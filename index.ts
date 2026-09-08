@@ -19,14 +19,22 @@
  *   - sentinel_status:   Show config, git state, history
  *
  * Hooks:
- *   - tool_call:  Detect file mutations, inject pre-flight awareness
- *   - turn_end:   Run onTurnEnd pipelines after an agent turn
+ *   - session_start:  Make config cwd-aware, announce armed state.
+ *   - tool_call:      Detect file mutations (edit/write), set status indicator.
+ *   - tool_result:    Run onFileMutation pipelines after an edit/write and
+ *                     auto-rollback + modify the result on failure.
+ *   - turn_end:       Run onTurnEnd pipelines after an agent turn.
  *
  * Commands:
  *   - /sentinel:  Interactive control (status / verify / test / rollback / config)
  */
 
-import type { ExtensionAPI, ToolCallEvent } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionUIContext,
+  ToolCallEvent,
+  ToolResultEvent,
+} from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 
 import { PipelineRunner } from "./src/clients/pipeline-runner.ts";
@@ -38,7 +46,7 @@ import { SentinelRollbackTool } from "./src/tools/sentinel-rollback.ts";
 import { SentinelStatusTool } from "./src/tools/sentinel-status.ts";
 
 export default function (pi: ExtensionAPI) {
-  // Load persisted state on startup
+  // Load persisted state on startup.
   loadState();
 
   // Resolve configuration lazily on first session event (cwd-aware).
@@ -50,12 +58,49 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // Register all tools
+  // Abort-safe shared verifier. Rolls back the working tree on an invariant
+  // violation (respecting autoRollback and warnOnly) and returns a result we
+  // can surface back into the loop.
+  async function verifyAndMaybeRollback(
+    trigger: "onFileMutation" | "onTurnEnd",
+    cwd: string,
+    ctx: { ui: ExtensionUIContext },
+  ): Promise<{ passed: boolean; formattedError: string }> {
+    const conf = getConfig();
+    const runner = new PipelineRunner();
+    const run = await runner.runAll(trigger, cwd);
+
+    if (run.passed) {
+      ctx.ui.setStatus("sentinel", undefined);
+      return { passed: true, formattedError: "" };
+    }
+
+    const failure = run.failure!;
+    ctx.ui.setStatus("sentinel", undefined);
+
+    if (conf.autoRollback && !failure.warnOnly) {
+      const rb = GitClient.rollback(cwd);
+      if (rb.success) {
+        recordRollback({
+          at: new Date().toISOString(),
+          branch: rb.branch ?? "unknown",
+          head: rb.committedAt ?? "unknown",
+          reason: failure.step,
+          method: rb.method,
+        });
+        ctx.ui.notify(`Sentinel rolled back (${failure.step} failed)`, "error");
+      }
+    }
+
+    return { passed: false, formattedError: failure.formattedError };
+  }
+
+  // Register all tools.
   pi.registerTool(SentinelVerifyTool);
   pi.registerTool(SentinelRollbackTool);
   pi.registerTool(SentinelStatusTool);
 
-  // Hook: session_start — make config cwd-aware, announce if enabled
+  // Hook: session_start — make config cwd-aware, announce if enabled.
   pi.on("session_start", async (_event, ctx) => {
     await ensureConfig(ctx.cwd);
     const conf = getConfig();
@@ -64,16 +109,14 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Hook: tool_call — intervene on file mutations
+  // Hook: tool_call — detect file mutations and show a status indicator.
   pi.on("tool_call", async (event: ToolCallEvent, ctx) => {
     await ensureConfig(ctx.cwd);
     const conf = getConfig();
     if (!conf.enabled) return;
 
     const isMutation =
-      isToolCallEventType("edit", event) ||
-      isToolCallEventType("write", event);
-
+      isToolCallEventType("edit", event) || isToolCallEventType("write", event);
     if (!isMutation) return;
 
     // Respect exclude patterns for targeted files.
@@ -81,7 +124,32 @@ export default function (pi: ExtensionAPI) {
     const target = (input.filePath ?? input.path ?? input.file) as string | undefined;
     if (target && isExcluded(target, conf)) return;
 
-    ctx.ui.setStatus("sentinel", "Verifying mutation...");
+    ctx.ui.setStatus("sentinel", "Mutation detected — verifying...");
+  });
+
+  // Hook: tool_result — run onFileMutation pipelines right after a mutation,
+  // roll back on failure, and surface the outcome by modifying the result.
+  pi.on("tool_result", async (event: ToolResultEvent, ctx) => {
+    await ensureConfig(ctx.cwd);
+    const conf = getConfig();
+    if (!conf.enabled) return;
+
+    const isMutation = event.toolName === "edit" || event.toolName === "write";
+    if (!isMutation) return;
+
+    // Respect exclude patterns for targeted files.
+    const target = (event.input?.filePath ?? event.input?.path) as string | undefined;
+    if (target && isExcluded(target, conf)) return;
+
+    const { passed, formattedError } = await verifyAndMaybeRollback("onFileMutation", ctx.cwd, ctx);
+
+    if (passed) return;
+
+    // Surface the pruned error by modifying the tool result in place.
+    return {
+      content: [{ type: "text" as const, text: `${formattedError}\n\n(previous result: ${event.content?.[0]?.type === "text" ? event.content[0].text : ""})` }],
+      isError: true as const,
+    };
   });
 
   // Hook: turn_end — run onTurnEnd pipelines after each agent turn.
@@ -90,35 +158,13 @@ export default function (pi: ExtensionAPI) {
     const conf = getConfig();
     if (!conf.enabled) return;
 
-    // Skip if git isn't available and rollback would be a no-op.
-    if (!GitClient.isGitRepo(ctx.cwd)) return;
+    // Skip if git isn't available and rollback would be a no-op (or config is empty).
+    if (conf.pipelines.onTurnEnd.length === 0) return;
 
-    const runner = new PipelineRunner();
-    const run = await runner.runAll("onTurnEnd", ctx.cwd);
-
-    if (!run.passed && run.failure) {
-      const failure = run.failure;
-      ctx.ui.setStatus("sentinel", "");
-
-      if (conf.autoRollback && !failure.warnOnly) {
-        const rb = GitClient.rollback(ctx.cwd);
-        if (rb.success) {
-          recordRollback({
-            at: new Date().toISOString(),
-            branch: rb.branch ?? "unknown",
-            head: rb.committedAt ?? "unknown",
-            reason: failure.step,
-            method: rb.method,
-          });
-          ctx.ui.notify(`Sentinel rolled back (${failure.step} failed)`, "error");
-          // Inject a steer message so the agent sees the error + that rollback happened.
-          pi.sendUserMessage(failure.formattedError, { deliverAs: "steer" });
-        }
-      }
-    }
+    await verifyAndMaybeRollback("onTurnEnd", ctx.cwd, ctx);
   });
 
-  // Register /sentinel command
+  // Register /sentinel command.
   pi.registerCommand("sentinel", {
     description: "Sentinel verification & rollback control",
     getArgumentCompletions: (prefix) => {
