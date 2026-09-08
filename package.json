@@ -1,0 +1,58 @@
+{
+  "name": "@patimweb/pi-sentinel",
+  "version": "0.1.0",
+  "description": "Astra/Codex-style in-loop verification & rollback hardening for Pi coding agent. Prunes failed tool-execution traces, runs type/lint/test pipelines, and rolls back on invariant violations.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "verification",
+    "rollback",
+    "trace-pruning",
+    "linter",
+    "tsc",
+    "ast",
+    "git"
+  ],
+  "author": "patimwep",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/patimweb/pi-sentinel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/patimweb/pi-sentinel/issues"
+  },
+  "homepage": "https://github.com/patimweb/pi-sentinel#readme",
+  "files": [
+    "*.ts",
+    "src/**/*.ts",
+    "CHANGELOG.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "typecheck": "tsc --noEmit",
+    "audit:runtime": "npm audit --omit=dev --omit=peer"
+  },
+  "dependencies": {
+    "typebox": "^1.1.38"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
