@@ -71,17 +71,27 @@ export default defineConfig({
 
   pipelines: {
     onFileMutation: [
-      { name: "type-check", cmd: "npx tsc --noEmit", timeoutMs: 6000 },
-      { name: "linter", cmd: "npx eslint --quiet", timeoutMs: 4000 },
+      { name: "type-check", cmd: "npx tsc --noEmit", timeoutMs: 15000 },
+      { name: "linter", cmd: "npx eslint --quiet", timeoutMs: 8000, warnOnly: true },
     ],
     onTurnEnd: [
-      { name: "unit-tests", cmd: "npm test -- --bail", timeoutMs: 12000 },
+      { name: "unit-tests", cmd: "npm test -- --bail", timeoutMs: 30000 },
     ],
   },
 
   exclude: ["**/node_modules/**", "**/.git/**", "**/*.md", "dist/**"],
 });
 ```
+
+> **warnOnly**: `linter` is `warnOnly` by default so projects without eslint don't trigger a hard rollback. Set `warnOnly: false` to make a step critical.
+
+## Hooks & trigger points
+
+| Hook | Trigger | Pipeline group | On failure |
+|------|---------|----------------|------------|
+| `tool_result` | after `edit` / `write` | `onFileMutation` | Modify result to `isError`, auto-rollback |
+| `turn_end` | after an agent turn | `onTurnEnd` | Auto-rollback |
+| `sentinel_verify` | on demand | `mutation` or `turn` | Report / optional rollback |
 
 ## Design
 

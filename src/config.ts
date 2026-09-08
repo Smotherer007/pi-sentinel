@@ -27,11 +27,13 @@ export const DEFAULT_CONFIG: SentinelConfig = {
   maxTraceLines: 12,
   pipelines: {
     onFileMutation: [
-      { name: "type-check", cmd: "npx tsc --noEmit", timeoutMs: 6000 },
-      { name: "linter", cmd: "npx eslint --quiet", timeoutMs: 4000 },
+      // type-check is generous: npx can fetch/compile on first cold run.
+      { name: "type-check", cmd: "npx tsc --noEmit", timeoutMs: 15000 },
+      // linter is warnOnly by default so projects without eslint don't break.
+      { name: "linter", cmd: "npx eslint --quiet", timeoutMs: 8000, warnOnly: true },
     ],
     onTurnEnd: [
-      { name: "unit-tests", cmd: "npm test -- --bail", timeoutMs: 12000 },
+      { name: "unit-tests", cmd: "npm test -- --bail", timeoutMs: 30000 },
     ],
   },
   exclude: [
