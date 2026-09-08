@@ -16,16 +16,16 @@
     "ast",
     "git"
   ],
-  "author": "patimwep",
+  "author": "Patrick Weppelmann",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/patimweb/pi-sentinel.git"
+    "url": "git+https://github.com/Smotherer007/pi-sentinel.git"
   },
   "bugs": {
-    "url": "https://github.com/patimweb/pi-sentinel/issues"
+    "url": "https://github.com/Smotherer007/pi-sentinel/issues"
   },
-  "homepage": "https://github.com/patimweb/pi-sentinel#readme",
+  "homepage": "https://github.com/Smotherer007/pi-sentinel#readme",
   "files": [
     "*.ts",
     "src/**/*.ts",
