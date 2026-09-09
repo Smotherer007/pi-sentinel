@@ -4,3 +4,6 @@ dist/
 .DS_Store
 coverage/
 sentinel-state.json
+
+# Mind Place knowledge-graph build artifacts
+graph-out/

@@ -16,27 +16,50 @@ pi install /path/to/pi-sentinel
 
 ## How it works
 
+Sentinel hooks into the pi loop at two points — **after a file mutation** (`edit`/`write`) and **at the end of a turn** — runs the configured pipelines, and turns any failure into a token-cheap, self-correcting signal for the agent:
+
 ```
-                    ┌─────────────────────────────────────────┐
-                    │               Pi Core Loop              │
-                    └────────────────────┬────────────────────┘
-                                         │ Tool Call: edit / write
-                                         ▼
-┌───────────────────────────────────────────────────────────────────────────┐
-│ @patimweb/pi-sentinel Guard                                               │
-│                                                                           │
-│  1. Pre-Check Diff ──> 2. Execute Linter / TSC ──> 3. Trace Pruning        │
-│                                                          │                │
-└──────────────────────────────────────────────────────────┼────────────────┘
-                                                           │
-                                   ┌───────────────────────┴───────────────────────┐
-                                   ▼                                               ▼
-                         [Status: SUCCESS]                                 [Status: FAILURE]
-                                   │                                               │
-                                   ▼                                               ▼
-                       Commit Turn to History                       1. Git Worktree Rollback
-                                                                    2. Inject Clean Error Trace
+                          pi Agent Loop
+   ┌────────────────────────────────────────────────────────────────────────┐
+   │   edit / write                       end of agent turn                  │
+   └──────────────────┬─────────────────────────────┬───────────────────────┘
+   tool_call: status  │                             │   turn_end
+   "Mutation detected" │                             │   runs onTurnEnd
+   ─→ verifying…       │                             │   pipelines
+                      ▼                             ▼
+   ┌────────────────────────────────────────────────────────────────────────┐
+   │                     Sentinel Guard (armed)                            │
+   │                                                                        │
+   │   onFileMutation ─→ type-check          onTurnEnd ─→ unit-tests        │
+   │                                                                        │
+   │   PipelineRunner: subprocess, timeout, buffered output                 │
+   └────────────────────────────┬────────────────────────────────────────────┘
+                                │
+             ┌──────────────────┴──────────────────┐
+             ▼                                     ▼
+   all steps exit 0                       some step exits ≠ 0
+   (checks passed)                        (checks failed)
+             │                                     │
+             ▼                                     ▼
+   clear status · green PASS            TracePruner keeps the ~N most
+   loop continues                        critical error lines (maxTraceLines)
+                                                   │
+                                                   ▼
+                                    ┌──────────────────────────────────┐
+                                    │  autoRollback && !warnOnly ?      │
+                                    └───────────────┬──────────────┬────┘
+                                                  yes            no
+                                                    ▼              ▼
+                                    GitClient.rollback      keep changes,
+                                    (checkout → restore)     recover manually
+                                                    |              |
+                                                    └──────┬───────┘
+                                                           ▼
+                                           formatError() → injected back into
+                                           the loop (tool_result isError / notify)
 ```
+
+The guard is opt-in-rollback: by default a failed check is **fed back** so the model can self-correct, and the working tree is only reset when the project sets `autoRollback: true`. Failed *warnings* (`warnOnly`) never trigger a rollback.
 
 ## Tools
 
@@ -90,11 +113,15 @@ export default defineConfig({
 
 ## Hooks & trigger points
 
-| Hook | Trigger | Pipeline group | On failure |
-|------|---------|----------------|------------|
-| `tool_result` | after `edit` / `write` | `onFileMutation` | Modify result to `isError` (feedback loop) |
-| `turn_end` | after an agent turn | `onTurnEnd` | Wake agent with the error |
+| Hook | Trigger | Pipeline group | What it does on failure |
+|------|---------|----------------|--------------------------|
+| `session_start` | session starts | — | Announce `Sentinel armed` if `enabled`; resolve config cwd-aware |
+| `tool_call` | before `edit` / `write` | — | Set status indicator `Mutation detected — verifying…` |
+| `tool_result` | after `edit` / `write` | `onFileMutation` | Prune trace → optional rollback → inject `isError` into the result |
+| `turn_end` | after an agent turn | `onTurnEnd` | Prune trace → optional rollback → wake the agent with the error |
 | `sentinel_verify` | on demand | `mutation` or `turn` | Report / optional rollback |
+
+Every event reloads `sentinel.config.ts` from disk (mtime-cache-busted), so config changes take effect without restarting pi.
 
 ## Design
 
