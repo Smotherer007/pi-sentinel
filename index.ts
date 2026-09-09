@@ -64,13 +64,11 @@ export default function (pi: ExtensionAPI) {
   // Load persisted state on startup.
   loadState();
 
-  // Resolve configuration lazily on first session event (cwd-aware).
-  let configLoaded = false;
+  // Resolve configuration on every session event (cwd-aware). We reload
+  // each time so editing `sentinel.config.ts` takes effect without a pi
+  // restart — loadConfig cache-busts the module by its file mtime.
   async function ensureConfig(cwd: string): Promise<void> {
-    if (!configLoaded) {
-      await loadConfig(cwd);
-      configLoaded = true;
-    }
+    await loadConfig(cwd);
   }
 
   // Abort-safe shared verifier. Rolls back the working tree on an invariant
@@ -170,15 +168,20 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Hook: turn_end — run onTurnEnd pipelines after each agent turn.
+  // Following Claude Code / Codex: a failed check is surfaced back to the
+  // agent/human so it can self-correct. Recovery is manual; the working tree
+  // is only reset when the project opts in via `autoRollback: true`.
   pi.on("turn_end", async (_event, ctx) => {
     await ensureConfig(ctx.cwd);
     const conf = getConfig();
     if (!conf.enabled) return;
 
-    // Skip if git isn't available and rollback would be a no-op (or config is empty).
     if (conf.pipelines.onTurnEnd.length === 0) return;
 
-    await verifyAndMaybeRollback("onTurnEnd", ctx.cwd, ctx);
+    const { passed, formattedError } = await verifyAndMaybeRollback("onTurnEnd", ctx.cwd, ctx);
+    if (!passed && formattedError) {
+      ctx.ui.notify(formattedError, "error");
+    }
   });
 
   // Register /sentinel command.

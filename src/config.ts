@@ -10,6 +10,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import type { SentinelConfig, SentinelPipelines, PipelineStep } from "./types.ts";
 
@@ -23,7 +24,10 @@ export type SentinelConfigInput = DeepPartial<SentinelConfig>;
 
 export const DEFAULT_CONFIG: SentinelConfig = {
   enabled: true,
-  autoRollback: true,
+  // Rollback is opt-in & manual (Claude Code / Codex). A failing check is fed
+  // back to the agent to self-correct; `autoRollback` is a deliberate
+  // per-project choice for a hard working-tree reset.
+  autoRollback: false,
   maxTraceLines: 12,
   pipelines: {
     onFileMutation: [
@@ -33,7 +37,8 @@ export const DEFAULT_CONFIG: SentinelConfig = {
       { name: "linter", cmd: "npx eslint --quiet", timeoutMs: 8000, warnOnly: true },
     ],
     onTurnEnd: [
-      { name: "unit-tests", cmd: "npm test -- --bail", timeoutMs: 30000 },
+      // node:test has no `--bail` flag (Vitest/Jest only), so plain `npm test`.
+      { name: "unit-tests", cmd: "npm test", timeoutMs: 30000 },
     ],
   },
   exclude: [
@@ -125,7 +130,12 @@ export async function loadConfig(cwd: string): Promise<SentinelConfig> {
   for (const file of candidates) {
     if (!fs.existsSync(file)) continue;
     try {
-      const mod = await import(file);
+      // Cache-bust with the file URL mtime so an edited config is re-read
+      // instead of Node's module cache handing back the original module.
+      const mtime = fs.statSync(file).mtimeMs;
+      const url = pathToFileURL(file);
+      url.searchParams.set("t", String(mtime));
+      const mod = await import(url.href);
       const raw = mod.default ?? mod.config;
       if (raw && typeof raw === "object") {
         activeConfig = deepMerge(DEFAULT_CONFIG, raw as Partial<SentinelConfig>);

@@ -66,7 +66,10 @@ import { defineConfig } from "@patimweb/pi-sentinel";
 
 export default defineConfig({
   enabled: true,
-  autoRollback: true,
+  // Rollback is opt-in. Like Claude Code / Codex, a failed check is fed back
+  // to the agent so it can self-correct. Set `autoRollback: true` only if you
+  // also want sentinel to hard-reset the working tree on a failure.
+  autoRollback: false,
   maxTraceLines: 12,
 
   pipelines: {
@@ -75,7 +78,7 @@ export default defineConfig({
       { name: "linter", cmd: "npx eslint --quiet", timeoutMs: 8000, warnOnly: true },
     ],
     onTurnEnd: [
-      { name: "unit-tests", cmd: "npm test -- --bail", timeoutMs: 30000 },
+      { name: "unit-tests", cmd: "npm test", timeoutMs: 30000 },
     ],
   },
 
@@ -89,8 +92,8 @@ export default defineConfig({
 
 | Hook | Trigger | Pipeline group | On failure |
 |------|---------|----------------|------------|
-| `tool_result` | after `edit` / `write` | `onFileMutation` | Modify result to `isError`, auto-rollback |
-| `turn_end` | after an agent turn | `onTurnEnd` | Auto-rollback |
+| `tool_result` | after `edit` / `write` | `onFileMutation` | Modify result to `isError` (feedback loop) |
+| `turn_end` | after an agent turn | `onTurnEnd` | Wake agent with the error |
 | `sentinel_verify` | on demand | `mutation` or `turn` | Report / optional rollback |
 
 ## Design
