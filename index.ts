@@ -36,6 +36,7 @@ import type {
   ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { isAbsolute, resolve, relative } from "node:path";
 
 import { PipelineRunner } from "./src/clients/pipeline-runner.ts";
 import { GitClient } from "./src/clients/git-client.ts";
@@ -44,6 +45,20 @@ import { loadConfig, loadState, getConfig, isExcluded, recordRollback } from "./
 import { SentinelVerifyTool } from "./src/tools/sentinel-verify.ts";
 import { SentinelRollbackTool } from "./src/tools/sentinel-rollback.ts";
 import { SentinelStatusTool } from "./src/tools/sentinel-status.ts";
+
+/**
+ * Whether a mutated file path lies inside the project the sentinel guards.
+ * The sentinel should only verify/rollback mutations that actually touch its
+ * own repo — otherwise it reacts to edits in unrelated projects (and can bar
+ * rolling back the wrong tree) on every such edit.
+ */
+function targetInScope(target: string | undefined, cwd: string): boolean {
+  // No target → fall through to existing logic (skip is handled elsewhere).
+  if (!target) return true;
+  const abs = isAbsolute(target) ? target : resolve(cwd, target);
+  const rel = relative(cwd, abs);
+  return rel === "" || !rel.startsWith("..");
+}
 
 export default function (pi: ExtensionAPI) {
   // Load persisted state on startup.
@@ -123,6 +138,7 @@ export default function (pi: ExtensionAPI) {
     const input = event.input as Record<string, unknown>;
     const target = (input.filePath ?? input.path ?? input.file) as string | undefined;
     if (target && isExcluded(target, conf)) return;
+    if (target && !targetInScope(target, ctx.cwd)) return;
 
     ctx.ui.setStatus("sentinel", "Mutation detected — verifying...");
   });
@@ -140,6 +156,7 @@ export default function (pi: ExtensionAPI) {
     // Respect exclude patterns for targeted files.
     const target = (event.input?.filePath ?? event.input?.path) as string | undefined;
     if (target && isExcluded(target, conf)) return;
+    if (target && !targetInScope(target, ctx.cwd)) return;
 
     const { passed, formattedError } = await verifyAndMaybeRollback("onFileMutation", ctx.cwd, ctx);
 

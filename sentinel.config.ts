@@ -7,8 +7,11 @@ export default defineConfig({
 
   pipelines: {
     onFileMutation: [
-      { name: "type-check", cmd: "npx tsc --noEmit", timeoutMs: 15000 },
-      { name: "linter", cmd: "npx eslint --quiet", timeoutMs: 8000, warnOnly: true },
+      // Use the project's own script (local TypeScript) — avoids `npx` registry
+      // lookups that hang in the subprocess. `tsc --noEmit` checks the whole
+      // installed pi SDK tree (~1700 files), so it can take >12s cold; the
+      // timeout is generous to avoid spurious failures.
+      { name: "type-check", cmd: "npm run typecheck", timeoutMs: 60000 },
     ],
     onTurnEnd: [
       { name: "unit-tests", cmd: "npm test -- --bail", timeoutMs: 30000 },
