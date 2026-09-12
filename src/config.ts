@@ -5,14 +5,16 @@
  * `~/.sentinel.config.ts` in the home directory, then finally to defaults.
  *
  * Also persists runtime state (rollback history, last verification runs) to
- * `~/.pi/sentinel-state.json` in an atomic, permission-safe manner.
+ * `~/.pi/sentinel-state/<project>.json` in an atomic, permission-safe manner.
+ * State is scoped per project so histories of unrelated repos don't mix.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
-import type { SentinelConfig, SentinelPipelines, PipelineStep } from "./types.ts";
+import type { SentinelConfig, PipelineStep } from "./types.ts";
 
 type DeepPartial<T> = {
   [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K];
@@ -26,7 +28,7 @@ export const DEFAULT_CONFIG: SentinelConfig = {
   enabled: true,
   // Rollback is opt-in & manual (Claude Code / Codex). A failing check is fed
   // back to the agent to self-correct; `autoRollback` is a deliberate
-  // per-project choice for a hard working-tree reset.
+  // per-project choice for an automatic restore.
   autoRollback: false,
   maxTraceLines: 12,
   pipelines: {
@@ -73,7 +75,7 @@ export interface SentinelState {
 
 let state: SentinelState = { rollbackHistory: [], lastVerifications: [] };
 let activeConfig: SentinelConfig = DEFAULT_CONFIG;
-let configPathCache: string | null = null;
+let stateScope: string | null = null;
 
 // ── Path resolution ───────────────────────────────────────────────────────
 
@@ -81,8 +83,27 @@ function homeDir(): string {
   return process.env.HOME || process.env.USERPROFILE || "~";
 }
 
+/** Stable, filesystem-safe key for a project directory. */
+function scopeKey(cwd: string): string {
+  const resolved = path.resolve(cwd);
+  const hash = createHash("sha1").update(resolved).digest("hex").slice(0, 10);
+  const base = path.basename(resolved).replace(/[^a-zA-Z0-9._-]/g, "_") || "root";
+  return `${base}-${hash}`;
+}
+
 function statePath(): string {
-  return path.join(homeDir(), ".pi", "sentinel-state.json");
+  return path.join(homeDir(), ".pi", "sentinel-state", `${stateScope ?? "global"}.json`);
+}
+
+/**
+ * Point the state store at a project. Reloads persisted state when the
+ * scope actually changes, so switching sessions never shows stale history.
+ */
+export function setStateScope(cwd: string): void {
+  const key = scopeKey(cwd);
+  if (key === stateScope) return;
+  stateScope = key;
+  loadState();
 }
 
 // ── Config loading ────────────────────────────────────────────────────────
@@ -121,6 +142,8 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  * Config files are imported dynamically (ESM), so they can contain code.
  */
 export async function loadConfig(cwd: string): Promise<SentinelConfig> {
+  setStateScope(cwd);
+
   const candidates = [
     path.join(cwd, "sentinel.config.ts"),
     path.join(cwd, "sentinel.config.js"),
@@ -191,11 +214,13 @@ export function loadState(): void {
           rollbackHistory: Array.isArray(raw.rollbackHistory) ? raw.rollbackHistory : [],
           lastVerifications: Array.isArray(raw.lastVerifications) ? raw.lastVerifications : [],
         };
+        return;
       }
     }
   } catch {
-    state = { rollbackHistory: [], lastVerifications: [] };
+    /* fall through to a clean state */
   }
+  state = { rollbackHistory: [], lastVerifications: [] };
 }
 
 // ── State accessors & mutations ───────────────────────────────────────────
@@ -210,40 +235,111 @@ export function recordRollback(entry: SentinelState["rollbackHistory"][number]):
   persistState();
 }
 
-export function recordVerification(entry: SentinelState["lastVerifications"][number]): void {
-  state.lastVerifications.unshift(entry);
-  if (state.lastVerifications.length > 20) state.lastVerifications.pop();
+/** Batch variant: persists once instead of once per step. */
+export function recordVerifications(entries: SentinelState["lastVerifications"]): void {
+  if (entries.length === 0) return;
+  for (const entry of entries) state.lastVerifications.unshift(entry);
+  if (state.lastVerifications.length > 20) state.lastVerifications.length = 20;
   persistState();
+}
+
+export function recordVerification(entry: SentinelState["lastVerifications"][number]): void {
+  recordVerifications([entry]);
 }
 
 // ── Glob matching ─────────────────────────────────────────────────────────
 
-export function matchesGlob(pattern: string, filePath: string): boolean {
-  // Build a regex from the glob.
-  // - `**/` (leading) is optional: matches zero or more directories.
-  // - `**` elsewhere matches anything.
-  // - `*` matches within one path segment (no slash).
-  const normalized = pattern
-    .replace(/\./g, "\\.")
-    .replace(/\*\*/g, "__DOUBLESTAR__")
-    .replace(/\*/g, "[^/]*")
-    .replace(/\?/g, ".")
-    .replace(/__DOUBLESTAR__/g, ".*")
-    .replace(/^\.\*\//, "(?:.*/)?");
-  const re = new RegExp(`^${normalized}$`);
-  return re.test(filePath);
+/** Convert a POSIX-style glob to an anchored regular expression. */
+function globToRegExp(glob: string): RegExp {
+  let out = "^";
+  let i = 0;
+  while (i < glob.length) {
+    const c = glob[i];
+    if (c === "*") {
+      if (glob[i + 1] === "*") {
+        i += 2;
+        if (glob[i] === "/") {
+          // `**/` matches zero or more leading directories.
+          i += 1;
+          out += "(?:.*/)?";
+        } else {
+          out += ".*";
+        }
+      } else {
+        i += 1;
+        out += "[^/]*";
+      }
+    } else if (c === "?") {
+      i += 1;
+      out += "[^/]";
+    } else if ("\\^$+?.()|{}[]".includes(c)) {
+      i += 1;
+      out += `\\${c}`;
+    } else {
+      i += 1;
+      out += c;
+    }
+  }
+  return new RegExp(`${out}$`);
 }
 
-export function isExcluded(filePath: string, config: SentinelConfig): boolean {
-  const rel = filePath.replace(/^\.\//, "").replace(/^\/.*\//, "");
-  return config.exclude.some(
-    (pattern) => matchesGlob(pattern, rel) || matchesGlob(pattern, filePath),
-  );
+/**
+ * Match a POSIX-style glob (`**`, `*`, `?`) against a normalised path.
+ * Callers should pass a project-relative path for anchored patterns; the
+ * absolute path is also compared so path-agnostic patterns still work.
+ */
+export function matchesGlob(pattern: string, filePath: string): boolean {
+  const p = pattern.replace(/\\/g, "/").replace(/^\.\//, "");
+  const f = filePath.replace(/\\/g, "/").replace(/^\.\//, "");
+  try {
+    return globToRegExp(p).test(f);
+  } catch {
+    return false;
+  }
+}
+
+/** Turn an absolute path into a project-relative one when possible. */
+function toRelative(filePath: string, cwd?: string): string {
+  const normalised = filePath.replace(/\\/g, "/");
+  if (cwd && path.isAbsolute(filePath)) {
+    const rel = path.relative(cwd, filePath).replace(/\\/g, "/");
+    if (rel && !rel.startsWith("..")) return rel;
+  }
+  return normalised.replace(/^\.\//, "");
+}
+
+export function isExcluded(filePath: string, config: SentinelConfig, cwd?: string): boolean {
+  const rel = toRelative(filePath, cwd);
+  return config.exclude.some((pattern) => matchesGlob(pattern, rel));
+}
+
+/**
+ * Decide whether a mutated file should trigger verification.
+ *
+ * - `exclude` always wins.
+ * - When `include` is empty, everything not excluded is verified.
+ * - Otherwise the file must match at least one `include` pattern.
+ */
+export function shouldVerify(filePath: string, config: SentinelConfig, cwd?: string): boolean {
+  const rel = toRelative(filePath, cwd);
+  if (isExcluded(filePath, config, cwd)) return false;
+  if (config.include.length === 0) return true;
+  return config.include.some((pattern) => matchesGlob(pattern, rel));
+}
+
+/** Type guard for a configured pipeline step (used by tests/tools). */
+export function isPipelineStep(value: unknown): value is PipelineStep {
+  return isPlainObject(value) && typeof value.name === "string" && typeof value.cmd === "string";
 }
 
 /** @internal Reset internals — for testing only */
 export function _resetForTesting(): void {
   state = { rollbackHistory: [], lastVerifications: [] };
   activeConfig = DEFAULT_CONFIG;
-  configPathCache = null;
+  stateScope = null;
+}
+
+/** @internal Override the active config — for testing only */
+export function _setConfigForTesting(config: SentinelConfig): void {
+  activeConfig = config;
 }

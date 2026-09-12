@@ -8,6 +8,7 @@
 import { Type } from "typebox";
 
 import { GitClient } from "../clients/git-client.ts";
+import { snapshots } from "../clients/snapshot.ts";
 import { getConfig, getState } from "../config.ts";
 
 export const SentinelStatusTool = {
@@ -17,15 +18,21 @@ export const SentinelStatusTool = {
     "Show the current sentinel configuration, git state, and recent rollback/verification history.",
   parameters: Type.Object({}),
 
-  async execute(_toolCallId: string, _params: Record<string, never>) {
+  async execute(
+    _toolCallId: string,
+    _params: Record<string, never>,
+    _signal: AbortSignal | undefined,
+    _onUpdate: unknown,
+    ctx?: { cwd: string },
+  ) {
     const conf = getConfig();
-    const cwd = process.cwd();
+    const cwd = ctx?.cwd ?? process.cwd();
     const repo = GitClient.gitMeta(cwd);
     const state = getState();
 
     const gitOk = repo
       ? `Git: ${repo.branch} @ ${repo.head}`
-      : "Git: not a repo (rollback unavailable)";
+      : "Git: not a repo (head reset unavailable)";
 
     const history = state.rollbackHistory.slice(0, 5).map((h) => {
       return `  ${h.at} | ${h.branch} @ ${h.head} | ${h.method} | ${h.reason}`;
@@ -42,7 +49,10 @@ export const SentinelStatusTool = {
       `  maxTraceLines: ${conf.maxTraceLines}`,
       `  pipelines onFileMutation: ${conf.pipelines.onFileMutation.length}`,
       `  pipelines onTurnEnd: ${conf.pipelines.onTurnEnd.length}`,
+      `  exclude: ${conf.exclude.join(", ") || "(none)"}`,
+      `  include: ${conf.include.join(", ") || "(all non-excluded files)"}`,
       `  ${gitOk}`,
+      `  turn snapshot: ${snapshots.hasTurnSnapshot() ? "captured (rollback available)" : "empty"}`,
       "",
       state.rollbackHistory.length > 0
         ? `Recent rollbacks (${state.rollbackHistory.length}):\n${history.join("\n")}`
@@ -59,6 +69,7 @@ export const SentinelStatusTool = {
         enabled: conf.enabled,
         autoRollback: conf.autoRollback,
         git: repo,
+        turnSnapshot: snapshots.hasTurnSnapshot(),
         rollbackHistory: state.rollbackHistory,
       },
     };

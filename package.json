@@ -3,6 +3,14 @@
   "version": "1.1.0",
   "description": "Astra/Codex-style in-loop verification & rollback hardening for Pi coding agent. Prunes failed tool-execution traces, runs type/lint/test pipelines, and rolls back on invariant violations.",
   "type": "module",
+  "main": "./index.ts",
+  "types": "./index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./src/config.ts": "./src/config.ts",
+    "./src/types.ts": "./src/types.ts",
+    "./package.json": "./package.json"
+  },
   "keywords": [
     "pi-package",
     "pi",

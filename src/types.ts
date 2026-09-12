@@ -66,11 +66,24 @@ export interface VerificationResult {
   warnOnly: boolean;
 }
 
+export interface PipelineWarning {
+  /** Name of the warnOnly step that failed. */
+  step: string;
+  /** Exit code of the failed step. */
+  exitCode: number;
+  /** Millisecond duration of the step. */
+  durationMs: number;
+  /** Pruned critical output of the failed step. */
+  prunedTrace: string;
+}
+
 export interface PipelineRunResult {
   /** Overall pass/fail across all steps. */
   passed: boolean;
-  /** First failure (or null if all passed). */
+  /** First critical failure (or null if all critical steps passed). */
   failure: VerificationResult | null;
+  /** Non-blocking failures from `warnOnly` steps, surfaced to the caller. */
+  warnings: PipelineWarning[];
   /** All steps that ran, including successes. */
   steps: Array<{
     name: string;
