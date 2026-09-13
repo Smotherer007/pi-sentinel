@@ -68,6 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/sentinel status` reports metrics and a compact history instead of dumping raw records.
 
 ### Fixed
+- The coalescing window and the SIGKILL escalation timer are no longer `unref`'d. A pending window is
+  the only thing that can resolve a queued verification, so letting the event loop drop it left the
+  caller's promise unsettled (a runner that ended as soon as the loop drained cancelled every
+  debounced test — caught by CI, guarded by a child-process test).
 - An empty pipeline group no longer clears the repeated-failure escalation counters either; it runs
   after every edit and would otherwise make escalation impossible to reach.
 - A killed verification step used to leave its children running (`child.kill()` signals only the

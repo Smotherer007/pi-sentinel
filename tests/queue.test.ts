@@ -1,5 +1,6 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 
 import { VerificationQueue } from "../src/clients/queue.ts";
 import { FailureEscalationTracker, shouldEscalate } from "../src/clients/escalation.ts";
@@ -158,5 +159,27 @@ describe("shouldEscalate", () => {
 
   test("a threshold of zero disables escalation", () => {
     assert.equal(shouldEscalate(99, 0), false);
+  });
+});
+
+describe("VerificationQueue timer lifetime", () => {
+  test("a pending window keeps the process alive until the batch has run", () => {
+    // Regression: the window timer was `unref`'d, so a process whose only
+    // pending work was the window exited before it fired and the caller's
+    // promise never settled (CI saw it as "cancelledByParent": 22 tests).
+    const moduleUrl = new URL("../src/clients/queue.ts", import.meta.url).href;
+    const script = [
+      `import { VerificationQueue } from ${JSON.stringify(moduleUrl)};`,
+      "const queue = new VerificationQueue(async (_key, payloads) => payloads.length, 40);",
+      'process.stdout.write("resolved:" + (await queue.enqueue("a", 1)));',
+    ].join("\n");
+
+    const out = execFileSync(
+      process.execPath,
+      ["--input-type=module", "-e", script],
+      { encoding: "utf-8", timeout: 20_000 },
+    );
+
+    assert.equal(out, "resolved:1", "the process must survive its own debounce window");
   });
 });

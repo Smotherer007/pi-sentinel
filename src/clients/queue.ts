@@ -79,11 +79,13 @@ export class VerificationQueue<K, P, R> {
     });
 
     const entry: Waiting<P, R> = { payloads: [payload], promise, resolve, reject };
+    // Deliberately *not* unref'd. This timer is the only thing that will ever
+    // resolve the promise, so dropping it when the event loop drains would
+    // leave every caller waiting forever — the batch must keep the process
+    // alive until it has run.
     entry.timer = setTimeout(() => {
       void this.flush(key);
     }, this.debounce);
-    // A pending window must never keep the process alive on its own.
-    (entry.timer as { unref?: () => void }).unref?.();
 
     this.waiting.set(key, entry);
     return promise;

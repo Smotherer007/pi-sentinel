@@ -437,10 +437,12 @@ export class PipelineRunner {
       /** SIGTERM, then SIGKILL after the grace period. */
       const terminate = (reason: string) => {
         killProcessTree(child, "SIGTERM");
+        // Not unref'd on purpose: this timer is what guarantees the tree is
+        // really gone. Dropping it when the loop drains would leave a child
+        // alive that sentinel has already reported as killed.
         escalateTimer = setTimeout(() => {
           killProcessTree(child, "SIGKILL");
         }, graceMs);
-        (escalateTimer as { unref?: () => void }).unref?.();
         return reason;
       };
 
