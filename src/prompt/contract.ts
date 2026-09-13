@@ -49,6 +49,11 @@ export function revisionContractText(config: SentinelConfig): string {
       "- When sentinel lists dependents from the code graph, treat them as the blast radius: fix the cause in place, then check the dependents it names.",
     );
   }
+  if (config.verification?.failureEscalation?.enabled) {
+    rules.push(
+      `- When the same failure comes back ${config.verification.failureEscalation.maxRepeatedFailures} times, stop varying the same edit: re-read the code and change the approach.`,
+    );
+  }
 
   return [`${CONTRACT_MARKER} active in this repository:`, ...rules].join("\n");
 }

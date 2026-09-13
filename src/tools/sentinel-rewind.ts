@@ -26,6 +26,8 @@ interface RewindDetails {
   restored: string[];
   deleted: string[];
   skipped: string[];
+  /** Files left untouched because they changed after that turn. */
+  conflicted: string[];
   partial: boolean;
 }
 
@@ -41,6 +43,7 @@ function detailsFor(
     restored: [],
     deleted: [],
     skipped: [],
+    conflicted: [],
     partial: false,
     ...extra,
   };
@@ -143,18 +146,27 @@ export const SentinelRewindTool = {
       method: "checkpoint:turn",
     });
 
+    const conflictText =
+      report.conflicted.length > 0
+        ? `\nROLLBACK CONFLICT: ${report.conflicted.length} file(s) changed after that turn and were NOT overwritten:\n${report.conflicted
+            .slice(0, 5)
+            .map((file) => `  ${file}`)
+            .join("\n")}\nManual recovery required.`
+        : "";
+
     return {
       content: [
         {
           type: "text" as const,
-          text: `[sentinel] Rewound to ${target?.label ?? targetId}: ${describeRestore(report)}.`,
+          text: `[sentinel] Rewound to ${target?.label ?? targetId}: ${describeRestore(report)}.${conflictText}`,
         },
       ],
       details: detailsFor(mode, list, {
-        rewound: true,
+        rewound: report.restored.length > 0 || report.deleted.length > 0,
         restored: report.restored,
         deleted: report.deleted,
         skipped: report.skipped,
+        conflicted: report.conflicted,
         partial: report.partial,
       }),
     };

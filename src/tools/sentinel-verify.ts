@@ -15,7 +15,8 @@ import { rollbackTurn } from "../clients/rollback.ts";
 import { snapshots } from "../clients/snapshot.ts";
 import { recordVerified, stateHashOf } from "../clients/evidence.ts";
 import { buildFailureFeedback } from "../formatting/feedback.ts";
-import { getConfig, recordRollback } from "../config.ts";
+import { getConfig, recordMetrics, recordRollback } from "../config.ts";
+import type { FailureKind, RollbackConflict } from "../types.ts";
 
 /** One stable details shape across every return path. */
 interface VerifyDetails {
@@ -23,8 +24,19 @@ interface VerifyDetails {
   step: string;
   exitCode: number;
   rolledBack: boolean;
-  steps: Array<{ name: string; passed: boolean; durationMs: number; exitCode: number }>;
+  steps: Array<{
+    name: string;
+    passed: boolean;
+    durationMs: number;
+    exitCode: number;
+    skipped?: string;
+    cached?: boolean;
+  }>;
   warnings: number;
+  /** Classification of the failure, when there was one. */
+  failureKind?: FailureKind;
+  /** Files left untouched because they changed since the snapshot. */
+  conflicts?: RollbackConflict[];
 }
 
 function detailsFor(extra: Partial<VerifyDetails> = {}): VerifyDetails {
@@ -59,7 +71,6 @@ export const SentinelVerifyTool = {
       }),
     ),
   }),
-
   async execute(
     _toolCallId: string,
     params: { trigger?: "mutation" | "turn"; rollback?: boolean },
@@ -75,7 +86,9 @@ export const SentinelVerifyTool = {
     // The files this turn touched are what a failure is actually about, so
     // they drive both evidence and the code-graph impact section.
     const focusPaths = snapshots.turnPaths();
-    const run = await runner.runAll(trigger, cwd, { signal, focusPaths });
+    // An explicit request means "run the checks": results are never taken
+    // from the cache, and the debounce window is bypassed.
+    const run = await runner.runAll(trigger, cwd, { signal, focusPaths, skipCache: true });
 
     if (run.passed) {
       if (config.trackVerifiedState && focusPaths.length > 0 && run.steps.length > 0) {
@@ -112,20 +125,22 @@ export const SentinelVerifyTool = {
     const doRollback = params.rollback ?? config.autoRollback;
     let rolledBack = false;
     let rollbackMsg = "";
+    let conflicts: RollbackConflict[] = [];
 
     if (doRollback && !failure.warnOnly) {
       const rb = rollbackTurn(cwd);
-      rolledBack = rb.success;
+      // A conflict means at least one file was deliberately left alone.
+      rolledBack = rb.success && !rb.partial;
+      conflicts = rb.conflicts ?? [];
       rollbackMsg = `\n${rb.message}`;
-      if (rb.success) {
-        recordRollback({
-          at: new Date().toISOString(),
-          branch: rb.branch ?? "unknown",
-          head: rb.committedAt ?? "unknown",
-          reason: `tool:${failure.step}`,
-          method: rb.method,
-        });
-      }
+      recordMetrics({ rollbacks: 1, partialRollbacks: rb.partial ? 1 : 0 });
+      recordRollback({
+        at: new Date().toISOString(),
+        branch: rb.branch ?? "unknown",
+        head: rb.committedAt ?? "unknown",
+        reason: `tool:${failure.step}`,
+        method: rb.method,
+      });
     }
 
     const { text } = buildFailureFeedback({
@@ -139,6 +154,11 @@ export const SentinelVerifyTool = {
       rolledBack,
       focusPaths,
       stateHash: stateHashOf(focusPaths),
+      failureKind: failure.failureKind,
+      timedOut: failure.timedOut,
+      errorSummary: failure.errorSummary,
+      attempts: failure.attempts,
+      conflicts,
       maxOutputTokens: config.maxOutputTokens,
     });
 
@@ -151,6 +171,8 @@ export const SentinelVerifyTool = {
         rolledBack,
         steps: run.steps,
         warnings: run.warnings.length,
+        failureKind: failure.failureKind,
+        conflicts,
       }),
     };
   },

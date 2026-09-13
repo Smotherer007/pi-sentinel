@@ -14,7 +14,7 @@ import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
-import type { SentinelConfig, PipelineStep } from "./types.ts";
+import type { PipelineStep, SentinelConfig, SentinelMetrics, StepPriority } from "./types.ts";
 
 type DeepPartial<T> = {
   [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K];
@@ -59,6 +59,29 @@ export const DEFAULT_CONFIG: SentinelConfig = {
   impactAwareFocus: true,
 
   maxTraceLines: 12,
+
+  // ── P6: performance, cache & escalation ────────────────────────────────
+  // Deliberately conservative defaults: these change *observable behaviour*
+  // (batching, reusing results, refusing to repeat a failure), so a project
+  // that upgrades to this version keeps the exact 2.0.0 semantics until it
+  // opts in. The safety limits below (`maxOutputBytes`, `killGraceMs`) are
+  // not toggles — they only bound damage and are on unconditionally.
+  verification: {
+    // 0 = verify every mutation immediately (pre-3.0 behaviour).
+    debounceMs: 0,
+    maxOutputBytes: 256 * 1024,
+    killGraceMs: 500,
+    cache: {
+      enabled: false,
+      ttlMs: 300_000,
+      maxEntries: 50,
+      persist: true,
+    },
+    failureEscalation: {
+      enabled: false,
+      maxRepeatedFailures: 3,
+    },
+  },
   pipelines: {
     onFileMutation: [
       // type-check is generous: npx can fetch/compile on first cold run.
@@ -118,6 +141,42 @@ export interface SentinelState {
     verifiedAt: string;
     reverted: boolean;
   }>;
+  /** P6: performance counters, surfaced by `/sentinel status`. */
+  metrics: SentinelMetrics;
+  /** P6: one entry per turn that ran a verification (compact history). */
+  turnHistory: Array<{
+    at: string;
+    turnIndex: number;
+    passed: boolean;
+    /** Failing step, when the turn was red. */
+    step?: string;
+  }>;
+  /** P6 audit trail: failures repeated often enough to escalate. */
+  escalations: Array<{
+    at: string;
+    step: string;
+    kind: string;
+    count: number;
+    signature: string;
+  }>;
+}
+
+/** All-zero metrics, so state files written by older versions still load. */
+export function emptyMetrics(): SentinelMetrics {
+  return {
+    checks: 0,
+    successes: 0,
+    failures: 0,
+    timeouts: 0,
+    skippedSteps: 0,
+    retries: 0,
+    escalations: 0,
+    cacheHits: 0,
+    cacheMisses: 0,
+    totalDurationMs: 0,
+    rollbacks: 0,
+    partialRollbacks: 0,
+  };
 }
 
 function emptyState(): SentinelState {
@@ -126,6 +185,9 @@ function emptyState(): SentinelState {
     lastVerifications: [],
     autoFixHistory: [],
     regressions: [],
+    metrics: emptyMetrics(),
+    turnHistory: [],
+    escalations: [],
   };
 }
 
@@ -286,6 +348,11 @@ export function loadState(): void {
           lastVerifications: Array.isArray(raw.lastVerifications) ? raw.lastVerifications : [],
           autoFixHistory: Array.isArray(raw.autoFixHistory) ? raw.autoFixHistory : [],
           regressions: Array.isArray(raw.regressions) ? raw.regressions : [],
+          // Merge onto zeros: a state file from an older version has no
+          // counters at all, and a partial write must not yield NaN totals.
+          metrics: { ...emptyMetrics(), ...(raw.metrics ?? {}) },
+          turnHistory: Array.isArray(raw.turnHistory) ? raw.turnHistory : [],
+          escalations: Array.isArray(raw.escalations) ? raw.escalations : [],
         };
         return;
       }
@@ -331,6 +398,37 @@ export function recordAutoFix(entry: SentinelState["autoFixHistory"][number]): v
 export function recordRegression(entry: SentinelState["regressions"][number]): void {
   state.regressions.unshift(entry);
   if (state.regressions.length > 20) state.regressions.length = 20;
+  persistState();
+}
+
+/** P6: add a batch of counters (one call per verification run). */
+export function recordMetrics(delta: Partial<SentinelMetrics>): void {
+  for (const [key, value] of Object.entries(delta)) {
+    if (typeof value !== "number" || !Number.isFinite(value)) continue;
+    const current = state.metrics[key as keyof SentinelMetrics] ?? 0;
+    state.metrics[key as keyof SentinelMetrics] = current + value;
+  }
+  persistState();
+}
+
+/** P6: log a failure that repeated often enough to escalate. */
+export function recordEscalation(entry: SentinelState["escalations"][number]): void {
+  state.escalations.unshift(entry);
+  if (state.escalations.length > 20) state.escalations.length = 20;
+  persistState();
+}
+
+/** P6: record the outcome of a turn, for the compact history block. */
+export function recordTurnOutcome(entry: SentinelState["turnHistory"][number]): void {
+  const newest = state.turnHistory[0];
+  // A turn can produce several runs (mutation + turn end). Keep the newest,
+  // but never append a second line for the same turn index and outcome.
+  if (newest && newest.turnIndex === entry.turnIndex && newest.passed === entry.passed) {
+    state.turnHistory[0] = entry;
+  } else {
+    state.turnHistory.unshift(entry);
+  }
+  if (state.turnHistory.length > 20) state.turnHistory.length = 20;
   persistState();
 }
 
@@ -417,6 +515,51 @@ export function shouldVerify(filePath: string, config: SentinelConfig, cwd?: str
 /** Type guard for a configured pipeline step (used by tests/tools). */
 export function isPipelineStep(value: unknown): value is PipelineStep {
   return isPlainObject(value) && typeof value.name === "string" && typeof value.cmd === "string";
+}
+
+/**
+ * Effective priority of a step.
+ *
+ * `warnOnly` is the pre-3.0 spelling of `priority: "warning"` and keeps
+ * working unchanged; an explicit priority wins so both styles can be mixed.
+ */
+export function priorityOf(step: PipelineStep): StepPriority {
+  if (step.priority) return step.priority;
+  return step.warnOnly ? "warning" : "normal";
+}
+
+/**
+ * Whether a step belongs to the pipeline group that is running.
+ * A step without a `phase` runs in both groups (the pre-3.0 behaviour).
+ */
+export function stepPhaseMatches(
+  step: PipelineStep,
+  trigger: "onFileMutation" | "onTurnEnd",
+): boolean {
+  if (!step.phase) return true;
+  const wanted = trigger === "onFileMutation" ? "mutation" : "turn";
+  return step.phase === wanted;
+}
+
+/**
+ * Whether a step cares about the files that changed.
+ *
+ * - No `files` patterns: the step is always relevant (back-compatible).
+ * - No changed files known: run the step — skipping a check because we could
+ *   not see what changed would be a silent loss of verification.
+ * - Otherwise at least one changed file must match one pattern.
+ */
+export function stepMatchesFiles(
+  step: PipelineStep,
+  changedFiles: string[],
+  cwd?: string,
+): boolean {
+  if (!step.files || step.files.length === 0) return true;
+  if (changedFiles.length === 0) return true;
+  return changedFiles.some((file) => {
+    const rel = toRelative(file, cwd);
+    return step.files!.some((pattern) => matchesGlob(pattern, rel));
+  });
 }
 
 /** @internal Reset internals — for testing only */

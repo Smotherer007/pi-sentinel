@@ -12,6 +12,13 @@ import {
   matchesGlob,
   loadConfig,
   getConfig,
+  priorityOf,
+  stepMatchesFiles,
+  stepPhaseMatches,
+  getState,
+  recordMetrics,
+  recordEscalation,
+  recordTurnOutcome,
   _resetForTesting,
 } from "../src/config.ts";
 
@@ -218,5 +225,151 @@ describe("loadConfig", () => {
     assert.equal(getConfig().maxTraceLines, 9);
     await loadConfig(project);
     assert.equal(getConfig().maxTraceLines, 9, "idempotent across events");
+  });
+});
+
+describe("P6 verification settings", () => {
+  test("behaviour-changing features are opt-in", () => {
+    // Deliberate: upgrading must not silently batch, reuse or escalate.
+    assert.equal(DEFAULT_CONFIG.verification.debounceMs, 0);
+    assert.equal(DEFAULT_CONFIG.verification.cache.enabled, false);
+    assert.equal(DEFAULT_CONFIG.verification.failureEscalation.enabled, false);
+  });
+
+  test("safety limits are on unconditionally", () => {
+    assert.ok(DEFAULT_CONFIG.verification.maxOutputBytes > 0);
+    assert.ok(DEFAULT_CONFIG.verification.killGraceMs > 0);
+  });
+
+  test("a project can switch each of them on", () => {
+    const conf = defineConfig({
+      verification: {
+        debounceMs: 150,
+        cache: { enabled: true, ttlMs: 60_000, maxEntries: 10, persist: false },
+        failureEscalation: { enabled: true, maxRepeatedFailures: 2 },
+      },
+    });
+    assert.equal(conf.verification.debounceMs, 150);
+    assert.equal(conf.verification.cache.enabled, true);
+    assert.equal(conf.verification.cache.ttlMs, 60_000);
+    assert.equal(conf.verification.failureEscalation.maxRepeatedFailures, 2);
+    assert.equal(conf.verification.maxOutputBytes, DEFAULT_CONFIG.verification.maxOutputBytes);
+  });
+
+  test("nested cache settings merge instead of replacing", () => {
+    const conf = defineConfig({ verification: { cache: { enabled: true } } });
+    assert.equal(conf.verification.cache.persist, DEFAULT_CONFIG.verification.cache.persist);
+    assert.equal(conf.verification.cache.ttlMs, DEFAULT_CONFIG.verification.cache.ttlMs);
+  });
+});
+
+describe("priorityOf", () => {
+  test("defaults to normal", () => {
+    assert.equal(priorityOf({ name: "a", cmd: "a", timeoutMs: 1 }), "normal");
+  });
+
+  test("warnOnly is the legacy spelling of warning", () => {
+    assert.equal(priorityOf({ name: "a", cmd: "a", timeoutMs: 1, warnOnly: true }), "warning");
+  });
+
+  test("an explicit priority wins over warnOnly", () => {
+    assert.equal(
+      priorityOf({ name: "a", cmd: "a", timeoutMs: 1, warnOnly: true, priority: "critical" }),
+      "critical",
+    );
+  });
+});
+
+describe("stepPhaseMatches", () => {
+  const step = { name: "s", cmd: "c", timeoutMs: 1 };
+
+  test("an unset phase runs in both groups", () => {
+    assert.equal(stepPhaseMatches(step, "onFileMutation"), true);
+    assert.equal(stepPhaseMatches(step, "onTurnEnd"), true);
+  });
+
+  test("a phase restricts the step to its group", () => {
+    assert.equal(stepPhaseMatches({ ...step, phase: "mutation" }, "onFileMutation"), true);
+    assert.equal(stepPhaseMatches({ ...step, phase: "mutation" }, "onTurnEnd"), false);
+    assert.equal(stepPhaseMatches({ ...step, phase: "turn" }, "onTurnEnd"), true);
+    assert.equal(stepPhaseMatches({ ...step, phase: "turn" }, "onFileMutation"), false);
+  });
+});
+
+describe("stepMatchesFiles", () => {
+  const step = { name: "s", cmd: "c", timeoutMs: 1 };
+
+  test("no patterns means always relevant", () => {
+    assert.equal(stepMatchesFiles(step, []), true);
+    assert.equal(stepMatchesFiles(step, ["a/b.md"]), true);
+    assert.equal(stepMatchesFiles({ ...step, files: [] }, ["a/b.md"]), true);
+  });
+
+  test("unknown changed files run the step rather than skipping a check", () => {
+    assert.equal(stepMatchesFiles({ ...step, files: ["**/*.ts"] }, []), true);
+  });
+
+  test("matches project-relative and absolute paths", () => {
+    const withFiles = { ...step, files: ["src/**/*.ts"] };
+    assert.equal(stepMatchesFiles(withFiles, ["src/a.ts"], "/p"), true);
+    assert.equal(stepMatchesFiles(withFiles, ["/p/src/a.ts"], "/p"), true);
+    assert.equal(stepMatchesFiles(withFiles, ["/p/docs/a.md"], "/p"), false);
+  });
+
+  test("one matching file is enough", () => {
+    const withFiles = { ...step, files: ["**/*.rs"] };
+    assert.equal(stepMatchesFiles(withFiles, ["src/a.ts", "src/lib.rs"], "/p"), true);
+  });
+});
+
+describe("P6 state persistence", () => {
+  test("metrics start at zero and accumulate", () => {
+    _resetForTesting();
+    const state = getState();
+    assert.equal(state.metrics.checks, 0);
+    assert.equal(state.metrics.cacheHits, 0);
+
+    recordMetrics({ checks: 2, successes: 2, totalDurationMs: 100 });
+    recordMetrics({ checks: 1, failures: 1, timeouts: 1, totalDurationMs: 50 });
+
+    const after = getState();
+    assert.equal(after.metrics.checks, 3);
+    assert.equal(after.metrics.successes, 2);
+    assert.equal(after.metrics.failures, 1);
+    assert.equal(after.metrics.timeouts, 1);
+    assert.equal(after.metrics.totalDurationMs, 150);
+  });
+
+  test("an unknown metric key is ignored, not written as NaN", () => {
+    _resetForTesting();
+    recordMetrics({ notAMetric: 5 } as never);
+    assert.equal(Number.isFinite(getState().metrics.checks), true);
+  });
+
+  test("turn outcomes are recorded newest-first and deduplicated per turn", () => {
+    _resetForTesting();
+    recordTurnOutcome({ at: "2026-01-01T00:00:00.000Z", turnIndex: 1, passed: true });
+    recordTurnOutcome({ at: "2026-01-01T00:01:00.000Z", turnIndex: 2, passed: false, step: "tests" });
+    recordTurnOutcome({ at: "2026-01-01T00:02:00.000Z", turnIndex: 2, passed: false, step: "lint" });
+
+    const state = getState();
+    assert.equal(state.turnHistory.length, 2, "same turn + outcome replaces the entry");
+    assert.equal(state.turnHistory[0].step, "lint");
+    assert.equal(state.turnHistory[1].turnIndex, 1);
+  });
+
+  test("escalations are logged with a cap", () => {
+    _resetForTesting();
+    for (let i = 0; i < 25; i += 1) {
+      recordEscalation({
+        at: new Date().toISOString(),
+        step: "tests",
+        kind: "test-failure",
+        count: 3,
+        signature: `sig-${i}`,
+      });
+    }
+    assert.equal(getState().escalations.length, 20);
+    assert.equal(getState().escalations[0].signature, "sig-24");
   });
 });

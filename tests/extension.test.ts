@@ -16,7 +16,7 @@ import * as path from "node:path";
 import { execSync } from "node:child_process";
 
 import extensionFactory, { SENTINEL_MESSAGE_TYPE } from "../index.ts";
-import { projectDir, _resetForTesting, getConfig } from "../src/config.ts";
+import { projectDir, _resetForTesting, getConfig, getState } from "../src/config.ts";
 import { checkpoints } from "../src/clients/checkpoints.ts";
 import { verifiedEntry } from "../src/clients/evidence.ts";
 import { SentinelRewindTool } from "../src/tools/sentinel-rewind.ts";
@@ -840,5 +840,182 @@ describe("disabled / status", () => {
     assert.ok(text.includes("checkpointRetention"));
     assert.ok(text.includes("Recent checkpoints"));
     assert.ok(text.includes("code graph (mindplace): absent"));
+  });
+});
+
+describe("P6 — coalescing, conflicts, escalation and metrics", () => {
+  /** A step that counts its own runs in a file inside the project. */
+  function countingStep(name: string, exitCode: number): Record<string, unknown> {
+    const program = `const fs=require('fs');const f='runs.txt';fs.appendFileSync(f,'${name}\\n');process.exit(${exitCode})`;
+    return { name, cmd: `node -e "${program}"`, timeoutMs: 10000 };
+  }
+
+  function runCount(): number {
+    const file = path.join(project, "runs.txt");
+    if (!fs.existsSync(file)) return 0;
+    return fs.readFileSync(file, "utf-8").split("\n").filter(Boolean).length;
+  }
+
+  test("debounce coalesces edits that land together into one verification", async () => {
+    await configure({
+      autoRollback: false,
+      verification: { debounceMs: 120 },
+      pipelines: { onFileMutation: [countingStep("check", 2)], onTurnEnd: [] },
+    });
+
+    await Promise.all([mutate("src/a.ts", "a\n", "call-a"), mutate("src/b.ts", "b\n", "call-b")]);
+    assert.equal(runCount(), 1, "one run answers both mutations");
+    assert.equal(fake.sent.length, 0, "mutation failures are reported as tool results");
+  });
+
+  test("without a debounce window every edit is verified on its own", async () => {
+    await configure({
+      autoRollback: false,
+      pipelines: { onFileMutation: [countingStep("check", 2)], onTurnEnd: [] },
+    });
+
+    await mutate("src/a.ts", "a\n", "call-a");
+    await mutate("src/b.ts", "b\n", "call-b");
+    assert.equal(runCount(), 2);
+  });
+
+  test("the failure payload names the kind and the file is left alone", async () => {
+    await configure({
+      autoRollback: false,
+      pipelines: { onFileMutation: [countingStep("check", 0)], onTurnEnd: [] },
+    });
+    const ok = await mutate("src/a.ts", "a\n", "call-ok");
+    assert.equal(ok, undefined, "a passing mutation changes nothing");
+  });
+
+  test("records verification metrics in the project state", async () => {
+    await configure({
+      autoRollback: false,
+      pipelines: { onFileMutation: [countingStep("check", 2)], onTurnEnd: [] },
+    });
+
+    await mutate("src/a.ts", "a\n", "call-metrics");
+    const metrics = getState().metrics;
+    assert.ok(metrics.checks >= 1, "a step ran");
+    assert.ok(metrics.failures >= 1, "and it failed");
+  });
+
+  test("escalates when the same failure repeats", async () => {
+    await configure({
+      autoFix: false,
+      autoRollback: false,
+      verification: { failureEscalation: { enabled: true, maxRepeatedFailures: 2 } },
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [
+          {
+            name: "tests",
+            cmd: "echo \"src/a.ts(1,1): error TS2322: boom\" && exit 1",
+            timeoutMs: 10000,
+          },
+        ],
+      },
+    });
+
+    await runTurn(1, "src/a.ts", "one\n");
+    assert.equal(
+      ctx._notifications.some((n) => n.text.includes("Repeated verification failure")),
+      false,
+      "one failure is not a loop",
+    );
+
+    await runTurn(2, "src/a.ts", "two\n");
+    assert.ok(
+      ctx._notifications.some((n) => n.text.includes("Repeated verification failure")),
+      "the second identical failure escalates",
+    );
+    assert.ok(getState().escalations.length >= 1, "and is audited");
+  });
+
+  test("a green run clears the escalation counters", async () => {
+    await configure({
+      autoFix: false,
+      autoRollback: false,
+      verification: { failureEscalation: { enabled: true, maxRepeatedFailures: 2 } },
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [{ name: "tests", cmd: "exit 1", timeoutMs: 10000 }],
+      },
+    });
+    await runTurn(1, "src/a.ts", "one\n");
+    await runTurn(2, "src/a.ts", "two\n");
+
+    writeConfig({
+      autoFix: false,
+      autoRollback: false,
+      backgroundTurnEnd: false,
+      verification: { failureEscalation: { enabled: true, maxRepeatedFailures: 2 } },
+      pipelines: { onFileMutation: [], onTurnEnd: [{ name: "tests", cmd: "exit 0", timeoutMs: 10000 }] },
+    });
+    await emit(fake, "session_start", { type: "session_start" }, ctx);
+    await runTurn(3, "src/a.ts", "three\n");
+
+    const status = await SentinelStatusTool.execute("s", {}, undefined, undefined, { cwd: project });
+    const text = (status.content as Array<{ text: string }>)[0].text;
+    assert.ok(text.includes("Escalating failures: none"), text);
+    assert.ok(text.includes("Performance"));
+  });
+
+  test("a rewind refuses to overwrite a file edited after that turn", async () => {
+    await configure({ autoRollback: false, pipelines: { onFileMutation: [], onTurnEnd: [] } });
+    fs.mkdirSync(path.join(project, "src"), { recursive: true });
+    fs.writeFileSync(path.join(project, "src/a.ts"), "original\n");
+
+    await runTurn(1, "src/a.ts", "agent version\n");
+    // Another process edits the file after the turn ended.
+    fs.writeFileSync(path.join(project, "src/a.ts"), "user version\n");
+
+    const result = await SentinelRewindTool.execute("r", { mode: "code" }, undefined, undefined, {
+      cwd: project,
+    });
+    const details = result.details as { rewound: boolean; conflicted: string[] };
+    assert.equal(details.rewound, false);
+    assert.equal(details.conflicted.length, 1);
+    assert.equal(fs.readFileSync(path.join(project, "src/a.ts"), "utf-8"), "user version\n");
+    const text = (result.content as Array<{ text: string }>)[0].text;
+    assert.ok(text.includes("ROLLBACK CONFLICT"), text);
+  });
+
+  test("the status tool reports the performance counters", async () => {
+    await configure({
+      autoRollback: false,
+      pipelines: { onFileMutation: [countingStep("check", 2)], onTurnEnd: [] },
+    });
+    await mutate("src/a.ts", "a\n", "call-status");
+
+    const result = await SentinelStatusTool.execute("s", {}, undefined, undefined, { cwd: project });
+    const text = (result.content as Array<{ text: string }>)[0].text;
+    assert.ok(text.includes("Performance"), text);
+    assert.ok(text.includes("checks:"));
+    assert.ok(text.includes("debounce: 0ms"));
+  });
+
+  test("/sentinel config never prints configured credentials", async () => {
+    await configure({
+      pipelines: {
+        onFileMutation: [
+          {
+            name: "leaky",
+            cmd: "exit 0",
+            timeoutMs: 1000,
+            env: { DEPLOY_TOKEN: "super-secret-token-1234" },
+          },
+        ],
+        onTurnEnd: [],
+      },
+    });
+
+    const command = fake.commands[0];
+    await command.handler("config", ctx);
+    const lines = (ctx._widgets.get("sentinel") ?? []) as string[];
+    const printed = lines.join("\n");
+    assert.equal(printed.includes("super-secret-token-1234"), false);
+    assert.ok(printed.includes("[redacted]"));
+    assert.ok(printed.includes("DEPLOY_TOKEN"), "the key stays visible");
   });
 });

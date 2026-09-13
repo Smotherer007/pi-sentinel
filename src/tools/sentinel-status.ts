@@ -13,6 +13,9 @@ import { snapshots } from "../clients/snapshot.ts";
 import { checkpoints } from "../clients/checkpoints.ts";
 import { allVerified } from "../clients/evidence.ts";
 import { graphStatus } from "../clients/mindplace.ts";
+import { peekVerificationCache } from "../clients/cache.ts";
+import { escalations } from "../clients/escalation.ts";
+import { metricsLines, turnHistoryLines, verificationLines } from "../formatting/status.ts";
 import { getConfig, getState } from "../config.ts";
 
 export const SentinelStatusTool = {
@@ -42,10 +45,6 @@ export const SentinelStatusTool = {
       return `  ${h.at} | ${h.branch} @ ${h.head} | ${h.method} | ${h.reason}`;
     });
 
-    const verifications = state.lastVerifications.slice(0, 5).map((v) => {
-      return `  ${v.at} | ${v.step} | ${v.passed ? "PASS" : "FAIL"} | exit ${v.exitCode} | ${v.durationMs}ms`;
-    });
-
     const autoFixes = state.autoFixHistory.slice(0, 5).map((a) => {
       return `  ${a.at} | ${a.step} | attempt ${a.attempt} | ${a.outcome} (${a.reason})`;
     });
@@ -60,6 +59,8 @@ export const SentinelStatusTool = {
 
     const evidence = allVerified(cwd);
     const graph = graphStatus(cwd);
+    const cacheStats = peekVerificationCache()?.stats();
+    const trackedEscalations = escalations.snapshot();
 
     const text = [
       "[sentinel] Status",
@@ -70,6 +71,8 @@ export const SentinelStatusTool = {
       `  revisionContract: ${conf.revisionContract} | backgroundTurnEnd: ${conf.backgroundTurnEnd}`,
       `  impactAwareFocus: ${conf.impactAwareFocus} | maxOutputTokens: ${conf.maxOutputTokens}`,
       `  maxTraceLines: ${conf.maxTraceLines} | checkpointRetention: ${conf.checkpointRetention}`,
+      `  debounce: ${conf.verification.debounceMs}ms | maxOutputBytes: ${conf.verification.maxOutputBytes} | killGrace: ${conf.verification.killGraceMs}ms`,
+      `  cache: ${conf.verification.cache.enabled} (ttl ${conf.verification.cache.ttlMs}ms) | escalation: ${conf.verification.failureEscalation.enabled} at ${conf.verification.failureEscalation.maxRepeatedFailures}`,
       `  pipelines onFileMutation: ${conf.pipelines.onFileMutation.length}`,
       `  pipelines onTurnEnd: ${conf.pipelines.onTurnEnd.length}`,
       `  exclude: ${conf.exclude.join(", ") || "(none)"}`,
@@ -82,6 +85,16 @@ export const SentinelStatusTool = {
           : "absent (impact analysis disabled)"
       }`,
       `  verified states: ${evidence.length}`,
+      "",
+      ...metricsLines(state.metrics),
+      "",
+      cacheStats
+        ? `Cache (this session): ${cacheStats.hits} hit(s) / ${cacheStats.misses} miss(es) / ${cacheStats.entries} entr(ies)`
+        : "Cache: not used in this session",
+      "",
+      state.turnHistory.length > 0
+        ? ["Recent turns (newest first):", ...turnHistoryLines(state.turnHistory)].join("\n")
+        : "Recent turns: none",
       "",
       checkpointList.length > 0
         ? `Recent checkpoints (${checkpointList.length}):\n${checkpointList.join("\n")}`
@@ -99,8 +112,18 @@ export const SentinelStatusTool = {
         ? `Recent regressions (${state.regressions.length}):\n${regressions.join("\n")}`
         : "Recent regressions: none",
       "",
+      trackedEscalations.length > 0
+        ? `Escalating failures (this session):\n${trackedEscalations
+            .slice(0, 5)
+            .map((e) => `  ${e.signature} — seen ${e.count}x`)
+            .join("\n")}`
+        : "Escalating failures: none",
+      "",
       state.lastVerifications.length > 0
-        ? `Recent verifications (${state.lastVerifications.length}):\n${verifications.join("\n")}`
+        ? `Recent verifications (${state.lastVerifications.length}):\n${verificationLines(
+            state.lastVerifications,
+            5,
+          ).join("\n")}`
         : "Recent verifications: none",
     ].join("\n");
 
@@ -115,6 +138,9 @@ export const SentinelStatusTool = {
         checkpoints: checkpoints.list(cwd, 5),
         verifiedStates: evidence.length,
         graph,
+        metrics: state.metrics,
+        turnHistory: state.turnHistory.slice(0, 10),
+        cache: cacheStats ?? null,
         rollbackHistory: state.rollbackHistory,
       },
     };

@@ -3,15 +3,17 @@ import { defineConfig } from "./src/config.ts";
 /**
  * Sentinel's own configuration.
  *
- * This file is deliberately explicit: it spells out every switch in one place,
- * at the library's defaults. The single deliberate exception is `autoRollback`,
- * which is off *for this repository* (see below). Elsewhere the guard is meant
- * to feel like Codex / Claude Code out of the box, not like a switchboard to
- * assemble first.
+ * This file is deliberately explicit: it spells out every switch in one place.
+ * Two deliberate exceptions to the library defaults exist *for this
+ * repository*, both marked below: `autoRollback` is off, and so is
+ * `revertOnRegression`. Everything else is on, including the three new P6
+ * features (debounce, cache, escalation), which are opt-in in the library so
+ * that upgrading never changes behaviour by surprise.
  */
 export default defineConfig({
   // ── master switches ────────────────────────────────────────────────────
   enabled: true,
+
   // A failing check restores the files that were changed. Destructive by
   // design: "bad code never pollutes the agent's context". The pre-state is
   // preserved as a checkpoint, so /sentinel rewind can still recover it.
@@ -33,7 +35,11 @@ export default defineConfig({
 
   // ── P2: state-bound evidence ───────────────────────────────────────────
   trackVerifiedState: true,
-  revertOnRegression: true,
+  // Also deliberately OFF for the same reason as autoRollback: a multi-file
+  // refactor is red between edits, and restoring the previous green revision
+  // would silently undo the edit that was just made. The ledger still records
+  // regressions and reports them — it just does not overwrite.
+  revertOnRegression: false,
   pruneStaleTraces: true,
 
   // ── P3: out-of-band changes ────────────────────────────────────────────
@@ -47,6 +53,34 @@ export default defineConfig({
   backgroundTurnEnd: true,
   maxOutputTokens: 2500,
 
+  // ── P6: performance, cache & escalation ────────────────────────────────
+  verification: {
+    // Parallel edits in one assistant message become one type-check instead of
+    // one per edit; sequential edits pay 150 ms of latency. `/sentinel verify`
+    // and the `sentinel_verify` tool always bypass the window.
+    debounceMs: 150,
+    // A step that prints more than this is truncated head+tail before it can
+    // reach the model. Not a toggle: it only bounds the damage.
+    maxOutputBytes: 262144,
+    // SIGTERM, then SIGKILL after this grace period, for the whole process tree.
+    killGraceMs: 500,
+    cache: {
+      // Reuse a passing run for an identical code state. Keyed by file content,
+      // lock/tsconfig content, step configuration, Node version and the
+      // environment variables that can change a result.
+      enabled: true,
+      ttlMs: 300000,
+      maxEntries: 50,
+      persist: true,
+    },
+    failureEscalation: {
+      // Three identical failures in a row mean the approach is wrong, not the
+      // last edit — say so instead of letting the loop repeat itself.
+      enabled: true,
+      maxRepeatedFailures: 3,
+    },
+  },
+
   // ── mindplace synergy ─────────────────────────────────────────────────
   impactAwareFocus: true,
 
@@ -57,13 +91,39 @@ export default defineConfig({
       // Keep this group FAST — it runs after every edit/write. The project's
       // own script uses the locally installed TypeScript (no `npx` registry
       // lookup) and `--incremental`, so repeat runs only re-check changed
-      // files.
-      { name: "type-check", cmd: "npm run typecheck", timeoutMs: 60000 },
+      // files. `files` restricts the step to the file types it can judge; a
+      // step without `files` always runs.
+      {
+        name: "type-check",
+        cmd: "npm run typecheck",
+        timeoutMs: 60000,
+        priority: "critical",
+        files: ["**/*.ts", "**/*.tsx"],
+      },
+      // The linter is a warning: it must never fail a turn or trigger a
+      // rollback, and projects without eslint stay usable.
+      {
+        name: "linter",
+        cmd: "npx eslint --quiet",
+        timeoutMs: 8000,
+        priority: "warning",
+        files: ["**/*.ts", "**/*.tsx"],
+      },
     ],
     onTurnEnd: [
       // Slow, whole-project checks belong at turn end. Runs in the background
       // unless backgroundTurnEnd is disabled.
-      { name: "unit-tests", cmd: "npm test", timeoutMs: 120000 },
+      //
+      // `cacheable: false` on purpose: this suite is the slowest step in the
+      // loop and the one whose result is least likely to be a pure function of
+      // the file contents, so it is never served from the cache.
+      {
+        name: "unit-tests",
+        cmd: "npm test",
+        timeoutMs: 120000,
+        priority: "critical",
+        cacheable: false,
+      },
     ],
   },
 

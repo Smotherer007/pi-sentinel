@@ -45,6 +45,16 @@ describe("revisionContractText", () => {
     );
   });
 
+  test("states the escalation rule only when escalation is on", () => {
+    const on = revisionContractText(
+      defineConfig({ verification: { failureEscalation: { enabled: true, maxRepeatedFailures: 3 } } }),
+    );
+    const off = revisionContractText(defineConfig({}));
+    assert.ok(on.includes("stop varying the same edit"));
+    assert.ok(on.includes("3 times"));
+    assert.equal(off.includes("stop varying the same edit"), false);
+  });
+
   test("returns nothing when disabled", () => {
     assert.equal(revisionContractText(defineConfig({ revisionContract: false })), "");
   });

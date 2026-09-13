@@ -4,7 +4,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { createHash } from "node:crypto";
+
 import { CheckpointStore } from "../src/clients/checkpoints.ts";
+import { snapshotFile as store_snapshot } from "../src/clients/snapshot.ts";
 import { describeRestore } from "../src/clients/snapshot.ts";
 
 let home: string;
@@ -203,5 +206,68 @@ describe("checkpoint housekeeping", () => {
     assert.deepEqual(store.list(dir), []);
     assert.equal(store.latest(dir), null);
     assert.equal(store.restore(dir).attempted, false);
+  });
+});
+
+describe("checkpoint conflict detection", () => {
+  test("refuses to overwrite a file that changed after the checkpointed turn", () => {
+    const file = write("conflict.ts", "original\n");
+    store.begin({ turnIndex: 1 });
+    store.capture(file);
+    fs.writeFileSync(file, "agent version\n");
+    const hash = createHash("sha1").update("agent version\n").digest("hex");
+    store.captureSnapshots([store_snapshot(file)], new Map([[file, hash]]));
+    const summary = store.flush(dir, 50);
+    assert.ok(summary);
+
+    // Somebody else edits the file after that turn ended.
+    fs.writeFileSync(file, "user version\n");
+
+    const report = store.restore(dir, summary.id);
+    assert.deepEqual(report.conflicted, [file]);
+    assert.equal(report.partial, true);
+    assert.equal(fs.readFileSync(file, "utf-8"), "user version\n", "later work survives");
+  });
+
+  test("restores when the file still matches what the turn left", () => {
+    const file = write("clean.ts", "original\n");
+    store.begin({ turnIndex: 1 });
+    store.capture(file);
+    fs.writeFileSync(file, "agent version\n");
+    const hash = createHash("sha1").update("agent version\n").digest("hex");
+    store.captureSnapshots([store_snapshot(file)], new Map([[file, hash]]));
+    const summary = store.flush(dir, 50)!;
+
+    const report = store.restore(dir, summary.id);
+    assert.deepEqual(report.conflicted, []);
+    assert.equal(fs.readFileSync(file, "utf-8"), "original\n");
+  });
+
+  test("force overwrites a conflicted file when explicitly requested", () => {
+    const file = write("forced.ts", "original\n");
+    store.begin({ turnIndex: 1 });
+    store.capture(file);
+    fs.writeFileSync(file, "agent\n");
+    store.captureSnapshots([store_snapshot(file)], new Map([[file, "deadbeef"]]));
+    const summary = store.flush(dir, 50)!;
+    fs.writeFileSync(file, "user\n");
+
+    const report = store.restore(dir, summary.id, { force: true });
+    assert.deepEqual(report.conflicted, []);
+    assert.equal(fs.readFileSync(file, "utf-8"), "original\n");
+  });
+
+  test("a manifest without post hashes restores as before (back-compatible)", () => {
+    const file = write("legacy.ts", "original\n");
+    store.begin({ turnIndex: 1 });
+    store.capture(file);
+    fs.writeFileSync(file, "agent\n");
+    store.captureSnapshots([store_snapshot(file)]);
+    const summary = store.flush(dir, 50)!;
+    fs.writeFileSync(file, "user\n");
+
+    const report = store.restore(dir, summary.id);
+    assert.deepEqual(report.conflicted, [], "no information, no conflict");
+    assert.equal(fs.readFileSync(file, "utf-8"), "original\n");
   });
 });

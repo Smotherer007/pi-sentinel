@@ -29,7 +29,7 @@ import {
   MAX_SNAPSHOT_BYTES,
 } from "./snapshot.ts";
 import type { FileSnapshot, RestoreReport } from "./snapshot.ts";
-import type { CheckpointSummary } from "../types.ts";
+import type { CheckpointSummary, RollbackConflict } from "../types.ts";
 
 export interface CheckpointMeta {
   turnIndex: number;
@@ -47,6 +47,12 @@ interface StoredFile {
   incomplete: boolean;
   blob?: string;
   hash?: string;
+  /**
+   * SHA-1 of what the agent's turn left in the file, or `null` when the file
+   * did not exist afterwards. Absent for manifests written before this field
+   * existed, which disables the conflict check for that file.
+   */
+  postHash?: string | null;
 }
 
 interface Manifest extends CheckpointMeta {
@@ -60,6 +66,8 @@ interface Manifest extends CheckpointMeta {
 interface Pending {
   meta: CheckpointMeta;
   files: Map<string, FileSnapshot>;
+  /** Post-mutation hash per path, when the caller could provide one. */
+  posts: Map<string, string | null>;
 }
 
 function checkpointsDir(cwd: string): string {
@@ -70,12 +78,21 @@ function hashBuffer(data: Buffer): string {
   return createHash("sha1").update(data).digest("hex");
 }
 
+/** SHA-1 of a file on disk, or `null` when it is not there. */
+function hashPath(absPath: string): string | null {
+  try {
+    return createHash("sha1").update(fs.readFileSync(absPath)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
 export class CheckpointStore {
   private pending: Pending | null = null;
 
   /** Start a new checkpoint scope for a turn. */
   begin(meta: CheckpointMeta): void {
-    this.pending = { meta, files: new Map() };
+    this.pending = { meta, files: new Map(), posts: new Map() };
   }
 
   /** True while a turn is being captured. */
@@ -98,13 +115,15 @@ export class CheckpointStore {
 
   /**
    * Import snapshots the in-memory store already read, so a turn is never
-   * read from disk twice.
+   * read from disk twice. `postHashes` carries what the agent left behind, so
+   * a later restore can refuse to overwrite a file edited since then.
    */
-  captureSnapshots(snaps: FileSnapshot[]): void {
+  captureSnapshots(snaps: FileSnapshot[], postHashes?: Map<string, string | null>): void {
     if (!this.pending) return;
     for (const snap of snaps) {
       const key = path.resolve(snap.path);
       if (!this.pending.files.has(key)) this.pending.files.set(key, snap);
+      if (postHashes?.has(key)) this.pending.posts.set(key, postHashes.get(key) ?? null);
     }
   }
 
@@ -142,6 +161,9 @@ export class CheckpointStore {
           existed: snap.existed,
           incomplete: snap.incomplete,
         };
+        if (pending.posts.has(snap.path)) {
+          entry.postHash = pending.posts.get(snap.path) ?? null;
+        }
         if (snap.data && !snap.incomplete && snap.data.length <= MAX_SNAPSHOT_BYTES) {
           const blob = `${index}.blob`;
           fs.writeFileSync(path.join(blobDir, blob), snap.data, { mode: 0o600 });
@@ -205,8 +227,13 @@ export class CheckpointStore {
     return this.list(cwd, 1)[0] ?? null;
   }
 
-  /** Restore a checkpoint (default: the newest) onto the working tree. */
-  restore(cwd: string, id?: string): RestoreReport {
+  /**
+   * Restore a checkpoint (default: the newest) onto the working tree.
+   *
+   * A file that changed after the checkpointed turn is *not* overwritten
+   * unless `force` is set: that later edit is invisible to the user otherwise.
+   */
+  restore(cwd: string, id?: string, options: { force?: boolean } = {}): RestoreReport {
     const manifest = id ? findManifest(cwd, id) : latestManifest(cwd);
     if (!manifest) return emptyRestoreReport();
 
@@ -216,6 +243,16 @@ export class CheckpointStore {
 
     // Reverse order, matching the in-memory store: later writes undo first.
     for (const file of [...manifest.files].reverse()) {
+      if (!options.force && file.postHash !== undefined && hashPath(file.path) !== file.postHash) {
+        report.conflicted.push(file.path);
+        report.conflicts.push({
+          path: file.path,
+          expectedHash: file.postHash,
+          actualHash: hashPath(file.path),
+          reason: "modified after the Sentinel checkpoint",
+        } as RollbackConflict);
+        continue;
+      }
       const snapshot = materialise(dir, file);
       const outcome = restoreFileSnapshot(snapshot);
       if (outcome === "restored") report.restored.push(file.path);
@@ -223,7 +260,7 @@ export class CheckpointStore {
       else report.skipped.push(file.path);
     }
 
-    report.partial = report.skipped.length > 0;
+    report.partial = report.skipped.length > 0 || report.conflicted.length > 0;
     return report;
   }
 

@@ -23,7 +23,7 @@ import { formatError } from "./pruner.ts";
 import { applyOutputCap } from "../clients/spill.ts";
 import { detectRegressions, stateHashOf } from "../clients/evidence.ts";
 import { impactOfAll } from "../clients/mindplace.ts";
-import type { Regression, SpillResult } from "../types.ts";
+import type { FailureKind, Regression, RollbackConflict, SpillResult } from "../types.ts";
 
 export interface FailureFeedbackInput {
   cwd: string;
@@ -40,6 +40,18 @@ export interface FailureFeedbackInput {
   stateHash?: string;
   /** P0 retry accounting, omitted for on-demand runs. */
   attempt?: { attempt: number; max: number; stopped?: boolean };
+  /** P6: classification of the failure, and what it implies. */
+  failureKind?: FailureKind;
+  /** P6: true when the step was killed because it exceeded its timeout. */
+  timedOut?: boolean;
+  /** P6: one-line summary of what failed. */
+  errorSummary?: string;
+  /** P6: attempts needed by the failing step (only interesting when > 1). */
+  attempts?: number;
+  /** P6: the same failure has now been seen this many times. */
+  escalation?: { count: number; max: number };
+  /** P6: files left untouched because they changed since the snapshot. */
+  conflicts?: RollbackConflict[];
   /**
    * Regressions detected *before* any revert ran. Callers that restore files
    * must pass the pre-revert list, otherwise the feedback would claim
@@ -84,6 +96,12 @@ export function buildFailureFeedback(input: FailureFeedbackInput): SpillResult {
     // when a caller forgot to compute it.
     stateHash: input.stateHash ?? stateHashOf(input.focusPaths),
     attempt: input.attempt,
+    failureKind: input.failureKind,
+    timedOut: input.timedOut,
+    errorSummary: input.errorSummary,
+    attempts: input.attempts,
+    escalation: input.escalation,
+    conflicts: input.conflicts,
   });
 
   return applyOutputCap(text, input.maxOutputTokens, spillDir(input.cwd), input.step);

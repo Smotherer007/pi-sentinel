@@ -2,100 +2,87 @@
  * TracePruner — pure formatting functions for pruning terminal output.
  *
  * Failed tool executions produce huge, noisy outputs (bundler logs, lint
- * waterfalls, full stack traces). Sentinel prunes these down to the N most
- * critical lines, saving tokens and keeping the loop's context clean.
+ * waterfalls, full stack traces). Sentinel prunes these down to the most
+ * *valuable* lines, not merely the first or last ones: compiler diagnostics
+ * and failing tests outrank stack frames, source locations outrank context,
+ * and download notices rank last (see `lines.ts` for the ordering).
  *
  * These are pure string-in / string-out functions (like pi-email's
  * formatting/formatters.ts) — no I/O, no side effects.
  */
 
-/** Matches ANSI SGR / CSI escape sequences emitted by colourised tools. */
-// eslint-disable-next-line no-control-regex
-const ANSI_PATTERN = /\u001b\[[0-9;]*[A-Za-z]/g;
+import { RANK, dedupeLines, isDiagnosticRank, rankLine, stripAnsi } from "./lines.ts";
+import { failureAdvice, failureHeadline } from "./classify.ts";
+import type { FailureKind, GraphImpact, Regression, RollbackConflict } from "../types.ts";
 
-/** Signals that a line is worth keeping (errors, diagnostics, stack frames). */
-const CRITICAL_PATTERNS: RegExp[] = [
-  /error/i,
-  /fail/i,
-  /\bTS\d{4}\b/,
-  /:\d+:\d+/,
-  /^error\[/,
-  /^\w+\.error/,
-  /^Error:/,
-  /^\s*at\s/, // Node stack frames
-];
-
-function isCritical(line: string): boolean {
-  return CRITICAL_PATTERNS.some((re) => re.test(line));
-}
-
-/** Collapse consecutive duplicate lines while keeping the first occurrence. */
-function dedupe(lines: string[]): string[] {
-  const out: string[] = [];
-  for (const line of lines) {
-    if (out.length > 0 && out[out.length - 1] === line) continue;
-    out.push(line);
-  }
-  return out;
+interface RankedLine {
+  line: string;
+  rank: number;
+  /** Position in the original output, used to keep a stable order. */
+  index: number;
 }
 
 /**
  * Extract the most informative error lines from raw process output.
  *
- * Heuristics:
- *   - Lines containing /error/i, /fail/i, /warning/i
- *   - Lines with file:line:column patterns (TS, eslint, gcc, etc.)
- *   - Lines starting with known error codes (TS####, E####, error[E####])
- *   - Stack frames (`  at foo (file:line:col)`)
- *   - Lines mentioning one of `focusPaths` (the files just mutated) are
- *     promoted to the front — those are the diagnostics the agent can act on.
- *   - First/last lines of a trace are kept as context anchors when nothing
- *     matched at all.
+ * Ordering: focus paths first (the files just mutated), then by rank, then by
+ * original position. When the output contains no diagnostic at all, the
+ * first/last lines are kept as anchors rather than returning nothing.
  *
  * @param rawOutput    Raw combined stdout/stderr of the failed step.
  * @param maxLines     Hard cap on returned lines (including the "..." marker).
  * @param focusPaths   Optional file paths to prioritise (absolute or relative).
  */
-import type { GraphImpact, Regression, SpillResult } from "../types.ts";
-
 export function pruneTrace(rawOutput: string, maxLines: number, focusPaths: string[] = []): string {
   if (!rawOutput.trim()) return "";
   if (maxLines <= 0) return "";
 
-  const clean = rawOutput.replace(ANSI_PATTERN, "");
-  const lines = clean.split("\n").map((l) => l.trimEnd());
-
-  const focused: string[] = [];
-  const critical: string[] = [];
+  const lines = stripAnsi(rawOutput).split("\n").map((line) => line.trimEnd());
   const focusNeedles = focusPaths
     .filter(Boolean)
-    .map((p) => p.replace(/\\/g, "/"));
+    .map((path) => path.replace(/\\/g, "/"));
 
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-
+  const ranked: RankedLine[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim();
+    if (!line) continue;
     // Focused lines are kept even if they don't look like errors — a compiler
     // pointing at the file we just touched is always the most useful signal.
-    const normalised = trimmed.replace(/\\/g, "/");
-    if (focusNeedles.some((needle) => normalised.includes(needle))) {
-      focused.push(trimmed);
-      continue;
-    }
-    if (isCritical(trimmed)) critical.push(trimmed);
+    const normalised = line.replace(/\\/g, "/");
+    const focused = focusNeedles.some((needle) => normalised.includes(needle));
+    ranked.push({ line, rank: focused ? RANK.focus : rankLine(line), index });
   }
 
-  let result = dedupe([...focused, ...critical]);
+  const hasDiagnostics = ranked.some((entry) => isDiagnosticRank(entry.rank));
 
-  // If nothing looked critical, keep first/last lines as anchors.
-  if (result.length === 0) {
-    const anchors: string[] = lines.slice(0, 3).map((l) => l.trim());
-    if (lines.length > 6) {
-      anchors.push("...");
-      anchors.push(...lines.slice(-3).map((l) => l.trim()));
+  let selected: RankedLine[];
+  if (hasDiagnostics) {
+    // Context (an indented continuation, a caret line, a source snippet) is
+    // only useful directly next to a diagnostic it belongs to.
+    const adjacent = new Set<number>();
+    for (const entry of ranked) {
+      if (!isDiagnosticRank(entry.rank)) continue;
+      adjacent.add(entry.index + 1);
+      adjacent.add(entry.index - 1);
     }
-    result = dedupe(anchors.filter((l) => l.length > 0));
+    selected = ranked.filter(
+      (entry) => isDiagnosticRank(entry.rank) || (entry.rank === RANK.context && adjacent.has(entry.index)),
+    );
+  } else {
+    // Nothing looked diagnostic: keep first/last lines as anchors.
+    const anchors: RankedLine[] = ranked.slice(0, 3);
+    if (ranked.length > 6) {
+      anchors.push({ line: "...", rank: RANK.noise, index: -1 });
+      anchors.push(...ranked.slice(-3));
+    }
+    selected = anchors;
   }
+
+  let result = dedupeLines(
+    [...selected]
+      .sort((a, b) => a.rank - b.rank || a.index - b.index)
+      .map((entry) => entry.line),
+  );
 
   // Cap to maxLines while keeping a header *and* a footer anchor.
   if (result.length > maxLines) {
@@ -135,24 +122,62 @@ export function formatError(failure: {
   stateHash?: string;
   /** P0: bounded-retry accounting for this attempt. */
   attempt?: { attempt: number; max: number; stopped?: boolean };
+  /** P6: what kind of failure this was, and what it means. */
+  failureKind?: FailureKind;
+  /** P6: true when the step was killed because it exceeded its timeout. */
+  timedOut?: boolean;
+  /** P6: one-line summary of the failure. */
+  errorSummary?: string;
+  /** P6: the same failure has now been seen this many times. */
+  escalation?: { count: number; max: number };
+  /** P6: files left untouched because they changed since the snapshot. */
+  conflicts?: RollbackConflict[];
+  /** P6: how many attempts the step needed (only when > 1). */
+  attempts?: number;
 }): string {
   const header = `[sentinel] Verification failed at step "${failure.step}"`;
-  const exit = `exit code: ${failure.exitCode} | duration: ${failure.durationMs}ms`;
+  const exitParts = [`exit code: ${failure.exitCode}`, `duration: ${failure.durationMs}ms`];
+  if (failure.attempts && failure.attempts > 1) exitParts.push(`attempts: ${failure.attempts}`);
+  if (failure.failureKind) exitParts.push(`kind: ${failureHeadline(failure.failureKind)}`);
+  if (failure.timedOut) exitParts.push("timed out");
+  const exit = exitParts.join(" | ");
   const trace = failure.prunedTrace || failure.rawOutput.slice(0, 2000);
+
+  const conflicts = failure.conflicts ?? [];
 
   let advice: string;
   if (failure.warnOnly) {
     advice = "This is a WARNING only; no rollback was performed.";
   } else if (failure.rolledBack) {
     advice = "Your changes were rolled back. Re-apply them only after fixing the cause.";
+  } else if (conflicts.length > 0) {
+    advice =
+      "Sentinel restored what it could and left the conflicted files as they are. Review those files before editing again — the restore did not finish.";
   } else {
     advice =
       "Your changes are still in place. Fix the reported error; do not repeat the same edit.";
   }
 
   const lines = [header, exit];
+  if (failure.errorSummary) lines.push(`what failed: ${failure.errorSummary}`);
   if (failure.stateHash) lines.push(`state: ${failure.stateHash}`);
   lines.push("─".repeat(60), trace, "─".repeat(60));
+
+  // P6: a file that the agent did not write and sentinel therefore refuses to
+  // touch. This is the one message that must never be softened: the restore
+  // did *not* happen.
+  if (conflicts.length > 0) {
+    lines.push(`ROLLBACK CONFLICT (${conflicts.length} file(s)) — NOT overwritten:`);
+    for (const conflict of conflicts.slice(0, 5)) {
+      lines.push(`  ${shortPath(conflict.path)} was modified after the Sentinel snapshot.`);
+      if (conflict.expectedHash || conflict.actualHash) {
+        lines.push(
+          `    expected: ${conflict.expectedHash?.slice(0, 12) ?? "absent"} | current: ${conflict.actualHash?.slice(0, 12) ?? "absent"}`,
+        );
+      }
+    }
+    lines.push("  The file was NOT overwritten. Manual recovery required.");
+  }
 
   // P2: the strongest signal sentinel can give — this used to be green.
   const regressions = failure.regressions ?? [];
@@ -183,6 +208,13 @@ export function formatError(failure: {
 
   lines.push(advice);
 
+  // P6: do not send the agent back to edit code that the failure was not
+  // about (timeouts, missing binaries, environment problems).
+  if (failure.failureKind && !failure.warnOnly) {
+    const kindAdvice = failureAdvice(failure.failureKind);
+    if (kindAdvice) lines.push(kindAdvice);
+  }
+
   // P0: bounded retries, reported to the model so it knows when to stop.
   if (failure.attempt && !failure.warnOnly) {
     const { attempt, max, stopped } = failure.attempt;
@@ -190,6 +222,15 @@ export function formatError(failure: {
       stopped
         ? `Repair attempt ${attempt}/${max} produced an identical code state — stop editing and report instead.`
         : `Repair attempt ${attempt}/${max}. After ${max}, stop and report what still fails instead of editing again.`,
+    );
+  }
+
+  // P6: the same failure has repeated — the current approach is not working.
+  if (failure.escalation) {
+    const { count, max } = failure.escalation;
+    lines.push(
+      "Repeated verification failure detected.",
+      `The same error occurred ${count} time(s) (threshold ${max}). Do not repeat the same approach — re-evaluate the implementation before editing again.`,
     );
   }
 
@@ -201,6 +242,3 @@ function shortPath(absPath: string): string {
   const parts = absPath.split(/[\\/]/);
   return parts.length > 2 ? parts.slice(-2).join("/") : absPath;
 }
-
-/** Re-exported so callers can type their spill results. */
-export type { SpillResult };

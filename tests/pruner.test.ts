@@ -207,3 +207,123 @@ describe("formatError", () => {
     assert.ok(traceAt < regressionAt && regressionAt < impactAt && impactAt < adviceAt, text);
   });
 });
+
+describe("pruneTrace ranking", () => {
+  test("keeps the compiler error and drops npm noise, whatever the order", () => {
+    const output = [
+      "npm notice Downloading typescript",
+      "npm notice done",
+      "  at Module._compile (node:internal/modules/cjs/loader:1:2)",
+      "src/a.ts(42,17): error TS2322: Type 'string' is not assignable to type 'number'.",
+    ].join("\n");
+
+    const result = pruneTrace(output, 12);
+    assert.ok(result.includes("error TS2322"));
+    assert.ok(result.includes("at Module._compile"), "stack frames are kept as evidence");
+    assert.equal(result.includes("Downloading"), false, "download notices are noise");
+    assert.ok(result.indexOf("error TS2322") < result.indexOf("at Module._compile"), "diagnostics first");
+  });
+
+  test("keeps a context line that belongs to a diagnostic", () => {
+    const output = [
+      "some unrelated banner",
+      "error TS2322: Type 'string' is not assignable to type 'number'.",
+      "  42 | const x: number = 'nope';",
+    ].join("\n");
+
+    const result = pruneTrace(output, 12);
+    assert.ok(result.includes("42 | const x: number"), "the source line explains the error");
+    assert.equal(result.includes("unrelated banner"), false);
+  });
+
+  test("drops context that belongs to nothing", () => {
+    const output = ["error TS1000: real", "  99 | orphaned context line"].join("\n");
+    const result = pruneTrace(output, 12);
+    assert.ok(result.includes("error TS1000"));
+  });
+
+  test("ranks a test failure above a version banner", () => {
+    const output = ["v22.0.0", "✖ adds two numbers", "npm notice lifecycle"].join("\n");
+    const result = pruneTrace(output, 12);
+    assert.ok(result.includes("adds two numbers"));
+    assert.equal(result.includes("npm notice"), false);
+  });
+});
+
+describe("formatError — structured failure information", () => {
+  const base = {
+    step: "type-check",
+    exitCode: 2,
+    durationMs: 10,
+    prunedTrace: "error TS2322",
+    rawOutput: "raw",
+    warnOnly: false,
+  };
+
+  test("names the failure kind and the concrete error", () => {
+    const text = formatError({
+      ...base,
+      failureKind: "type-error",
+      errorSummary: "src/a.ts(1,1): error TS2322: nope",
+    });
+    assert.ok(text.includes("kind: type error"));
+    assert.ok(text.includes("what failed: src/a.ts(1,1): error TS2322: nope"));
+  });
+
+  test("tells the agent a timeout is not a code error", () => {
+    const text = formatError({ ...base, failureKind: "timeout", timedOut: true });
+    assert.ok(text.includes("timed out"));
+    assert.ok(text.includes("not a code error"));
+    assert.ok(text.includes("still in place"), "a timeout never triggers a rollback");
+  });
+
+  test("tells the agent not to fix code for a missing command", () => {
+    const text = formatError({ ...base, failureKind: "command-not-found" });
+    assert.ok(text.includes("could not be started"));
+    assert.ok(text.includes("do not change application code"));
+  });
+
+  test("reports how many attempts a retried step needed", () => {
+    const text = formatError({ ...base, attempts: 2 });
+    assert.ok(text.includes("attempts: 2"));
+  });
+
+  test("reports a rollback conflict without claiming a restore", () => {
+    const text = formatError({
+      ...base,
+      failureKind: "type-error",
+      conflicts: [
+        {
+          path: "/repo/src/foo.ts",
+          expectedHash: "aaaaaaaaaaaa",
+          actualHash: "bbbbbbbbbbbb",
+          reason: "modified after the Sentinel snapshot",
+        },
+      ],
+    });
+    assert.ok(text.includes("ROLLBACK CONFLICT"));
+    assert.ok(text.includes("src/foo.ts was modified after the Sentinel snapshot."));
+    assert.ok(text.includes("The file was NOT overwritten. Manual recovery required."));
+    assert.equal(text.includes("still in place"), false, "a conflict is not a clean no-op");
+  });
+
+  test("escalates a repeated failure with explicit guidance", () => {
+    const text = formatError({ ...base, failureKind: "type-error", escalation: { count: 3, max: 3 } });
+    assert.ok(text.includes("Repeated verification failure detected."));
+    assert.ok(text.includes("occurred 3 time(s)"));
+    assert.ok(text.includes("Do not repeat the same approach"));
+  });
+
+  test("places the rollback advice before the kind-specific hint", () => {
+    const text = formatError({ ...base, rolledBack: true, failureKind: "timeout", timedOut: true });
+    const rollbackAt = text.indexOf("Your changes were rolled back");
+    const kindAt = text.indexOf("This is a timeout");
+    assert.ok(rollbackAt >= 0 && kindAt >= 0, text);
+    assert.ok(rollbackAt < kindAt, "the outcome first, then what to do about the kind");
+  });
+
+  test("appends the escalation after the advice, so the advice is read first", () => {
+    const text = formatError({ ...base, failureKind: "test-failure", escalation: { count: 3, max: 3 } });
+    assert.ok(text.indexOf("Fix the reported error") < text.indexOf("Repeated verification failure"));
+  });
+});

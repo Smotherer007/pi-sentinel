@@ -66,14 +66,23 @@ import { isAbsolute, resolve, relative, sep } from "node:path";
 
 import { PipelineRunner } from "./src/clients/pipeline-runner.ts";
 import { GitClient } from "./src/clients/git-client.ts";
-import { rollbackMutation, rollbackTurn, rollbackToHead } from "./src/clients/rollback.ts";
+import {
+  rollbackMutation,
+  rollbackMutations,
+  rollbackTurn,
+  rollbackToHead,
+} from "./src/clients/rollback.ts";
 import { snapshots, describeRestore } from "./src/clients/snapshot.ts";
 import { checkpoints } from "./src/clients/checkpoints.ts";
 import { stateHashOf, recordVerified, detectRegressions, revertToVerified } from "./src/clients/evidence.ts";
 import { outOfBandChanges } from "./src/clients/workspace.ts";
 import { describeChange, expandWithDependents } from "./src/clients/mindplace.ts";
+import { VerificationQueue } from "./src/clients/queue.ts";
+import { escalations, shouldEscalate } from "./src/clients/escalation.ts";
 import { buildFailureFeedback, spillDir } from "./src/formatting/feedback.ts";
 import { applyOutputCap } from "./src/clients/spill.ts";
+import { metricsLines, turnHistoryLines } from "./src/formatting/status.ts";
+import { redactEnv } from "./src/formatting/redact.ts";
 import { revisionContractText } from "./src/prompt/contract.ts";
 import {
   loadConfig,
@@ -83,9 +92,17 @@ import {
   recordRollback,
   recordAutoFix,
   recordRegression,
+  recordMetrics,
+  recordEscalation,
+  recordTurnOutcome,
   projectDir,
 } from "./src/config.ts";
-import type { PipelineRunResult, Regression, VerificationResult } from "./src/types.ts";
+import type {
+  PipelineRunResult,
+  Regression,
+  RollbackConflict,
+  VerificationResult,
+} from "./src/types.ts";
 
 import { SentinelVerifyTool } from "./src/tools/sentinel-verify.ts";
 import { SentinelRollbackTool } from "./src/tools/sentinel-rollback.ts";
@@ -136,6 +153,8 @@ interface VerificationOutcome {
   passed: boolean;
   /** Identity of the code state the outcome refers to. */
   stateHash: string;
+  /** The files the run actually covered (a coalesced batch covers several). */
+  focusPaths: string[];
   /** First critical failure, when the run failed. */
   failure?: VerificationResult;
   warnings: PipelineRunResult["warnings"];
@@ -146,6 +165,18 @@ interface VerificationOutcome {
    * feedback can say "this was green, I put it back" instead of hiding it.
    */
   regressions: Regression[];
+  /** Files left untouched because they changed after the agent's mutation. */
+  conflicts: RollbackConflict[];
+  /** Set once the same failure has been seen often enough to escalate. */
+  escalation?: { count: number; max: number };
+}
+
+/** One mutation's verification request, batched by the queue. */
+interface MutationRequest {
+  cwd: string;
+  ctx: { ui: ExtensionUIContext };
+  focusPaths: string[];
+  toolCallIds: string[];
 }
 
 type AutoFixAction = "inject" | "stop-unchanged" | "exhausted" | "none";
@@ -163,18 +194,43 @@ export default function (pi: ExtensionAPI) {
   let backgroundRun: Promise<void> | null = null;
 
   /**
+   * Mutation verifications are batched: with a debounce window, edits that
+   * land together (parallel tool calls in one assistant message) produce a
+   * single run instead of one run per edit. With the default window of `0`
+   * this is a direct pass-through and behaves exactly as before.
+   */
+  const mutationQueue = new VerificationQueue<string, MutationRequest, VerificationOutcome>(
+    async (_key, requests) => {
+      const first = requests[0];
+      return runVerification({
+        trigger: "onFileMutation",
+        cwd: first.cwd,
+        ctx: first.ctx,
+        // One run, the union of every request in the batch.
+        focusPaths: [...new Set(requests.flatMap((request) => request.focusPaths))],
+        toolCallIds: [...new Set(requests.flatMap((request) => request.toolCallIds))],
+      });
+    },
+    0,
+  );
+
+  /**
    * Resolve configuration on every session event (cwd-aware). We reload
    * each time so editing `sentinel.config.ts` takes effect without a pi
-   * restart — loadConfig cache-busts the module by its file mtime.
+   * restart — loadConfig cache-busts the module by its file content.
    */
   async function ensureConfig(cwd: string): Promise<void> {
     await loadConfig(cwd);
+    // The debounce window is configuration, and configuration can change.
+    mutationQueue.setDebounce(getConfig().verification.debounceMs);
   }
 
   function resetRepairBudget(): void {
     autoFixAttempts = 0;
     lastInjectedStateHash = null;
     lastInjectedPaths = [];
+    // A new user turn (or a repaired loop) is a fresh start for escalation.
+    escalations.reset();
   }
 
   /**
@@ -217,17 +273,28 @@ export default function (pi: ExtensionAPI) {
     cwd: string;
     ctx: { ui: ExtensionUIContext };
     focusPaths: string[];
-    toolCallId?: string;
+    /** Mutations this verification belongs to (a coalesced batch holds several). */
+    toolCallIds?: string[];
     /** Set false in background mode: a later turn owns the tree by then. */
     allowRollback?: boolean;
+    /** Bypass the verification cache (explicit runs). */
+    skipCache?: boolean;
   }): Promise<VerificationOutcome> {
     const conf = getConfig();
     const runner = new PipelineRunner();
-    const run = await runner.runAll(args.trigger, args.cwd, { focusPaths: args.focusPaths });
+    const run = await runner.runAll(args.trigger, args.cwd, {
+      focusPaths: args.focusPaths,
+      changedFiles: args.focusPaths,
+      skipCache: args.skipCache,
+    });
     const stateHash = stateHashOf(args.focusPaths);
 
     if (run.passed) {
       args.ctx.ui.setStatus("sentinel", undefined);
+      // A green run means the repair loop converged: stop escalating. Runs that
+      // executed nothing at all prove nothing, so they must not clear the
+      // counters either (an empty mutation group fires after every edit).
+      if (run.steps.length > 0) escalations.reset();
       // Evidence only counts when something actually ran: an empty pipeline
       // group proves nothing, and claiming "verified" for it would be a lie.
       if (conf.trackVerifiedState && args.focusPaths.length > 0 && run.steps.length > 0) {
@@ -242,7 +309,15 @@ export default function (pi: ExtensionAPI) {
         }
       }
       notifyWarnings(args.ctx, run.warnings, args.cwd);
-      return { passed: true, stateHash, warnings: run.warnings, rolledBack: false, regressions: [] };
+      return {
+        passed: true,
+        stateHash,
+        focusPaths: args.focusPaths,
+        warnings: run.warnings,
+        rolledBack: false,
+        regressions: [],
+        conflicts: [],
+      };
     }
 
     const failure = run.failure!;
@@ -255,19 +330,33 @@ export default function (pi: ExtensionAPI) {
 
     // 1) Whole-scope rollback (opt-in, never for warnOnly steps).
     let rolledBack = false;
+    let conflicts: RollbackConflict[] = [];
     if (conf.autoRollback && !failure.warnOnly && args.allowRollback !== false) {
-      const rb = args.toolCallId
-        ? rollbackMutation(args.toolCallId, args.cwd)
-        : rollbackTurn(args.cwd);
+      const ids = args.toolCallIds ?? [];
+      const rb =
+        ids.length > 1
+          ? rollbackMutations(ids, args.cwd)
+          : ids.length === 1
+            ? rollbackMutation(ids[0], args.cwd)
+            : rollbackTurn(args.cwd);
       rolledBack = rb.success;
-      if (rb.success) {
-        recordRollback({
-          at: new Date().toISOString(),
-          branch: rb.branch ?? "unknown",
-          head: rb.committedAt ?? "unknown",
-          reason: failure.step,
-          method: rb.method,
-        });
+      conflicts = rb.conflicts ?? [];
+      recordMetrics({ rollbacks: 1, partialRollbacks: rb.partial ? 1 : 0 });
+      // The rollback *was* attempted, so it belongs in the history even when
+      // it came back partial — that is exactly the case a user must know about.
+      recordRollback({
+        at: new Date().toISOString(),
+        branch: rb.branch ?? "unknown",
+        head: rb.committedAt ?? "unknown",
+        reason: failure.step,
+        method: rb.method,
+      });
+      if (conflicts.length > 0) {
+        args.ctx.ui.notify(
+          `Sentinel left ${conflicts.length} file(s) untouched: they changed after its snapshot.`,
+          "error",
+        );
+      } else if (rb.success) {
         args.ctx.ui.notify(`Sentinel restored your changes (${failure.step} failed)`, "error");
       } else {
         args.ctx.ui.notify(`Sentinel rollback failed: ${rb.message}`, "error");
@@ -299,8 +388,35 @@ export default function (pi: ExtensionAPI) {
       regressions = regressions.map((r) => ({ ...r, reverted: true }));
     }
 
+    // 3) Repeated-failure escalation: the state keeps changing but the error
+    //    does not, which means the *approach* is wrong, not the last edit.
+    const escalationSettings = conf.verification.failureEscalation;
+    const seen = escalations.record(failure.signature);
+    let escalation: { count: number; max: number } | undefined;
+    if (escalationSettings.enabled && shouldEscalate(seen, escalationSettings.maxRepeatedFailures)) {
+      escalation = { count: seen, max: escalationSettings.maxRepeatedFailures };
+      recordEscalation({
+        at: new Date().toISOString(),
+        step: failure.step,
+        kind: failure.failureKind,
+        count: seen,
+        signature: failure.signature,
+      });
+      recordMetrics({ escalations: 1 });
+    }
+
     notifyWarnings(args.ctx, run.warnings, args.cwd);
-    return { passed: false, stateHash, failure, warnings: run.warnings, rolledBack, regressions };
+    return {
+      passed: false,
+      stateHash,
+      focusPaths: args.focusPaths,
+      failure,
+      warnings: run.warnings,
+      rolledBack,
+      regressions,
+      conflicts,
+      escalation,
+    };
   }
 
   /** Never let a ledger read break a verification run. */
@@ -335,6 +451,12 @@ export default function (pi: ExtensionAPI) {
       stateHash: stateHashOverride ?? outcome.stateHash,
       regressions: outcome.regressions,
       attempt,
+      failureKind: failure.failureKind,
+      timedOut: failure.timedOut,
+      errorSummary: failure.errorSummary,
+      attempts: failure.attempts,
+      escalation: outcome.escalation,
+      conflicts: outcome.conflicts,
       maxOutputTokens: conf.maxOutputTokens,
     }).text;
   }
@@ -473,6 +595,9 @@ export default function (pi: ExtensionAPI) {
         conf.autoRollback ? "auto-rollback" : null,
         conf.trackVerifiedState ? "evidence" : null,
         conf.detectOutOfBand ? "out-of-band" : null,
+        mutationQueue.debouncing ? `debounce ${conf.verification.debounceMs}ms` : null,
+        conf.verification.cache.enabled ? "cache" : null,
+        conf.verification.failureEscalation.enabled ? "escalation" : null,
       ].filter(Boolean);
       ctx.ui.notify(`Sentinel armed (${extras.join(", ")})`, "info");
     }
@@ -585,23 +710,29 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    // Record what the agent's write left on disk. A later rollback compares
+    // the file against this state, so an edit that happens in between (a
+    // formatter, another process, the user) is never overwritten silently.
+    snapshots.capturePost(event.toolCallId);
+
     const focusPaths = focusFor(ctx.cwd, target ? [absPath(target, ctx.cwd)] : []);
-    const outcome = await runVerification({
-      trigger: "onFileMutation",
+    const outcome = await mutationQueue.enqueue(ctx.cwd, {
       cwd: ctx.cwd,
       ctx,
       focusPaths,
-      toolCallId: event.toolCallId,
+      toolCallIds: [event.toolCallId],
     });
 
     snapshots.endCall(event.toolCallId);
 
     if (outcome.passed) return;
 
-    // Prepend the pruned error while keeping the original result blocks.
+    // Prepend the pruned error while keeping the original result blocks. The
+    // run may have covered more files than this hook did (coalesced batch), so
+    // the scope of the run is what the payload describes.
     return {
       content: [
-        { type: "text" as const, text: renderFailure(outcome, focusPaths, ctx.cwd) },
+        { type: "text" as const, text: renderFailure(outcome, outcome.focusPaths, ctx.cwd) },
         ...(event.content ?? []),
       ],
       isError: true as const,
@@ -633,11 +764,13 @@ export default function (pi: ExtensionAPI) {
 
     const focusPaths = [...new Set([...turnPaths, ...outOfBand])];
 
-    // P1 — persist the turn's pre-state so it can be rewound later.
+    // P1 — persist the turn's pre-state so it can be rewound later. The
+    // post-mutation hashes come along, so a rewind can refuse to overwrite a
+    // file that changed after that turn.
     let checkpointId: string | undefined;
     if (conf.enabled) {
       try {
-        checkpoints.captureSnapshots(snapshots.turnSnapshots());
+        checkpoints.captureSnapshots(snapshots.turnSnapshots(), snapshots.turnPostHashes());
         checkpoints.setLabel(describeChange(ctx.cwd, focusPaths));
         const summary = checkpoints.flush(ctx.cwd, conf.checkpointRetention);
         checkpointId = summary?.id;
@@ -675,6 +808,13 @@ export default function (pi: ExtensionAPI) {
       cwd: ctx.cwd,
       ctx,
       focusPaths,
+    });
+
+    recordTurnOutcome({
+      at: new Date().toISOString(),
+      turnIndex: turnIndexOf(event),
+      passed: outcome.passed,
+      step: outcome.failure?.step,
     });
 
     if (outcome.passed) {
@@ -727,6 +867,13 @@ export default function (pi: ExtensionAPI) {
           resetRepairBudget();
           return;
         }
+
+        recordTurnOutcome({
+          at: new Date().toISOString(),
+          turnIndex: -1,
+          passed: false,
+          step: outcome.failure?.step,
+        });
 
         if (
           conf.autoRollback &&
@@ -857,7 +1004,22 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         case "config": {
-          ctx.ui.setWidget("sentinel", JSON.stringify(conf, null, 2).split("\n"));
+          // Never print configured credentials: the config is injected into
+          // the conversation, so an env token pasted into it would leak.
+          const safe = {
+            ...conf,
+            pipelines: {
+              onFileMutation: conf.pipelines.onFileMutation.map((step) => ({
+                ...step,
+                env: redactEnv(step.env),
+              })),
+              onTurnEnd: conf.pipelines.onTurnEnd.map((step) => ({
+                ...step,
+                env: redactEnv(step.env),
+              })),
+            },
+          };
+          ctx.ui.setWidget("sentinel", JSON.stringify(safe, null, 2).split("\n"));
           return;
         }
         case "help":
@@ -977,13 +1139,19 @@ export default function (pi: ExtensionAPI) {
       `  enabled: ${conf.enabled} | autoRollback: ${conf.autoRollback} | autoFix: ${conf.autoFix}/${conf.maxAutoRetries}`,
       `  evidence: ${conf.trackVerifiedState} (revert ${conf.revertOnRegression}) | out-of-band: ${conf.detectOutOfBand}`,
       `  background checks: ${conf.backgroundTurnEnd} | output budget: ${conf.maxOutputTokens} tokens`,
+      `  debounce: ${conf.verification.debounceMs}ms | cache: ${conf.verification.cache.enabled} | escalation: ${conf.verification.failureEscalation.enabled}`,
       `  pipelines: mutation ${conf.pipelines.onFileMutation.length} | turn ${conf.pipelines.onTurnEnd.length}`,
       repo ? `  Git: ${repo.branch} @ ${repo.head}` : "  Git: not a repo",
       `  turn snapshot: ${snapshots.hasTurnSnapshot() ? "captured (rollback available)" : "empty"}`,
       latest
         ? `  latest checkpoint: ${latest.id} — ${latest.label} (${latest.fileCount} file(s))`
         : "  latest checkpoint: none",
-      `  rollbacks: ${state.rollbackHistory.length} | auto-fix attempts: ${state.autoFixHistory.length} | regressions: ${state.regressions.length}`,
+      "",
+      ...metricsLines(state.metrics),
+      "",
+      state.turnHistory.length > 0
+        ? ["History (newest first):", ...turnHistoryLines(state.turnHistory)].join("\n")
+        : "History: none",
     ];
     return lines;
   }
@@ -998,4 +1166,9 @@ function safeSessionFile(ctx: {
   } catch {
     return undefined;
   }
+}
+
+/** Turn index of a `turn_end` event, when the host provides one. */
+function turnIndexOf(event: { turnIndex?: number }): number {
+  return typeof event.turnIndex === "number" ? event.turnIndex : -1;
 }
