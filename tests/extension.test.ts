@@ -1224,3 +1224,130 @@ describe("P6 — coalescing, conflicts, escalation and metrics", () => {
     assert.ok(printed.includes("DEPLOY_TOKEN"), "the key stays visible");
   });
 });
+
+describe("data safety — foreign work and unknown state", () => {
+  test("a user's out-of-band edit to a verified file is never reverted", async () => {
+    // Regression: the P2 regression revert used to consider every path in the
+    // turn's focus, including files that only appeared via out-of-band
+    // detection — so a user's manual edit to a previously verified file was
+    // silently overwritten while the agent was working on something else.
+    await configure({
+      autoRollback: false,
+      revertOnRegression: true,
+      include: ["**/*.ts"],
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [{ name: "chk", cmd: "exit 0", timeoutMs: 5000 }],
+      },
+    });
+    execSync("git init -q", { cwd: project });
+
+    await runTurn(1, "src/a.ts", "export const a = 1; // green\n");
+    assert.ok(verifiedEntry(project, path.join(project, "src/a.ts")), "a.ts is verified");
+
+    // The user edits the verified file outside any agent turn.
+    fs.writeFileSync(path.join(project, "src/a.ts"), "export const a = 2; // USER WORK\n");
+
+    // A later turn fails, but the agent only touched a different file.
+    await configure({
+      autoRollback: false,
+      revertOnRegression: true,
+      include: ["**/*.ts"],
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [{ name: "chk", cmd: "exit 1", timeoutMs: 5000 }],
+      },
+    });
+    await runTurn(2, "src/b.ts", "export const b = 1;\n");
+
+    assert.equal(
+      fs.readFileSync(path.join(project, "src/a.ts"), "utf-8"),
+      "export const a = 2; // USER WORK\n",
+      "the user's manual edit must survive",
+    );
+    const body = fake.sent[0]?.message.content ?? "";
+    assert.equal(
+      body.includes("Regressed from a verified state"),
+      false,
+      "sentinel must not attribute a user's pre-turn edit to the agent",
+    );
+  });
+
+  test("a step skipped by its file filter does not create verified evidence", async () => {
+    // Regression: a skipped step still appeared in `run.steps`, so a run that
+    // proved nothing was recorded as a verified state.
+    await configure({
+      autoRollback: false,
+      include: ["**/*.ts"],
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [{ name: "python-only", cmd: "exit 0", timeoutMs: 5000, files: ["**/*.py"] }],
+      },
+    });
+
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+
+    assert.equal(
+      verifiedEntry(project, path.join(project, "src/a.ts")),
+      null,
+      "no check ran, so nothing was proved",
+    );
+  });
+
+  test("a partial restore is reported as an unknown state", async () => {
+    await configure({
+      autoRollback: true,
+      backgroundTurnEnd: false,
+      include: ["**/*.ts"],
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [{ name: "chk", cmd: "exit 1", timeoutMs: 5000 }],
+      },
+    });
+
+    // Pre-existing and larger than MAX_SNAPSHOT_BYTES: sentinel keeps no
+    // content and so cannot restore it. The message must not claim the change
+    // is still in place.
+    fs.mkdirSync(path.join(project, "src"), { recursive: true });
+    fs.writeFileSync(path.join(project, "src/big.ts"), "y".repeat(4 * 1024 * 1024 + 64));
+    await runTurn(1, "src/big.ts", "x".repeat(4 * 1024 * 1024 + 64));
+
+    const body = fake.sent[0]?.message.content ?? "";
+    assert.ok(body.includes("RESTORE INCOMPLETE"), body);
+    assert.ok(body.includes("UNKNOWN"), body);
+    assert.ok(
+      ctx._notifications.some((n) => n.text.includes("only part of the turn")),
+      "the user is told the restore was partial",
+    );
+  });
+});
+
+describe("background staleness — a moved tree invalidates the result", () => {
+  test("a background failure is discarded when the code changed while it ran", async () => {
+    // The check itself edits the file it is judging, then fails — the exact
+    // shape of "the agent moved on while npm test was still running". Acting on
+    // that failure would send the repair loop after code that already changed.
+    await configure({
+      autoRollback: false,
+      backgroundTurnEnd: true,
+      include: ["**/*.ts"],
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [
+          {
+            name: "stale",
+            cmd: "node -e \"require('fs').appendFileSync('src/a.ts',' // moved during the run'); process.exit(1)\"",
+            timeoutMs: 10000,
+          },
+        ],
+      },
+    });
+
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+
+    await waitFor(() =>
+      ctx._notifications.some((n) => n.text.includes("stale result was discarded")),
+    );
+    assert.equal(fake.sent.length, 0, "the agent must not be re-prompted on a stale result");
+  });
+});

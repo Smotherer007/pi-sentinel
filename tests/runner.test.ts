@@ -549,3 +549,44 @@ describe("PipelineRunner — missing commands and per-step pruning budget", () =
     assert.ok(!trace.includes("error TS3"));
   });
 });
+
+describe("PipelineRunner config safety", () => {
+  test("an invalid timeoutMs is refused, not reported as a timeout", async () => {
+    // Regression: 0/negative/NaN/Infinity and a missing value all collapse to
+    // a ~1 ms setTimeout, which reported every healthy check as a timeout — and
+    // with autoRollback on that undid a perfectly good change.
+    for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, undefined]) {
+      _setConfigForTesting(
+        defineConfig({
+          pipelines: {
+            onFileMutation: [{ name: "healthy", cmd: "exit 0", timeoutMs: timeoutMs as number }],
+            onTurnEnd: [],
+          },
+        }),
+      );
+
+      const run = await new PipelineRunner().runAll("onFileMutation", dir);
+      assert.equal(run.passed, false, `timeoutMs ${String(timeoutMs)} must not pass`);
+      assert.equal(run.failure?.timedOut, false, "it is a config error, not a timeout");
+      assert.equal(run.failure?.failureKind, "environment-error");
+      assert.ok(run.failure?.formattedError.includes("invalid timeoutMs"));
+    }
+  });
+
+  test("a negative output cap cannot grow the buffer without bound", async () => {
+    const script = `let i=0; const w=()=>{ if(i++<4000){ process.stdout.write("0123456789"); setImmediate(w);} else process.exit(1);}; w();`;
+    _setConfigForTesting(
+      defineConfig({
+        verification: { maxOutputBytes: -1 },
+        pipelines: {
+          onFileMutation: [{ name: "noisy", cmd: `node -e '${script}'`, timeoutMs: 20000 }],
+          onTurnEnd: [],
+        },
+      }),
+    );
+
+    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const output = run.failure?.rawOutput ?? "";
+    assert.ok(output.length < 2_000_000, `output must stay bounded, got ${output.length}`);
+  });
+});

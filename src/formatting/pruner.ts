@@ -132,6 +132,12 @@ export function formatError(failure: {
   escalation?: { count: number; max: number };
   /** P6: files left untouched because they changed since the snapshot. */
   conflicts?: RollbackConflict[];
+  /**
+   * Files sentinel could not restore (oversized, unreadable, a symlink). Their
+   * state is unknown — the advice must say so instead of claiming the changes
+   * are either restored or still in place.
+   */
+  restoreSkipped?: string[];
   /** P6: how many attempts the step needed (only when > 1). */
   attempts?: number;
 }): string {
@@ -144,6 +150,7 @@ export function formatError(failure: {
   const trace = failure.prunedTrace || failure.rawOutput.slice(0, 2000);
 
   const conflicts = failure.conflicts ?? [];
+  const skipped = failure.restoreSkipped ?? [];
 
   let advice: string;
   if (failure.warnOnly) {
@@ -153,6 +160,9 @@ export function formatError(failure: {
   } else if (conflicts.length > 0) {
     advice =
       "Sentinel restored what it could and left the conflicted files as they are. Review those files before editing again — the restore did not finish.";
+  } else if (skipped.length > 0) {
+    advice =
+      "Sentinel restored only part of the changed files: the ones below could not be restored, so their state is UNKNOWN. Inspect them before editing again — do not assume either kind of change is still present.";
   } else {
     advice =
       "Your changes are still in place. Fix the reported error; do not repeat the same edit.";
@@ -177,6 +187,14 @@ export function formatError(failure: {
       }
     }
     lines.push("  The file was NOT overwritten. Manual recovery required.");
+  }
+
+  // A file sentinel could not restore is neither restored nor untouched. Say
+  // so explicitly: the state is unknown, and guessing either way is unsafe.
+  if (skipped.length > 0) {
+    lines.push(`RESTORE INCOMPLETE (${skipped.length} file(s)) — state UNKNOWN:`);
+    for (const file of skipped.slice(0, 5)) lines.push(`  ${shortPath(file)} could not be restored.`);
+    lines.push("  These files were NOT touched by the rollback. Verify them by hand.");
   }
 
   // P2: the strongest signal sentinel can give — this used to be green.

@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- Add entries here. They are promoted into a version section when a release is cut. -->
 
+## [2.2.1] - 2026-09-13
+
+### Fixed
+- **Data safety — an unreadable file is never deleted.** A read failure (`EACCES`/`EPERM`/`ELOOP`/…)
+  was recorded as "did not exist", so a rollback removed the file. Only a genuine absence
+  (`ENOENT`/`ENOTDIR`) now leads to a delete; anything unreadable is skipped and reported.
+- **Data safety — a symlink is never turned into a regular file.** Symlinks are recorded as
+  incomplete, so a restore skips them instead of destroying the link while leaving the target
+  changed.
+- **A regression revert can no longer overwrite foreign work.** A file is reverted only when the
+  agent itself wrote it this turn *and* it still matches the agent's post-mutation hash; regression
+  detection is scoped the same way, so a user's uncommitted edit is neither overwritten nor
+  attributed to the agent.
+- **A skipped step no longer counts as evidence.** A step filtered out by `phase`/`files` still
+  appeared in `run.steps`, so a run that proved nothing could be recorded as a verified state
+  (and could then be reported as a regression).
+- **An invalid `timeoutMs` is refused instead of faked as a timeout.** `0`, negative, `NaN`,
+  `Infinity` and a missing value all collapse to a ~1 ms timer, which reported healthy checks as
+  timeouts and could roll back a good change. The step now fails as an environment error, values
+  above the 32-bit timer range are clamped, and `configProblems` warns at load time without
+  silently repairing the value.
+- **A negative `maxOutputBytes` can no longer grow the output buffer.** The head/tail math doubled
+  the buffer on every chunk; a non-usable cap falls back to the documented default.
+- **A partial restore is reported as an unknown state.** Files the rollback could not restore
+  (oversized, unreadable or symlinked) are surfaced explicitly (`RESTORE INCOMPLETE … state
+  UNKNOWN`) instead of the message claiming the changes are still in place.
+- **A background check that outlives its input is discarded.** If the code changes while a
+  background `onTurnEnd` run is in flight, the result is reported to the human but never used to
+  re-prompt the agent or restore files.
+- **A path named `..foo.ts` is no longer skipped** by the project-scope check, and a change-policy
+  stop now keeps its rewind checkpoint.
+
+### Tests
+- Regression tests for unreadable files, symlink preservation, skipped-step evidence, foreign-work
+  protection, invalid timeouts, the output cap, partial-restore reporting and stale background
+  results.
+
 ## [2.2.0] - 2026-09-13
 
 ### Added

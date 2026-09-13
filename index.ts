@@ -75,7 +75,7 @@ import {
 } from "./src/clients/rollback.ts";
 import { snapshots, describeRestore } from "./src/clients/snapshot.ts";
 import { checkpoints } from "./src/clients/checkpoints.ts";
-import { stateHashOf, recordVerified, detectRegressions, revertToVerified } from "./src/clients/evidence.ts";
+import { stateHashOf, recordVerified, detectRegressions, revertToVerified, hashFile } from "./src/clients/evidence.ts";
 import { evaluatePolicy, formatPolicyReport, relativePath } from "./src/clients/policy.ts";
 import type { PolicyChange } from "./src/clients/policy.ts";
 import { outOfBandChanges } from "./src/clients/workspace.ts";
@@ -135,6 +135,15 @@ const SUPERSEDED_TRACE =
 const MAX_IMPACT_FOCUS = 10;
 
 /**
+ * Whether at least one configured step actually executed. A step skipped by a
+ * phase or file filter still appears in `run.steps`, so counting the array
+ * would let a run that proved nothing be recorded as verified evidence.
+ */
+function ranAnyStep(run: PipelineRunResult): boolean {
+  return run.steps.some((step) => !step.skipped);
+}
+
+/**
  * Whether a mutated file path lies inside the project the sentinel guards.
  * The sentinel should only verify/rollback mutations that actually touch its
  * own repo — otherwise it reacts to edits in unrelated projects.
@@ -143,7 +152,10 @@ function targetInScope(target: string | undefined, cwd: string): boolean {
   if (!target) return true;
   const abs = isAbsolute(target) ? target : resolve(cwd, target);
   const rel = relative(cwd, abs);
-  return rel === "" || !rel.startsWith("..");
+  if (rel === "") return true;
+  // ".." as a whole segment is outside; a file literally named "..foo.ts" is
+  // inside and must still be guarded (`startsWith("..")` would wrongly skip it).
+  return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
 function absPath(target: string, cwd: string): string {
@@ -174,6 +186,8 @@ interface VerificationOutcome {
   regressions: Regression[];
   /** Files left untouched because they changed after the agent's mutation. */
   conflicts: RollbackConflict[];
+  /** Files the rollback could not restore at all, so their state is unknown. */
+  restoreSkipped: string[];
   /** Set once the same failure has been seen often enough to escalate. */
   escalation?: { count: number; max: number };
 }
@@ -242,6 +256,7 @@ export default function (pi: ExtensionAPI) {
         rolledBack: false,
         regressions: [],
         conflicts: [],
+        restoreSkipped: [],
       };
     },
     0,
@@ -415,6 +430,15 @@ export default function (pi: ExtensionAPI) {
     focusPaths: string[];
     /** Mutations this verification belongs to (a coalesced batch holds several). */
     toolCallIds?: string[];
+    /**
+     * Files the agent itself wrote this turn (absolute). Only these may be
+     * reverted on a regression; a user's uncommitted edit is never sentinel's
+     * to undo. Passed explicitly for background runs, whose in-memory turn
+     * scope has already been cleared.
+     */
+    mutablePaths?: string[];
+    /** Post-mutation hashes for `mutablePaths`, from the snapshot store. */
+    postHashes?: Map<string, string | null>;
     /** Set false in background mode: a later turn owns the tree by then. */
     allowRollback?: boolean;
     /** Bypass the verification cache (explicit runs). */
@@ -434,15 +458,15 @@ export default function (pi: ExtensionAPI) {
       // A green run means the repair loop converged: stop escalating. Runs that
       // executed nothing at all prove nothing, so they must not clear the
       // counters either (an empty mutation group fires after every edit).
-      if (run.steps.length > 0) escalations.reset();
+      if (ranAnyStep(run)) escalations.reset();
       // Evidence only counts when something actually ran: an empty pipeline
       // group proves nothing, and claiming "verified" for it would be a lie.
-      if (conf.trackVerifiedState && args.focusPaths.length > 0 && run.steps.length > 0) {
+      if (conf.trackVerifiedState && args.focusPaths.length > 0 && ranAnyStep(run)) {
         try {
           recordVerified(
             args.cwd,
             args.focusPaths,
-            `${args.trigger}:${run.steps.map((s) => s.name).join("+") || "none"}`,
+            `${args.trigger}:${run.steps.filter((s) => !s.skipped).map((s) => s.name).join("+") || "none"}`,
           );
         } catch {
           /* evidence is an optimisation, never a failure source */
@@ -457,20 +481,39 @@ export default function (pi: ExtensionAPI) {
         rolledBack: false,
         regressions: [],
         conflicts: [],
+        restoreSkipped: [],
       };
     }
 
     const failure = run.failure!;
     args.ctx.ui.setStatus("sentinel", undefined);
 
+    // Files the agent itself wrote this turn — the only ones whose regression
+    // sentinel may attribute (and revert). Out-of-band diffs are still verified,
+    // but sentinel cannot tell a user's pre-turn edit from an agent's bash edit,
+    // so it must not claim either one regressed from a verified state.
+    const ownedPaths = new Set(
+      args.mutablePaths ??
+        (args.toolCallIds && args.toolCallIds.length > 0
+          ? args.toolCallIds.flatMap((id) =>
+              snapshots.callSnapshots(id).map((snap) => snap.path),
+            )
+          : snapshots.turnPaths()),
+    );
+
     // 0) Detect regressions first: a later revert must not erase the evidence
     //    that the file *was* green before this revision.
     let regressions =
-      conf.trackVerifiedState ? detectRegressionsSafe(args.cwd, args.focusPaths) : [];
+      conf.trackVerifiedState
+        ? detectRegressionsSafe(args.cwd, args.focusPaths).filter((r) =>
+            ownedPaths.has(r.path),
+          )
+        : [];
 
     // 1) Whole-scope rollback (opt-in, never for warnOnly steps).
     let rolledBack = false;
     let conflicts: RollbackConflict[] = [];
+    let restoreSkipped: string[] = [];
     if (conf.autoRollback && !failure.warnOnly && args.allowRollback !== false) {
       const ids = args.toolCallIds ?? [];
       const rb =
@@ -481,6 +524,7 @@ export default function (pi: ExtensionAPI) {
             : rollbackTurn(args.cwd);
       rolledBack = rb.success;
       conflicts = rb.conflicts ?? [];
+      restoreSkipped = rb.skipped ?? [];
       recordMetrics({ rollbacks: 1, partialRollbacks: rb.partial ? 1 : 0 });
       // The rollback *was* attempted, so it belongs in the history even when
       // it came back partial — that is exactly the case a user must know about.
@@ -505,6 +549,12 @@ export default function (pi: ExtensionAPI) {
           `Sentinel did not roll back (${failure.step} failed): no snapshot was captured, so the changes are still in place.`,
           "warning",
         );
+      } else if (restoreSkipped.length > 0) {
+        // A partial restore is not "restored" and not "still in place".
+        args.ctx.ui.notify(
+          `Sentinel restored only part of the turn (${failure.step} failed): ${restoreSkipped.length} file(s) could not be restored, so their state is unknown.`,
+          "error",
+        );
       } else {
         args.ctx.ui.notify(`Sentinel rollback failed: ${rb.message}`, "error");
       }
@@ -513,8 +563,17 @@ export default function (pi: ExtensionAPI) {
     // 2) Otherwise, only the individual files that regressed from a state
     //    which used to pass. This is the P2 revert, and it is narrower than a
     //    turn rollback: it leaves the rest of the turn's work alone.
+    //
+    //    Two guards keep it from destroying work sentinel does not own:
+    //    the file must be one the agent itself wrote this turn, and it must
+    //    still be exactly what the agent left (a later edit by the user, a
+    //    formatter or another process is never overwritten).
     if (!rolledBack && conf.trackVerifiedState && conf.revertOnRegression) {
+      const postHashes = args.postHashes ?? snapshots.turnPostHashes();
       regressions = regressions.map((regression) => {
+        if (!ownedPaths.has(regression.path)) return regression;
+        if (!postHashes.has(regression.path)) return regression;
+        if (hashFile(regression.path) !== postHashes.get(regression.path)) return regression;
         if (!revertToVerified(args.cwd, regression.path)) return regression;
         recordRegression({
           at: new Date().toISOString(),
@@ -562,6 +621,7 @@ export default function (pi: ExtensionAPI) {
       rolledBack,
       regressions,
       conflicts,
+      restoreSkipped,
       escalation,
     };
   }
@@ -604,6 +664,7 @@ export default function (pi: ExtensionAPI) {
       attempts: failure.attempts,
       escalation: outcome.escalation,
       conflicts: outcome.conflicts,
+      restoreSkipped: outcome.restoreSkipped,
       maxOutputTokens: conf.maxOutputTokens,
     }).text;
   }
@@ -960,6 +1021,16 @@ export default function (pi: ExtensionAPI) {
       try {
         const report = evaluatePolicy(policyChangesFor(ctx.cwd, focusPaths), conf.policy, ctx.cwd);
         if (!report.passed) {
+          // Persist the turn's pre-state before stopping it: a policy stop must
+          // still leave a rewind handle, otherwise the offending change can only
+          // be undone with a destructive `mode: "head"` reset.
+          try {
+            checkpoints.captureSnapshots(snapshots.turnSnapshots(), snapshots.turnPostHashes());
+            checkpoints.setLabel(describeChange(ctx.cwd, focusPaths));
+            checkpoints.flush(ctx.cwd, conf.checkpointRetention);
+          } catch {
+            /* a lost checkpoint must not change the policy decision */
+          }
           handlePolicyViolation({ report, cwd: ctx.cwd, ctx, focusPaths });
           snapshots.beginTurn();
           return;
@@ -1007,7 +1078,16 @@ export default function (pi: ExtensionAPI) {
 
     // P5 — background mode: do not make the turn wait for the slow checks.
     if (conf.backgroundTurnEnd) {
-      startBackgroundChecks({ cwd: ctx.cwd, ctx, focusPaths, checkpointId });
+      startBackgroundChecks({
+        cwd: ctx.cwd,
+        ctx,
+        focusPaths,
+        checkpointId,
+        // The in-memory scope is cleared right below; hand the background run
+        // the agent's own files so its regression revert stays scoped.
+        mutablePaths: turnPaths,
+        postHashes: snapshots.turnPostHashes(),
+      });
       snapshots.beginTurn();
       return;
     }
@@ -1017,6 +1097,8 @@ export default function (pi: ExtensionAPI) {
       cwd: ctx.cwd,
       ctx,
       focusPaths,
+      mutablePaths: turnPaths,
+      postHashes: snapshots.turnPostHashes(),
     });
 
     if (!outcome) {
@@ -1052,6 +1134,8 @@ export default function (pi: ExtensionAPI) {
     ctx: { ui: ExtensionUIContext };
     focusPaths: string[];
     toolCallIds?: string[];
+    mutablePaths?: string[];
+    postHashes?: Map<string, string | null>;
     allowRollback?: boolean;
     skipCache?: boolean;
   }): Promise<VerificationOutcome | null> {
@@ -1096,6 +1180,10 @@ export default function (pi: ExtensionAPI) {
     ctx: { ui: ExtensionUIContext };
     focusPaths: string[];
     checkpointId?: string;
+    /** Files the agent wrote this turn; the regression revert is scoped to them. */
+    mutablePaths?: string[];
+    /** Post-mutation hashes for `mutablePaths`. */
+    postHashes?: Map<string, string | null>;
   }): void {
     if (backgroundRun) {
       args.ctx.ui.notify(
@@ -1110,16 +1198,34 @@ export default function (pi: ExtensionAPI) {
 
     backgroundRun = (async () => {
       try {
+        // Fingerprint the state this run is about. A background check easily
+        // outlives it — the agent can already be editing the next turn while
+        // `npm test` is still running — and acting on a failure that no longer
+        // describes the tree is exactly the stale trace that sends repair
+        // loops after code that has already moved on.
+        const startHash = stateHashOf(args.focusPaths);
         const outcome = await runVerification({
           trigger: "onTurnEnd",
           cwd: args.cwd,
           ctx: args.ctx,
           focusPaths: args.focusPaths,
+          mutablePaths: args.mutablePaths,
+          postHashes: args.postHashes,
           allowRollback: false,
         });
 
         if (outcome.passed) {
           resetRepairBudget();
+          return;
+        }
+
+        // The code moved while the check ran: report the stale result to the
+        // human, but never re-prompt the agent or restore files on it.
+        if (stateHashOf(args.focusPaths) !== startHash) {
+          args.ctx.ui.notify(
+            `Sentinel: background check "${outcome.failure?.step ?? "unknown"}" failed, but the code changed while it ran — the stale result was discarded.`,
+            "warning",
+          );
           return;
         }
 

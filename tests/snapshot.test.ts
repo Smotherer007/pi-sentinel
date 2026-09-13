@@ -316,3 +316,61 @@ describe("describeRestore", () => {
     assert.ok(text.includes("partial"), text);
   });
 });
+
+describe("SnapshotStore data safety", () => {
+  test("a file that exists but cannot be read is skipped, never deleted", (t) => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) {
+      // root ignores file mode bits, so the precondition cannot be created.
+      t.skip("running as root");
+      return;
+    }
+    // Regression: a read failure (EACCES) used to be recorded as "did not
+    // exist", so a rollback deleted the file outright. Only a genuine absence
+    // may ever lead to a delete.
+    const store = new SnapshotStore();
+    const file = path.join(dir, "unreadable.txt");
+    fs.writeFileSync(file, "user work that must survive\n");
+    fs.chmodSync(file, 0o000);
+
+    store.captureCall("unreadable", file);
+    const [snap] = store.callSnapshots("unreadable");
+    assert.equal(snap.existed, true, "an unreadable file is not an absent file");
+    assert.equal(snap.incomplete, true);
+
+    // The agent still writes through it (as it could once permissions allowed).
+    fs.chmodSync(file, 0o600);
+    fs.writeFileSync(file, "agent version\n");
+    store.capturePost("unreadable");
+
+    const report = store.rollbackCall("unreadable");
+    assert.deepEqual(report.deleted, [], "the file must not be removed");
+    assert.deepEqual(report.skipped, [file]);
+    assert.equal(report.partial, true);
+    assert.equal(fs.existsSync(file), true);
+  });
+
+  test("a symlink is left intact instead of becoming a regular file", (t) => {
+    const store = new SnapshotStore();
+    const target = path.join(dir, "link-target.txt");
+    const link = path.join(dir, "link.txt");
+    fs.writeFileSync(target, "target original\n");
+    try {
+      fs.symlinkSync(target, link);
+    } catch {
+      t.skip("symlinks are not supported here");
+      return;
+    }
+
+    store.captureCall("link", link);
+    fs.writeFileSync(link, "agent version\n");
+    store.capturePost("link");
+
+    const report = store.rollbackCall("link");
+    assert.deepEqual(report.skipped, [link]);
+    assert.equal(
+      fs.lstatSync(link).isSymbolicLink(),
+      true,
+      "the link itself must survive the rollback",
+    );
+  });
+});

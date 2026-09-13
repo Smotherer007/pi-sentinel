@@ -367,6 +367,12 @@ export interface RollbackResult {
   branch?: string;
   /** Files left untouched because they changed since the snapshot. */
   conflicts?: RollbackConflict[];
+  /**
+   * Files that could not be restored (oversized, unreadable, a symlink). Their
+   * state is unknown: sentinel deliberately did nothing to them, so the caller
+   * must not claim the tree is either restored or untouched.
+   */
+  skipped?: string[];
   /** True when at least one file could not be restored. */
   partial?: boolean;
 }

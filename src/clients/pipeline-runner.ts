@@ -48,6 +48,20 @@ import type {
 export const DEFAULT_MAX_OUTPUT_BYTES = 256 * 1024;
 /** Fallback SIGTERM → SIGKILL grace period. */
 export const DEFAULT_KILL_GRACE_MS = 500;
+/** Largest delay `setTimeout` accepts; beyond it Node silently uses 1 ms. */
+export const MAX_TIMER_MS = 2_147_483_647;
+
+/**
+ * A usable output cap. A negative or non-finite value makes the head/tail math
+ * grow the buffer instead of bounding it (a negative cap doubles it on every
+ * chunk), so it falls back to the documented default.
+ */
+export function effectiveMaxOutputBytes(configured: number | undefined): number {
+  if (typeof configured === "number" && Number.isFinite(configured) && configured >= 2) {
+    return configured;
+  }
+  return DEFAULT_MAX_OUTPUT_BYTES;
+}
 
 export interface CommandOutcome {
   stdout: string;
@@ -213,13 +227,15 @@ export class PipelineRunner {
         const passed = outcome.exitCode === 0;
         const failureKind = passed
           ? undefined
-          : classifyFailure({
-              stepName: step.name,
-              cmd: step.cmd,
-              exitCode: outcome.exitCode ?? -1,
-              timedOut,
-              output: outcome.stdout,
-            });
+          : outcome.invalidConfig
+            ? "environment-error"
+            : classifyFailure({
+                stepName: step.name,
+                cmd: step.cmd,
+                exitCode: outcome.exitCode ?? -1,
+                timedOut,
+                output: outcome.stdout,
+              });
         const priority: StepPriority = priorityOf(step);
 
         results.push({
@@ -375,9 +391,24 @@ export class PipelineRunner {
     signal?: AbortSignal,
   ): Promise<CommandOutcome> {
     const config = getConfig();
-    const maxBytes = config.verification?.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+    const maxBytes = effectiveMaxOutputBytes(config.verification?.maxOutputBytes);
     const graceMs = config.verification?.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
     const startedAt = Date.now();
+
+    // A deadline of 0, a negative/NaN value or one beyond the 32-bit timer
+    // range does not mean "no deadline": `setTimeout` silently collapses all
+    // of them to ~1 ms, which reports every healthy check as a timeout — and
+    // with autoRollback on that would undo a perfectly good change. Refuse the
+    // step instead of running it with an impossible deadline.
+    if (!Number.isFinite(step.timeoutMs) || step.timeoutMs <= 0) {
+      return {
+        stdout: `[sentinel] ${step.name}: invalid timeoutMs (${String(step.timeoutMs)}); the step was not run. Set a positive timeout in sentinel.config.ts.`,
+        exitCode: 1,
+        invalidConfig: `invalid timeoutMs: ${String(step.timeoutMs)}`,
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    const timeoutMs = Math.min(Math.floor(step.timeoutMs), MAX_TIMER_MS);
 
     const resolvedCwd = resolveStepCwd(baseCwd, step.cwd);
     if (!resolvedCwd.cwd) {
@@ -466,11 +497,11 @@ export class PipelineRunner {
       killTimer = setTimeout(() => {
         terminate("timeout");
         finish({
-          stdout: `${step.name}: timeout after ${step.timeoutMs}ms`,
+          stdout: `${step.name}: timeout after ${timeoutMs}ms`,
           exitCode: 124,
           timedOut: true,
         });
-      }, step.timeoutMs);
+      }, timeoutMs);
 
       child.stdout?.on("data", push);
       child.stderr?.on("data", push);

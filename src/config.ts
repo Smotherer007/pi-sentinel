@@ -378,6 +378,11 @@ export async function loadConfig(cwd: string): Promise<SentinelConfig> {
       const raw = mod.default ?? mod.config;
       if (raw && typeof raw === "object") {
         activeConfig = normaliseConfig(deepMerge(DEFAULT_CONFIG, raw as Partial<SentinelConfig>), raw as SentinelConfigInput);
+        // Report dangerous values early and by name. They are *not* silently
+        // repaired: the user should see exactly what is wrong and fix it.
+        for (const problem of configProblems(activeConfig)) {
+          console.warn(`[sentinel] config: ${problem}`);
+        }
         return activeConfig;
       }
     } catch (err) {
@@ -653,6 +658,64 @@ export function stepMatchesFiles(
     const rel = toRelative(file, cwd);
     return step.files!.some((pattern) => matchesGlob(pattern, rel));
   });
+}
+
+/**
+ * Human-readable problems with a loaded configuration.
+ *
+ * Deliberately non-mutating: a dangerous value is reported by name so the user
+ * can fix it, never silently repaired into something else. The runner refuses
+ * an invalid `timeoutMs` anyway, so this is the early, visible half of the same
+ * guarantee.
+ */
+export function configProblems(config: SentinelConfig): string[] {
+  const problems: string[] = [];
+  const groups: Array<[string, PipelineStep[] | undefined]> = [
+    ["pipelines.onFileMutation", config.pipelines?.onFileMutation],
+    ["pipelines.onTurnEnd", config.pipelines?.onTurnEnd],
+  ];
+  for (const [group, steps] of groups) {
+    for (const step of steps ?? []) {
+      const name = step?.name ?? "(unnamed)";
+      if (!step || typeof step.cmd !== "string" || step.cmd.trim() === "") {
+        problems.push(`${group}: step "${name}" has an empty command`);
+      }
+      if (!Number.isFinite(step?.timeoutMs) || (step?.timeoutMs ?? 0) <= 0) {
+        problems.push(
+          `${group}: step "${name}" has an invalid timeoutMs (${String(step?.timeoutMs)}); it would time out immediately and is refused at run time`,
+        );
+      }
+    }
+  }
+  const maxBytes = config.verification?.maxOutputBytes;
+  if (!Number.isFinite(maxBytes) || (maxBytes ?? 0) < 2) {
+    problems.push(
+      `verification.maxOutputBytes (${String(maxBytes)}) is not a usable bound; the default is used instead`,
+    );
+  }
+  if (!Number.isFinite(config.maxTraceLines) || config.maxTraceLines <= 0) {
+    problems.push(
+      `maxTraceLines (${String(config.maxTraceLines)}) keeps no error lines; failures will arrive without a trace`,
+    );
+  }
+  if (!Number.isFinite(config.maxOutputTokens) || config.maxOutputTokens < 0) {
+    problems.push(
+      `maxOutputTokens (${String(config.maxOutputTokens)}) is not a usable budget`,
+    );
+  }
+  if (Number.isFinite(config.checkpointRetention) && config.checkpointRetention <= 0) {
+    problems.push(
+      "checkpointRetention <= 0 disables pruning, so checkpoints grow without bound on disk",
+    );
+  }
+  if (
+    config.verification?.cache?.enabled &&
+    Number.isFinite(config.verification.cache.maxEntries) &&
+    config.verification.cache.maxEntries <= 0
+  ) {
+    problems.push("verification.cache.maxEntries <= 0 leaves the cache unbounded");
+  }
+  return problems;
 }
 
 /** @internal Reset internals — for testing only */

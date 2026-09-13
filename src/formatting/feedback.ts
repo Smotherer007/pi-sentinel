@@ -53,6 +53,11 @@ export interface FailureFeedbackInput {
   /** P6: files left untouched because they changed since the snapshot. */
   conflicts?: RollbackConflict[];
   /**
+   * Files sentinel could not restore (oversized, unreadable, a symlink), so
+   * their state is unknown and the advice must not guess.
+   */
+  restoreSkipped?: string[];
+  /**
    * Regressions detected *before* any revert ran. Callers that restore files
    * must pass the pre-revert list, otherwise the feedback would claim
    * everything was fine after sentinel itself repaired it.
@@ -102,6 +107,7 @@ export function buildFailureFeedback(input: FailureFeedbackInput): SpillResult {
     attempts: input.attempts,
     escalation: input.escalation,
     conflicts: input.conflicts,
+    restoreSkipped: input.restoreSkipped,
   });
 
   return applyOutputCap(text, input.maxOutputTokens, spillDir(input.cwd), input.step);

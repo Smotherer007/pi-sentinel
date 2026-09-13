@@ -55,6 +55,7 @@ function fromReport(report: RestoreReport, method: string, cwd: string): Rollbac
     message: `${method === "snapshot:mutation" ? "Mutation" : "Turn"} rolled back — ${describeRestore(report)}.`,
     command: "",
     conflicts: report.conflicts,
+    skipped: report.skipped,
     partial: report.partial,
     ...gitMeta(cwd),
   };

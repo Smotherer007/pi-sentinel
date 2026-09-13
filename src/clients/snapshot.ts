@@ -106,6 +106,22 @@ export function hashFile(absPath: string): string | null {
 function readSnapshot(absPath: string): FileSnapshot {
   const capturedAt = Date.now();
   try {
+    // A symlink is a distinct object, not a copy of its target. Recording the
+    // target's bytes and writing them back at the link path would replace the
+    // link with a regular file while leaving the real target changed — a
+    // corrupt state. Mark it incomplete so a restore skips it and never
+    // destroys the link.
+    const link = fs.lstatSync(absPath);
+    if (link.isSymbolicLink()) {
+      return {
+        path: absPath,
+        existed: true,
+        data: null,
+        incomplete: true,
+        size: link.size,
+        capturedAt,
+      };
+    }
     const stat = fs.statSync(absPath);
     if (!stat.isFile() || stat.size > MAX_SNAPSHOT_BYTES) {
       return {
@@ -129,9 +145,21 @@ function readSnapshot(absPath: string): FileSnapshot {
       mode: stat.mode & 0o777,
       capturedAt,
     };
-  } catch {
-    // File does not exist (or is unreadable) — treat as "did not exist".
-    return { path: absPath, existed: false, data: null, incomplete: false, capturedAt };
+  } catch (err) {
+    // Only a genuine absence is "did not exist". Any other failure (EACCES,
+    // EPERM, ELOOP, EBUSY, ...) means a file we could not read; treating it as
+    // absent would make a rollback *delete* it — the one outcome a snapshot
+    // must never cause. Record it as incomplete so a restore skips it and
+    // reports a partial rollback instead of destroying data.
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    const absent = code === "ENOENT" || code === "ENOTDIR";
+    return {
+      path: absPath,
+      existed: !absent,
+      data: null,
+      incomplete: !absent,
+      capturedAt,
+    };
   }
 }
 

@@ -91,9 +91,15 @@ export const SentinelVerifyTool = {
     const run = await runner.runAll(trigger, cwd, { signal, focusPaths, skipCache: true });
 
     if (run.passed) {
-      if (config.trackVerifiedState && focusPaths.length > 0 && run.steps.length > 0) {
+      // Evidence only counts when a step actually executed: a step skipped by a
+      // phase/file filter proves nothing and must not be recorded as verified.
+      if (config.trackVerifiedState && focusPaths.length > 0 && run.steps.some((s) => !s.skipped)) {
         try {
-          recordVerified(cwd, focusPaths, `${trigger}:${run.steps.map((s) => s.name).join("+")}`);
+          recordVerified(
+            cwd,
+            focusPaths,
+            `${trigger}:${run.steps.filter((s) => !s.skipped).map((s) => s.name).join("+") || "none"}`,
+          );
         } catch {
           /* evidence is an optimisation */
         }
@@ -126,12 +132,14 @@ export const SentinelVerifyTool = {
     let rolledBack = false;
     let rollbackMsg = "";
     let conflicts: RollbackConflict[] = [];
+    let restoreSkipped: string[] = [];
 
     if (doRollback && !failure.warnOnly) {
       const rb = rollbackTurn(cwd);
       // A conflict means at least one file was deliberately left alone.
       rolledBack = rb.success && !rb.partial;
       conflicts = rb.conflicts ?? [];
+      restoreSkipped = rb.skipped ?? [];
       rollbackMsg = `\n${rb.message}`;
       recordMetrics({ rollbacks: 1, partialRollbacks: rb.partial ? 1 : 0 });
       recordRollback({
@@ -159,6 +167,7 @@ export const SentinelVerifyTool = {
       errorSummary: failure.errorSummary,
       attempts: failure.attempts,
       conflicts,
+      restoreSkipped,
       maxOutputTokens: config.maxOutputTokens,
     });
 
