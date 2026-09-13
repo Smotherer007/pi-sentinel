@@ -115,15 +115,11 @@ let home: string;
 let project: string;
 let fake: FakePi;
 let ctx: FakeCtx;
-let configClock: number;
 
-/** Write a project config; the mtime is forced forward to beat the cache-bust. */
+/** Write a project config that the loader picks up by content hash. */
 function writeConfig(extra: Record<string, unknown> = {}): void {
   const file = path.join(project, "sentinel.config.js");
   fs.writeFileSync(file, `export default ${JSON.stringify(extra, null, 2)};\n`, "utf-8");
-  configClock += 5_000;
-  const stamp = new Date(configClock);
-  fs.utimesSync(file, stamp, stamp);
 }
 
 /**
@@ -208,7 +204,6 @@ beforeEach(async () => {
   }
   fs.rmSync(projectDir(project), { recursive: true, force: true });
 
-  configClock = Date.now();
   fake = createFakePi();
   extensionFactory(fake.api);
   ctx = makeCtx(project);

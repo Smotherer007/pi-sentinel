@@ -1,5 +1,8 @@
-import { test, describe } from "node:test";
+import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 import {
   defineConfig,
@@ -7,8 +10,26 @@ import {
   isExcluded,
   shouldVerify,
   matchesGlob,
+  loadConfig,
+  getConfig,
   _resetForTesting,
 } from "../src/config.ts";
+
+let home: string;
+let project: string;
+
+before(() => {
+  home = fs.mkdtempSync(path.join(os.tmpdir(), "sentinel-cfg-home-"));
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  project = fs.mkdtempSync(path.join(os.tmpdir(), "sentinel-cfg-"));
+  fs.writeFileSync(path.join(project, "package.json"), '{"type":"module"}\n');
+});
+
+after(() => {
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(project, { recursive: true, force: true });
+});
 
 describe("defineConfig", () => {
   test("merges over defaults", () => {
@@ -163,4 +184,39 @@ describe("shouldVerify", () => {
 test("reset helper restores defaults", () => {
   _resetForTesting();
   assert.equal(isExcluded("README.md", DEFAULT_CONFIG), true);
+});
+
+describe("loadConfig", () => {
+  test("picks up an edit even when the mtime did not change", async () => {
+    // Regression: cache-busting was mtime-based, and some filesystems (CI
+    // containers, network mounts) have coarse mtime resolution. Two edits
+    // inside one tick made Node's ESM loader serve the *old* config, so sentinel
+    // silently kept verifying with stale pipelines.
+    const file = path.join(project, "sentinel.config.js");
+    const fixed = new Date("2026-01-01T00:00:00.000Z");
+
+    fs.writeFileSync(file, "export default { maxTraceLines: 1 };\n", "utf-8");
+    fs.utimesSync(file, fixed, fixed);
+    await loadConfig(project);
+    assert.equal(getConfig().maxTraceLines, 1);
+
+    fs.writeFileSync(file, "export default { maxTraceLines: 2 };\n", "utf-8");
+    fs.utimesSync(file, fixed, fixed);
+    await loadConfig(project);
+    assert.equal(getConfig().maxTraceLines, 2, "an unchanged mtime must not pin the old config");
+
+    fs.rmSync(file);
+    await loadConfig(project);
+    assert.equal(getConfig().maxTraceLines, DEFAULT_CONFIG.maxTraceLines);
+  });
+
+  test("re-reads an unchanged file without re-evaluating a stale module", async () => {
+    const file = path.join(project, "sentinel.config.js");
+    fs.writeFileSync(file, "export default { maxTraceLines: 9 };\n", "utf-8");
+
+    await loadConfig(project);
+    assert.equal(getConfig().maxTraceLines, 9);
+    await loadConfig(project);
+    assert.equal(getConfig().maxTraceLines, 9, "idempotent across events");
+  });
 });

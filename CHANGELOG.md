@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sentinel_verify` produce identical feedback.
 
 ### Fixed
+- `loadConfig` cache-busted the config file by `mtime`, and Node's ESM loader caches by URL. On
+  filesystems with coarse mtime resolution (CI containers, network mounts) two edits inside one tick
+  therefore kept the *old* configuration alive, so sentinel verified with stale pipelines. The bust is
+  now a content hash.
 - The checkpoint store read its blobs from the wrong directory, so restoring a checkpoint silently
   skipped every file instead of writing it back.
 - Regressions were detected *after* the automatic revert had already run, so a file that sentinel had

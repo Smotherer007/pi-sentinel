@@ -218,11 +218,17 @@ export async function loadConfig(cwd: string): Promise<SentinelConfig> {
   for (const file of candidates) {
     if (!fs.existsSync(file)) continue;
     try {
-      // Cache-bust with the file URL mtime so an edited config is re-read
-      // instead of Node's module cache handing back the original module.
-      const mtime = fs.statSync(file).mtimeMs;
+      // Cache-bust by *content*, not by mtime. Node's ESM loader caches by URL,
+      // and mtime has inconsistent resolution across filesystems (coarse on
+      // some CI containers and network mounts). Two edits inside one mtime tick
+      // would then silently keep the old config — the hash cannot collide that
+      // way, and an unchanged file is still served from the module cache.
+      const stamp = createHash("sha1")
+        .update(fs.readFileSync(file))
+        .digest("hex")
+        .slice(0, 16);
       const url = pathToFileURL(file);
-      url.searchParams.set("t", String(mtime));
+      url.searchParams.set("v", stamp);
       const mod = await import(url.href);
       const raw = mod.default ?? mod.config;
       if (raw && typeof raw === "object") {

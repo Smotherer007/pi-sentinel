@@ -301,7 +301,8 @@ Guarantees and limits, stated plainly:
 
 Create `sentinel.config.ts` in the project root (or `~/.sentinel.config.ts`). Resolution order:
 `<cwd>/sentinel.config.ts` → `<cwd>/sentinel.config.js` → `~/.sentinel.config.ts` → defaults.
-Every event reloads the file (mtime cache-busted), so editing it takes effect without restarting pi.
+Every event reloads the file (cache-busted by content hash, so an edit is picked
+up without restarting pi and twice-in-one-tick edits cannot go unnoticed).
 
 ```ts
 import { defineConfig } from "@patimweb/pi-sentinel";
