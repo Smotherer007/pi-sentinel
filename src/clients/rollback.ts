@@ -4,8 +4,11 @@
  *
  * Preference order:
  *   1. Snapshot restore (file-accurate, never touches unrelated work).
- *   2. `git checkout/restore` — only when no snapshot was captured (e.g. a
- *      mutation that arrived through a path we did not hook).
+ *   2. Nothing. An automatic rollback with no snapshot is a no-op — it must
+ *      never widen into `git checkout -- .`, because that discards *every*
+ *      uncommitted change in the repository, including the user's own work.
+ *      A full HEAD reset stays available as an explicit, user-initiated
+ *      `mode: "head"` action (`rollbackToHead`).
  *
  * This module is the only place that decides *which* strategy runs, keeping
  * the tools and hooks free of rollback policy.
@@ -19,6 +22,23 @@ import type { RollbackResult } from "../types.ts";
 function gitMeta(cwd: string): { branch?: string; committedAt?: string } {
   const meta = GitClient.gitMeta(cwd);
   return { branch: meta?.branch, committedAt: meta?.head };
+}
+
+/**
+ * What an automatic rollback reports when it never captured a pre-state.
+ *
+ * Deliberately *not* successful: nothing was restored, and pretending
+ * otherwise is the one lie that would make the agent re-apply changes that are
+ * still present (or, worse, convince a user a destructive reset happened).
+ */
+function noSnapshot(cwd: string, scope: string): RollbackResult {
+  return {
+    success: false,
+    method: "none",
+    message: `No ${scope} snapshot was captured, so nothing was restored. The changes are still in place; use mode "head" for an explicit git reset.`,
+    command: "",
+    ...gitMeta(cwd),
+  };
 }
 
 /**
@@ -43,14 +63,14 @@ function fromReport(report: RestoreReport, method: string, cwd: string): Rollbac
 /** Undo a single mutation (identified by its tool call id). */
 export function rollbackMutation(toolCallId: string, cwd: string): RollbackResult {
   const report = snapshots.rollbackCall(toolCallId);
-  if (!report.attempted) return GitClient.rollback(cwd);
+  if (!report.attempted) return noSnapshot(cwd, "mutation");
   return fromReport(report, "snapshot:mutation", cwd);
 }
 
 /** Undo every file the agent touched during the current turn. */
 export function rollbackTurn(cwd: string): RollbackResult {
   const report = snapshots.rollbackTurn();
-  if (!report.attempted) return GitClient.rollback(cwd);
+  if (!report.attempted) return noSnapshot(cwd, "turn");
   return fromReport(report, "snapshot:turn", cwd);
 }
 
@@ -73,7 +93,7 @@ export function rollbackMutations(toolCallIds: string[], cwd: string): RollbackR
     merged.conflicts.push(...report.conflicts);
   }
 
-  if (!attempted) return GitClient.rollback(cwd);
+  if (!attempted) return noSnapshot(cwd, "mutation");
   merged.attempted = true;
   merged.partial = merged.skipped.length > 0 || merged.conflicted.length > 0;
   return fromReport(merged, "snapshot:mutation", cwd);

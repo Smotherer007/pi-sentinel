@@ -19,8 +19,11 @@ import {
   recordMetrics,
   recordEscalation,
   recordTurnOutcome,
+  policyOf,
+  recoveryOf,
   _resetForTesting,
 } from "../src/config.ts";
+import type { SentinelConfig } from "../src/types.ts";
 
 let home: string;
 let project: string;
@@ -121,6 +124,79 @@ describe("defineConfig", () => {
 
   test("returns default when no overrides", () => {
     assert.deepEqual(defineConfig({}), DEFAULT_CONFIG);
+  });
+});
+
+describe("recovery & change policy", () => {
+  test("the canonical recovery block carries the loop defaults", () => {
+    const conf = defineConfig({});
+    assert.equal(conf.recovery.enabled, true);
+    assert.equal(conf.recovery.maxAttempts, 3);
+    assert.equal(conf.recovery.rollbackAfterExhaustion, false);
+  });
+
+  test("the policy is opt-in with every rule inert", () => {
+    const conf = defineConfig({});
+    assert.equal(conf.policy.enabled, false);
+    assert.equal(conf.policy.maxChangedFiles, 0);
+    assert.equal(conf.policy.maxAddedLines, 0);
+    assert.equal(conf.policy.allowPackageChanges, true);
+    assert.equal(conf.policy.allowLockfileChanges, true);
+    assert.equal(conf.policy.allowWorkflowChanges, true);
+    assert.deepEqual(conf.policy.sensitivePaths, []);
+    assert.equal(conf.policy.rollbackOnViolation, false);
+  });
+
+  test("legacy autoFix / maxAutoRetries are adopted and stay in sync", () => {
+    const conf = defineConfig({ autoFix: false, maxAutoRetries: 5 });
+    assert.equal(conf.recovery.enabled, false);
+    assert.equal(conf.recovery.maxAttempts, 5);
+    // The legacy spellings are written back, so the contract stays truthful.
+    assert.equal(conf.autoFix, false);
+    assert.equal(conf.maxAutoRetries, 5);
+  });
+
+  test("an explicit recovery block wins over the legacy keys", () => {
+    const conf = defineConfig({ recovery: { maxAttempts: 2 }, maxAutoRetries: 9 });
+    assert.equal(conf.recovery.maxAttempts, 2);
+    assert.equal(conf.maxAutoRetries, 2, "no two spellings may disagree");
+  });
+
+  test("a nonsensical attempt budget is clamped to at least one", () => {
+    assert.equal(defineConfig({ recovery: { maxAttempts: 0 } }).recovery.maxAttempts, 1);
+    assert.equal(
+      defineConfig({ recovery: { maxAttempts: Number.NaN } }).recovery.maxAttempts,
+      1,
+    );
+  });
+
+  test("a policy can be switched on and configured", () => {
+    const conf = defineConfig({
+      policy: {
+        enabled: true,
+        maxChangedFiles: 5,
+        sensitivePaths: ["secrets/**"],
+        rollbackOnViolation: true,
+      },
+    });
+    assert.equal(conf.policy.enabled, true);
+    assert.equal(conf.policy.maxChangedFiles, 5);
+    assert.deepEqual(conf.policy.sensitivePaths, ["secrets/**"]);
+    assert.equal(conf.policy.rollbackOnViolation, true);
+    // Untouched policy keys keep their defaults.
+    assert.equal(conf.policy.allowWorkflowChanges, true);
+  });
+
+  test("the helpers fall back safely for a config from an older version", () => {
+    const legacy = { ...DEFAULT_CONFIG, autoFix: false, maxAutoRetries: 2 } as Record<string, unknown>;
+    delete legacy.recovery;
+    delete legacy.policy;
+    const conf = legacy as unknown as SentinelConfig;
+
+    assert.equal(recoveryOf(conf).enabled, false);
+    assert.equal(recoveryOf(conf).maxAttempts, 2);
+    assert.equal(recoveryOf(conf).rollbackAfterExhaustion, false);
+    assert.equal(policyOf(conf).enabled, false);
   });
 });
 

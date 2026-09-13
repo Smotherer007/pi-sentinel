@@ -22,6 +22,7 @@ import { verifiedEntry } from "../src/clients/evidence.ts";
 import { SentinelRewindTool } from "../src/tools/sentinel-rewind.ts";
 import { SentinelStatusTool } from "../src/tools/sentinel-status.ts";
 import { _clearCache } from "../src/clients/mindplace.ts";
+import { changedPaths } from "../src/clients/workspace.ts";
 
 type Handler = (event: any, ctx: any) => any;
 
@@ -397,6 +398,201 @@ describe("P0 — closing the loop", () => {
   });
 });
 
+describe("recovery — bounded attempts", () => {
+  test("rollbackAfterExhaustion restores the state before the failing cycle", async () => {
+    await configure({
+      autoRollback: false,
+      recovery: { enabled: true, maxAttempts: 1, rollbackAfterExhaustion: true },
+      pipelines: { onFileMutation: [], onTurnEnd: [{ name: "check", cmd: "exit 1", timeoutMs: 5000 }] },
+    });
+
+    const file = path.join(project, "src/a.ts");
+    await runTurn(1, "src/a.ts", "revision 1\n");
+    assert.equal(fake.sent.length, 1, "the first attempt is re-prompted");
+    assert.ok(fs.existsSync(file));
+
+    await runTurn(2, "src/a.ts", "revision 2\n");
+    assert.equal(fake.sent.length, 1, "the attempt budget is spent");
+    assert.ok(ctx._notifications.some((n) => n.text.includes("recovery exhausted")));
+    assert.equal(
+      fs.existsSync(file),
+      false,
+      "the state before the whole failing cycle is restored, not just the last edit",
+    );
+  });
+
+  test("the legacy maxAutoRetries still bounds the loop", async () => {
+    await configure({
+      autoRollback: false,
+      maxAutoRetries: 1,
+      pipelines: { onFileMutation: [], onTurnEnd: [{ name: "check", cmd: "exit 1", timeoutMs: 5000 }] },
+    });
+
+    await runTurn(1, "src/a.ts", "revision 1\n");
+    await runTurn(2, "src/a.ts", "revision 2\n");
+
+    assert.equal(fake.sent.length, 1, "one attempt, then stop");
+    assert.ok(ctx._notifications.some((n) => n.text.includes("recovery attempts exhausted")));
+  });
+
+  test("a green turn resets the recovery counter", async () => {
+    await configure({
+      autoRollback: false,
+      // Off: a regression revert would rewrite src/a.ts back to the verified
+      // state and make the next red turn look like "state unchanged".
+      revertOnRegression: false,
+      maxAutoRetries: 1,
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [
+          {
+            name: "toggle",
+            cmd: "node -e \"const fs=require('fs');const s=fs.existsSync('state.txt')?fs.readFileSync('state.txt','utf8'):'';process.exit(s==='green'?0:1)\"",
+            timeoutMs: 10000,
+          },
+        ],
+      },
+    });
+
+    await runTurn(1, "src/a.ts", "revision 1\n");
+    assert.equal(fake.sent.length, 1, "the red turn is re-prompted");
+
+    // A green turn must clear the budget...
+    fs.writeFileSync(path.join(project, "state.txt"), "green");
+    await runTurn(2, "src/a.ts", "revision 2\n");
+    assert.equal(fake.sent.length, 1, "a green turn does not re-prompt");
+
+    // ...so the next red cycle gets its own attempt again.
+    fs.writeFileSync(path.join(project, "state.txt"), "red");
+    await runTurn(3, "src/a.ts", "revision 3\n");
+    assert.equal(fake.sent.length, 2, "the reset budget allows a new attempt");
+
+    await runTurn(4, "src/a.ts", "revision 4\n");
+    assert.equal(fake.sent.length, 2, "the new budget is bounded again");
+    assert.ok(
+      ctx._notifications.some((n) => n.text.includes("recovery attempts exhausted")),
+      "notifications: " + JSON.stringify(ctx._notifications.map((n) => n.text)),
+    );
+  });
+});
+
+describe("P7 — change policy", () => {
+  test("a disallowed workflow stops the turn and tells the agent what to revert", async () => {
+    await configure({
+      autoRollback: false,
+      policy: { enabled: true, allowWorkflowChanges: false },
+      pipelines: { onFileMutation: [], onTurnEnd: [] },
+    });
+
+    const before = {
+      violations: getState().policyViolations.length,
+      metric: getState().metrics.policyViolations,
+    };
+    await runTurn(1, ".github/workflows/ci.yml", "name: ci\n");
+
+    assert.equal(fake.sent.length, 1, "the agent is asked to revert it");
+    const body = fake.sent[0].message.content as string;
+    assert.ok(body.includes("Change policy violation"));
+    assert.ok(body.includes(".github/workflows/ci.yml"));
+    assert.ok(ctx._notifications.some((n) => n.text.includes("Change policy violation")));
+    assert.equal(getState().policyViolations.length, before.violations + 1);
+    assert.equal(getState().metrics.policyViolations, before.metric + 1);
+    assert.deepEqual(getState().policyViolations[0].rules, ["allowWorkflowChanges"]);
+  });
+
+  test("stops the turn before verification runs", async () => {
+    await configure({
+      autoRollback: false,
+      policy: { enabled: true, allowWorkflowChanges: false },
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [
+          { name: "marker", cmd: "node -e \"require('fs').writeFileSync('ran.marker','x')\"", timeoutMs: 5000 },
+        ],
+      },
+    });
+
+    await runTurn(1, ".github/workflows/ci.yml", "name: ci\n");
+
+    assert.equal(
+      fs.existsSync(path.join(project, "ran.marker")),
+      false,
+      "a policy stop short-circuits the pipeline",
+    );
+  });
+
+  test("rollbackOnViolation restores the offending file", async () => {
+    await configure({
+      autoRollback: false,
+      policy: { enabled: true, allowWorkflowChanges: false, rollbackOnViolation: true },
+      pipelines: { onFileMutation: [], onTurnEnd: [] },
+    });
+
+    await runTurn(1, ".github/workflows/ci.yml", "name: ci\n");
+
+    assert.equal(fs.existsSync(path.join(project, ".github/workflows/ci.yml")), false);
+    const body = fake.sent[0].message.content as string;
+    assert.ok(body.includes("restored to their pre-turn state"));
+  });
+
+  test("an ordinary turn within the limits is not stopped", async () => {
+    await configure({
+      autoRollback: false,
+      policy: { enabled: true, maxChangedFiles: 10, maxAddedLines: 100 },
+      pipelines: { onFileMutation: [], onTurnEnd: [{ name: "ok", cmd: "exit 0", timeoutMs: 5000 }] },
+    });
+
+    const before = getState().policyViolations.length;
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+
+    assert.equal(fake.sent.length, 0);
+    assert.equal(getState().policyViolations.length, before, "no violation is recorded");
+  });
+
+  test("a violation in one turn does not leak into the next", async () => {
+    await configure({
+      autoRollback: false,
+      policy: { enabled: true, allowWorkflowChanges: false },
+      pipelines: { onFileMutation: [], onTurnEnd: [] },
+    });
+
+    const before = getState().policyViolations.length;
+    await runTurn(1, ".github/workflows/ci.yml", "name: ci\n");
+    assert.equal(getState().policyViolations.length, before + 1);
+
+    // Turn 2 touches only an ordinary file: it must be clean and must not
+    // inherit or re-report turn 1's violation.
+    await runTurn(2, "src/a.ts", "export const a = 1;\n");
+    assert.equal(getState().policyViolations.length, before + 1, "no violation is carried over");
+    assert.equal(fake.sent.length, 1, "only the violating turn produced a follow-up");
+  });
+
+  test("an out-of-band violation is reported once, not re-sent in a loop", async () => {
+    await configure({
+      autoRollback: false,
+      policy: { enabled: true, allowWorkflowChanges: false },
+      include: ["**/*.yml"],
+      pipelines: { onFileMutation: [], onTurnEnd: [] },
+    });
+
+    execSync("git init -q", { cwd: project });
+    execSync("git add -A", { cwd: project });
+
+    const target = path.join(project, ".github/workflows/ci.yml");
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, "name: ci\n");
+
+    await runTurn(1, null, "");
+    assert.equal(fake.sent.length, 1, "a bash-only change is still caught");
+
+    // The very same state is observed again: nothing changed and nothing was
+    // committed, so the change is reported to the human but not re-prompted.
+    await runTurn(2, null, "");
+    assert.equal(fake.sent.length, 1, "an identical violation is not re-sent");
+    assert.ok(ctx._notifications.some((n) => n.text.includes("same policy violation repeated")));
+  });
+});
+
 describe("mutation feedback", () => {
   test("a failing mutation pipeline returns an isError result with the trace", async () => {
     await configure({
@@ -639,6 +835,13 @@ describe("P3 — out-of-band changes", () => {
     fs.mkdirSync(path.join(project, "src"), { recursive: true });
     fs.writeFileSync(path.join(project, "src/generated.ts"), "export const g = 1;\n");
 
+    // Precondition: `git status` is the only source for out-of-band changes and
+    // can lag briefly under load. Wait until the scan sees the file, so a slow
+    // git fails here with a clear message instead of at the notification below.
+    await waitFor(() =>
+      changedPaths(project).some((c) => c.path.endsWith("generated.ts")),
+    );
+
     await runTurn(1, null, "");
 
     assert.ok(
@@ -836,7 +1039,9 @@ describe("disabled / status", () => {
     );
     const text = (result.content as Array<{ text: string }>)[0].text;
 
-    assert.ok(text.includes("autoFix: true"));
+    assert.ok(text.includes("autoFix (legacy alias): true"));
+    assert.ok(text.includes("recovery: true | maxAttempts: 3"));
+    assert.ok(text.includes("policy: false"));
     assert.ok(text.includes("checkpointRetention"));
     assert.ok(text.includes("Recent checkpoints"));
     assert.ok(text.includes("code graph (mindplace): absent"));

@@ -248,7 +248,13 @@ export class PipelineRunner {
 
         if (passed) continue;
 
-        const prunedTrace = pruneTrace(outcome.stdout, config.maxTraceLines, options.focusPaths);
+        const prunedTrace = pruneTrace(
+          outcome.stdout,
+          // A step can override the budget: a noisy linter and a terse compiler
+          // want different trace sizes. Unset keeps the global default.
+          step.maxTraceLines ?? config.maxTraceLines,
+          options.focusPaths,
+        );
         const kind: FailureKind = failureKind ?? "unknown";
 
         if (priority === "warning") {

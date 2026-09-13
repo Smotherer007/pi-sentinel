@@ -85,7 +85,60 @@ change — see [Synergy with pi-mindplace](#synergy-with-pi-mindplace).
                         (tool_result isError, or a follow-up turn)
 ```
 
-## The seven mechanisms
+### A worked example: sentinel as a safety layer
+
+The shape is the same whether you drive pi interactively or from a script: the agent edits freely,
+sentinel is the last line of defence, and every red state has a defined way out.
+
+```ts
+// sentinel.config.ts — safety-layer profile
+import { defineConfig } from "@patimweb/pi-sentinel";
+
+export default defineConfig({
+  autoRollback: false,             // do not silently undo work in progress
+  recovery: {
+    enabled: true,
+    maxAttempts: 3,                // bounded repair loop
+    rollbackAfterExhaustion: true, // …then return to the pre-cycle state
+  },
+  policy: {
+    enabled: true,                 // refuse the wrong *shape* of change, too
+    maxChangedFiles: 15,
+    maxAddedLines: 600,
+    allowWorkflowChanges: false,
+    sensitivePaths: [".env", "secrets/**"],
+    rollbackOnViolation: true,
+  },
+  pipelines: {
+    onFileMutation: [
+      { name: "type-check", cmd: "npm run typecheck", timeoutMs: 60000, priority: "critical", files: ["**/*.ts"] },
+    ],
+    onTurnEnd: [
+      { name: "unit-tests", cmd: "npm test", timeoutMs: 120000, priority: "critical", cacheable: false },
+    ],
+  },
+});
+```
+
+A single turn then looks like this:
+
+```text
+agent edits src/foo.ts
+  → onFileMutation: type-check               (fast; result returned with the edit)
+turn ends
+  → onTurnEnd: unit-tests                    (full suite)
+       PASS → verified state recorded; recovery budget reset
+       FAIL → agent re-prompted with the pruned failure      (attempt 1/3)
+              … still red after 3 attempts?
+              → restore the files changed since the first attempt
+              → report to the human: "recovery exhausted"
+```
+
+What that buys you: unrelated uncommitted work is never touched, a repair loop cannot run forever,
+a spent budget cannot leave a half-finished edit behind, and a change that would rewrite CI or a
+lockfile is stopped before it is ever verified.
+
+## The eight mechanisms
 
 ### P0 — close the loop: the agent is re-prompted, not just reported to
 
@@ -99,14 +152,25 @@ stops for one of four reasons"):
 | Stop condition | Implementation |
 |---|---|
 | checks pass | budget reset |
-| retry budget exhausted | `maxAutoRetries` (default 3) |
+| retry budget exhausted | `recovery.maxAttempts` (default 3) |
 | **the delta stops changing** | the code-state hash is identical to the one already re-prompted for |
 | a real user prompt arrives | budget reset (only `role: "user"` messages reset it — sentinel's own continuations do not, otherwise the loop would be unbounded) |
 
 ```ts
-autoFix: true,
-maxAutoRetries: 3,
+recovery: {
+  enabled: true,                   // re-prompt the agent with the failure
+  maxAttempts: 3,                  // consecutive attempts before the loop stops
+  rollbackAfterExhaustion: false,  // restore the state before the failing cycle
+},
 ```
+
+`autoFix` and `maxAutoRetries` are the older spelling of `enabled` and `maxAttempts`. Sentinel
+reconciles the two in both directions, so an existing configuration keeps its exact attempt budget —
+but `recovery` is the canonical block. With `rollbackAfterExhaustion` on, spending the budget
+restores the checkpoint from **before the first turn of the failing cycle**, not merely the last edit,
+so neither the agent nor the user inherits a half-finished change. That restore bypasses the
+"modified since the checkpoint" guard on purpose: the conflict it would report is the agent's own
+intermediate attempt, which is exactly what is being discarded.
 
 Evidence of the "delta stops changing" rule in the payload:
 
@@ -295,6 +359,71 @@ The same error occurred 3 time(s) (threshold 3). Do not repeat the same approach
 
 A genuinely green run clears the counters.
 
+### P7 — change policy: green code can still be the wrong change
+
+Verification answers *"does it work?"*. A change policy answers a different question: *"is this the
+kind of change that was supposed to happen?"* — twenty unrelated files, a 500-line diff, or a
+rewritten CI workflow can all be green and still be a serious mistake. Codex and Claude Code both
+gate this class of change behind an explicit approval; sentinel turns it into a structured stop the
+agent has to answer.
+
+The policy is **disabled by default** (`policy.enabled: false`) so upgrading never blocks an existing
+workflow. When enabled, it measures the shape of a turn and refuses it *before* anything is verified
+or persisted:
+
+| Rule | Fires on |
+|---|---|
+| `maxChangedFiles` | more than N files in one turn (`0` = unlimited) |
+| `maxAddedLines` | more than N added lines in one turn (`0` = unlimited) |
+| `allowPackageChanges` | a `package.json` was modified |
+| `allowLockfileChanges` | a lockfile (`package-lock.json`, `yarn.lock`, …) was modified |
+| `allowWorkflowChanges` | anything under `.github/workflows/` was modified |
+| `sensitivePaths` | a configured glob was modified (always forbidden) |
+
+```ts
+policy: {
+  enabled: true,
+  maxChangedFiles: 12,         // 0 = no limit
+  maxAddedLines: 400,          // 0 = no limit
+  allowPackageChanges: true,
+  allowLockfileChanges: false,
+  allowWorkflowChanges: false,
+  sensitivePaths: ["secrets/**", "**/*.pem"],
+  rollbackOnViolation: true,   // restore the turn's files when it violates
+},
+```
+
+A violation is a hard stop with a machine-readable explanation, so the agent is told exactly what to
+revert rather than a count it cannot act on:
+
+```
+[sentinel] Change policy violation — the turn was not accepted.
+
+Change summary:
+  files changed: 3 (added 1, modified 2, deleted 0)
+  lines added:   412 | lines removed: 8
+  sensitive:     .github/workflows/ci.yml (workflow)
+
+Violations:
+  • Policy violation: 412 lines were added, but at most 400 are allowed per turn.
+  • Policy violation: .github/workflows/ci.yml may not be modified.
+
+Revert the offending change (use `sentinel_rollback` or edit the file back). If the change is
+intended, the user must relax the policy in sentinel.config.ts.
+```
+
+The engine is pure (`src/clients/policy.ts`): it receives the before/after content of every changed
+file and returns counts plus violations, so the rules are unit-tested without a repository. Line
+stats come from a bounded LCS diff — exact for anything a human reviews, and deliberately
+over-reporting rather than under-reporting beyond the budget, because a policy whose job is to stop
+large changes must never miss one. Two rules keep the stop honest:
+
+- A path whose pre-state was never captured (a bash-only change) is still treated as changed, so a
+  shell-driven deletion of a protected file cannot slip past the policy.
+- The **identical** violation (same offending state, same rule) is reported to the human but never
+  re-sent to the agent, which is what keeps a policy stop from becoming a loop of its own. A clean
+  turn reopens the stop, so a later occurrence is reported again.
+
 ## Tools
 
 | Tool | Description |
@@ -415,7 +544,9 @@ trustworthy:
 | A step times out | Kills the tree, reports `timeout` and says the code is not the problem. | Re-run, or raise `timeoutMs`. Do not rewrite working code. |
 | The command is missing | Reports `command-not-found` and says the pipeline or the tool is at fault. | Fix the configuration or install the tool. |
 | The same error repeats | After `maxRepeatedFailures` identical failures it says so explicitly and tells the agent to change approach. | Re-evaluate the implementation, not the last edit. |
-| The code state stops changing | The repair loop stops instead of re-prompting (`autoFix`). | Read the report; another identical attempt would repeat itself. |
+| The code state stops changing | The repair loop stops instead of re-prompting (`recovery.enabled`). | Read the report; another identical attempt would repeat itself. |
+| The recovery budget is spent | With `rollbackAfterExhaustion` the state before the failing cycle is restored; otherwise the work stays and is reported. | Read what still fails; do not start another identical cycle. |
+| A turn violates the change policy | The turn stops before verification, the violation is recorded, and with `rollbackOnViolation` its files are restored. | Revert the offending change, or relax `policy` in `sentinel.config.ts` if it was intended. |
 | A file regressed from a verified state | Reported as a regression; with `revertOnRegression` that single file is restored. | Restore the file or justify the change — never silently keep both. |
 
 ## Configuration
@@ -434,8 +565,24 @@ export default defineConfig({
   autoRollback: true,          // restore on a failed check (destructive)
 
   // ── P0: close the loop ────────────────────────────────────────────────
-  autoFix: true,               // re-prompt the agent with the failure
-  maxAutoRetries: 3,           // …at most this many times
+  recovery: {
+    enabled: true,             // re-prompt the agent with the failure
+    maxAttempts: 3,            // …at most this many times
+    rollbackAfterExhaustion: false, // restore the pre-cycle state when spent
+  },
+  // autoFix / maxAutoRetries are the legacy spellings, reconciled automatically.
+
+  // ── P7: change policy (opt-in) ────────────────────────────────────────
+  policy: {
+    enabled: false,            // gate the *shape* of a turn, not just its result
+    maxChangedFiles: 0,        // 0 = no limit
+    maxAddedLines: 0,          // 0 = no limit
+    allowPackageChanges: true,
+    allowLockfileChanges: true,
+    allowWorkflowChanges: true,
+    sensitivePaths: [],        // project-relative globs that may never change
+    rollbackOnViolation: false,
+  },
 
   // ── P1: checkpoints ───────────────────────────────────────────────────
   checkpointRetention: 50,     // how many turn checkpoints stay on disk
@@ -518,8 +665,19 @@ export default defineConfig({
 |-----|------|---------|---------|
 | `enabled` | boolean | `true` | Master switch. When false the extension loads but does nothing. |
 | `autoRollback` | boolean | `true` | Restore the mutated files when a critical step fails. |
-| `autoFix` | boolean | `true` | Re-prompt the agent with the pruned failure at turn end (P0). |
-| `maxAutoRetries` | number | `3` | Upper bound on consecutive auto-fix continuations. |
+| `recovery.enabled` | boolean | `true` | Re-prompt the agent with the pruned failure at turn end (P0). |
+| `recovery.maxAttempts` | number | `3` | Upper bound on consecutive repair attempts (`>= 1`). |
+| `recovery.rollbackAfterExhaustion` | boolean | `false` | Restore the pre-cycle state once the attempt budget is spent (P0). |
+| `policy.enabled` | boolean | `false` | Gate the *shape* of a turn, not just its result (P7). |
+| `policy.maxChangedFiles` | number | `0` | Max changed files per turn; `0` = no limit. |
+| `policy.maxAddedLines` | number | `0` | Max added lines per turn; `0` = no limit. |
+| `policy.allowPackageChanges` | boolean | `true` | Allow a `package.json` to be modified. |
+| `policy.allowLockfileChanges` | boolean | `true` | Allow a lockfile to be modified. |
+| `policy.allowWorkflowChanges` | boolean | `true` | Allow `.github/workflows/**` to be modified. |
+| `policy.sensitivePaths` | string[] | `[]` | Project-relative globs that may never be modified. |
+| `policy.rollbackOnViolation` | boolean | `false` | Restore the turn's files when the policy is violated. |
+| `autoFix` | boolean | `true` | Legacy alias of `recovery.enabled`, kept in sync. |
+| `maxAutoRetries` | number | `3` | Legacy alias of `recovery.maxAttempts`, kept in sync. |
 | `checkpointRetention` | number | `50` | Turn checkpoints kept on disk; `0` keeps all. |
 | `trackVerifiedState` | boolean | `true` | Hash and keep a copy of every state that passed (P2). |
 | `revertOnRegression` | boolean | `true` | Restore a file that regressed away from its verified state. |

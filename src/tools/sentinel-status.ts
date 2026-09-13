@@ -65,7 +65,10 @@ export const SentinelStatusTool = {
     const text = [
       "[sentinel] Status",
       `  enabled: ${conf.enabled}`,
-      `  autoRollback: ${conf.autoRollback} | autoFix: ${conf.autoFix} (max ${conf.maxAutoRetries} attempts)`,
+      `  autoRollback: ${conf.autoRollback}`,
+      `  recovery: ${conf.recovery.enabled} | maxAttempts: ${conf.recovery.maxAttempts} | rollbackAfterExhaustion: ${conf.recovery.rollbackAfterExhaustion}`,
+      `  policy: ${conf.policy.enabled} | maxChangedFiles: ${conf.policy.maxChangedFiles || "unlimited"} | maxAddedLines: ${conf.policy.maxAddedLines || "unlimited"} | allowWorkflow: ${conf.policy.allowWorkflowChanges}`,
+      `  autoFix (legacy alias): ${conf.autoFix} (max ${conf.maxAutoRetries} attempts)`,
       `  trackVerifiedState: ${conf.trackVerifiedState} | revertOnRegression: ${conf.revertOnRegression}`,
       `  pruneStaleTraces: ${conf.pruneStaleTraces} | detectOutOfBand: ${conf.detectOutOfBand}`,
       `  revisionContract: ${conf.revisionContract} | backgroundTurnEnd: ${conf.backgroundTurnEnd}`,
@@ -112,6 +115,13 @@ export const SentinelStatusTool = {
         ? `Recent regressions (${state.regressions.length}):\n${regressions.join("\n")}`
         : "Recent regressions: none",
       "",
+      state.policyViolations.length > 0
+        ? `Recent policy violations (${state.policyViolations.length}):\n${state.policyViolations
+            .slice(0, 5)
+            .map((p) => `  ${p.at} | ${p.rules.join(", ")} | ${p.files.slice(0, 3).join(", ") || "(no paths)"}`)
+            .join("\n")}`
+        : "Recent policy violations: none",
+      "",
       trackedEscalations.length > 0
         ? `Escalating failures (this session):\n${trackedEscalations
             .slice(0, 5)
@@ -140,6 +150,7 @@ export const SentinelStatusTool = {
         graph,
         metrics: state.metrics,
         turnHistory: state.turnHistory.slice(0, 10),
+        policyViolations: state.policyViolations.slice(0, 10),
         cache: cacheStats ?? null,
         rollbackHistory: state.rollbackHistory,
       },

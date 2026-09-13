@@ -14,7 +14,14 @@ import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
-import type { PipelineStep, SentinelConfig, SentinelMetrics, StepPriority } from "./types.ts";
+import type {
+  PipelineStep,
+  PolicyConfig,
+  RecoveryConfig,
+  SentinelConfig,
+  SentinelMetrics,
+  StepPriority,
+} from "./types.ts";
 
 type DeepPartial<T> = {
   [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K];
@@ -35,6 +42,29 @@ export const DEFAULT_CONFIG: SentinelConfig = {
   // P0 — feedback is the product: re-prompt the agent on a red turn.
   autoFix: true,
   maxAutoRetries: 3,
+
+  // Bounded recovery: the same loop as autoFix/maxAutoRetries, but explicit.
+  // `rollbackAfterExhaustion` is off by default so an upgrade never restores
+  // more than it did before; turn it on to return to the pre-cycle state once
+  // the attempt budget is spent.
+  recovery: {
+    enabled: true,
+    maxAttempts: 3,
+    rollbackAfterExhaustion: false,
+  },
+
+  // Diff/change policy — opt-in. Existing projects are never blocked until
+  // they explicitly enable a rule.
+  policy: {
+    enabled: false,
+    maxChangedFiles: 0,
+    maxAddedLines: 0,
+    allowPackageChanges: true,
+    allowLockfileChanges: true,
+    allowWorkflowChanges: true,
+    sensitivePaths: [],
+    rollbackOnViolation: false,
+  },
 
   // P1 — keep enough checkpoints to undo a working session, not the repo.
   checkpointRetention: 50,
@@ -159,6 +189,12 @@ export interface SentinelState {
     count: number;
     signature: string;
   }>;
+  /** Change-policy audit trail: what rule fired and on which files. */
+  policyViolations: Array<{
+    at: string;
+    rules: string[];
+    files: string[];
+  }>;
 }
 
 /** All-zero metrics, so state files written by older versions still load. */
@@ -176,6 +212,7 @@ export function emptyMetrics(): SentinelMetrics {
     totalDurationMs: 0,
     rollbacks: 0,
     partialRollbacks: 0,
+    policyViolations: 0,
   };
 }
 
@@ -188,6 +225,7 @@ function emptyState(): SentinelState {
     metrics: emptyMetrics(),
     turnHistory: [],
     escalations: [],
+    policyViolations: [],
   };
 }
 
@@ -239,7 +277,52 @@ export function setStateScope(cwd: string): void {
  * Type helper for authoring `sentinel.config.ts`.
  */
 export function defineConfig(config: SentinelConfigInput): SentinelConfig {
-  return deepMerge(DEFAULT_CONFIG, config);
+  return normaliseConfig(deepMerge(DEFAULT_CONFIG, config), config);
+}
+
+/**
+ * Reconcile the canonical `recovery` block with the legacy `autoFix` /
+ * `maxAutoRetries` keys.
+ *
+ * The two spellings must never disagree. An explicit `recovery.maxAttempts`
+ * wins; otherwise a configured `maxAutoRetries` is adopted, so a project that
+ * upgrades from 2.x keeps its exact attempt budget. The legacy fields are then
+ * written back so `revisionContract` and the status output stay truthful.
+ */
+function normaliseConfig(
+  merged: SentinelConfig,
+  raw: SentinelConfigInput | undefined,
+): SentinelConfig {
+  const rawRecovery = (raw?.recovery ?? {}) as Partial<RecoveryConfig>;
+  const legacyMax = (raw as { maxAutoRetries?: number } | undefined)?.maxAutoRetries;
+  const legacyEnabled = (raw as { autoFix?: boolean } | undefined)?.autoFix;
+
+  const maxAttempts = rawRecovery.maxAttempts ?? legacyMax ?? merged.recovery.maxAttempts;
+  const enabled = rawRecovery.enabled ?? legacyEnabled ?? merged.recovery.enabled;
+
+  merged.recovery = {
+    enabled,
+    maxAttempts: Number.isFinite(maxAttempts) ? Math.max(1, Math.floor(maxAttempts)) : 1,
+    rollbackAfterExhaustion:
+      rawRecovery.rollbackAfterExhaustion ?? merged.recovery.rollbackAfterExhaustion,
+  };
+  merged.autoFix = merged.recovery.enabled;
+  merged.maxAutoRetries = merged.recovery.maxAttempts;
+  return merged;
+}
+
+/** Settings a change policy needs, with safe defaults for out-of-date callers. */
+export function policyOf(config: SentinelConfig): PolicyConfig {
+  return config.policy ?? DEFAULT_CONFIG.policy;
+}
+
+/** Settings the recovery loop needs, with safe defaults for older callers. */
+export function recoveryOf(config: SentinelConfig): RecoveryConfig {
+  return config.recovery ?? {
+    enabled: config.autoFix,
+    maxAttempts: config.maxAutoRetries,
+    rollbackAfterExhaustion: false,
+  };
 }
 
 function deepMerge<T>(base: T, override: SentinelConfigInput): T {
@@ -294,7 +377,7 @@ export async function loadConfig(cwd: string): Promise<SentinelConfig> {
       const mod = await import(url.href);
       const raw = mod.default ?? mod.config;
       if (raw && typeof raw === "object") {
-        activeConfig = deepMerge(DEFAULT_CONFIG, raw as Partial<SentinelConfig>);
+        activeConfig = normaliseConfig(deepMerge(DEFAULT_CONFIG, raw as Partial<SentinelConfig>), raw as SentinelConfigInput);
         return activeConfig;
       }
     } catch (err) {
@@ -315,12 +398,11 @@ export function getConfig(): SentinelConfig {
 function persistState(): void {
   const filePath = statePath();
   const dir = path.dirname(filePath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  }
-
   const tmpPath = `${filePath}.${process.pid}.tmp`;
   try {
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
     fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2), {
       encoding: "utf-8",
       mode: 0o600,
@@ -328,12 +410,15 @@ function persistState(): void {
     fs.chmodSync(tmpPath, 0o600);
     fs.renameSync(tmpPath, filePath);
   } catch (err) {
+    // Persisting history is an audit convenience, never a reason to fail a
+    // verification run or crash a hook. A full/read-only disk must not turn
+    // "checks passed" into an exception the agent sees.
     try {
       fs.unlinkSync(tmpPath);
     } catch {
       /* ignore */
     }
-    throw err;
+    console.warn("[sentinel] could not persist state:", err);
   }
 }
 
@@ -353,6 +438,7 @@ export function loadState(): void {
           metrics: { ...emptyMetrics(), ...(raw.metrics ?? {}) },
           turnHistory: Array.isArray(raw.turnHistory) ? raw.turnHistory : [],
           escalations: Array.isArray(raw.escalations) ? raw.escalations : [],
+          policyViolations: Array.isArray(raw.policyViolations) ? raw.policyViolations : [],
         };
         return;
       }
@@ -415,6 +501,13 @@ export function recordMetrics(delta: Partial<SentinelMetrics>): void {
 export function recordEscalation(entry: SentinelState["escalations"][number]): void {
   state.escalations.unshift(entry);
   if (state.escalations.length > 20) state.escalations.length = 20;
+  persistState();
+}
+
+/** Change policy: log a violation (rule ids + the files it concerned). */
+export function recordPolicyViolation(entry: SentinelState["policyViolations"][number]): void {
+  state.policyViolations.unshift(entry);
+  if (state.policyViolations.length > 20) state.policyViolations.length = 20;
   persistState();
 }
 

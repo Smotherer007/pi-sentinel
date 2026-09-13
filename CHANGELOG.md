@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- Add entries here. They are promoted into a version section when a release is cut. -->
 
+## [2.2.0] - 2026-09-13
+
+### Added
+- **P7 — change policy** (`src/clients/policy.ts`): an opt-in, per-turn diff policy that gates the
+  *shape* of a change rather than its result — `maxChangedFiles`, `maxAddedLines`,
+  `allowPackageChanges`, `allowLockfileChanges`, `allowWorkflowChanges` and custom
+  `sensitivePaths`. A violation is a structured stop the agent has to answer, with optional
+  `rollbackOnViolation`, an identical-violation guard and an audit trail in `sentinel_status`.
+  Disabled by default, so upgrading never blocks an existing workflow.
+- **Bounded recovery** (`recovery`): the canonical spelling of `autoFix` / `maxAutoRetries`, plus
+  `rollbackAfterExhaustion` to restore the state before the failing cycle. The legacy keys are
+  reconciled in both directions, so an existing configuration keeps its exact attempt budget.
+- **`PipelineStep.maxTraceLines`**: per-step override for the pruner's critical-line budget.
+
+### Changed
+- **An automatic rollback never widens into `git checkout -- .`.** With no snapshot captured it is an
+  explicit no-op that reports `method: "none"`, instead of discarding unrelated uncommitted work; the
+  explicit `sentinel_rollback` `mode: "head"` reset remains available.
+- **Snapshot restores are atomic**: content is written to a sibling temp file and renamed, so a crash
+  or a full disk cannot leave a half-written source file.
+- **Verification and persistence failures no longer end a session**: a throwing runner is reported and
+  the turn continues, and failing to persist state is a warning, not an exception.
+- `/sentinel status` and `sentinel_status` report `recovery` and `policy` separately from the legacy
+  aliases, and list recent policy violations.
+
+### Fixed
+- Change-policy `sensitivePaths` globs are matched project-relative, like `include`/`exclude`; an
+  anchored pattern previously never matched.
+- `rollbackAfterExhaustion` now actually restores the pre-cycle state: the restore is no longer
+  refused by the "modified since the checkpoint" guard that the intermediate attempts itself triggered.
+- Out-of-band detection retries `git status` once instead of silently returning no changes, so a
+  transient failure can no longer disable P3 for a whole turn.
+
 ## [2.1.0] - 2026-09-13
 
 ### Added

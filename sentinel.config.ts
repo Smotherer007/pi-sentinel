@@ -27,8 +27,15 @@ export default defineConfig({
 
   // ── P0: close the loop ─────────────────────────────────────────────────
   // Turn-end failures re-prompt the agent instead of only notifying the human.
-  autoFix: true,
-  maxAutoRetries: 3,
+  // `recovery` is the canonical block; `autoFix` / `maxAutoRetries` are the
+  // legacy spellings and are reconciled automatically.
+  recovery: {
+    enabled: true,
+    maxAttempts: 3,
+    // Off for this repo: the budget is still bounded, but a spent budget must
+    // not silently undo a work-in-progress refactor.
+    rollbackAfterExhaustion: false,
+  },
 
   // ── P1: durable checkpoints ────────────────────────────────────────────
   checkpointRetention: 50,
@@ -79,6 +86,21 @@ export default defineConfig({
       enabled: true,
       maxRepeatedFailures: 3,
     },
+  },
+
+  // ── P7: change policy (opt-in) ─────────────────────────────────────────
+  // Off in the library and off here: gating the *shape* of a turn is a
+  // deliberate per-project choice. Switch `enabled` on to refuse oversized
+  // diffs or changes to sensitive files before they are verified.
+  policy: {
+    enabled: false,
+    maxChangedFiles: 0,
+    maxAddedLines: 0,
+    allowPackageChanges: true,
+    allowLockfileChanges: true,
+    allowWorkflowChanges: true,
+    sensitivePaths: [],
+    rollbackOnViolation: false,
   },
 
   // ── mindplace synergy ─────────────────────────────────────────────────

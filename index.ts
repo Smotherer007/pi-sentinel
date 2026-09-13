@@ -62,6 +62,7 @@ import type {
   ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import * as fs from "node:fs";
 import { isAbsolute, resolve, relative, sep } from "node:path";
 
 import { PipelineRunner } from "./src/clients/pipeline-runner.ts";
@@ -75,6 +76,8 @@ import {
 import { snapshots, describeRestore } from "./src/clients/snapshot.ts";
 import { checkpoints } from "./src/clients/checkpoints.ts";
 import { stateHashOf, recordVerified, detectRegressions, revertToVerified } from "./src/clients/evidence.ts";
+import { evaluatePolicy, formatPolicyReport, relativePath } from "./src/clients/policy.ts";
+import type { PolicyChange } from "./src/clients/policy.ts";
 import { outOfBandChanges } from "./src/clients/workspace.ts";
 import { describeChange, expandWithDependents } from "./src/clients/mindplace.ts";
 import { VerificationQueue } from "./src/clients/queue.ts";
@@ -94,11 +97,15 @@ import {
   recordRegression,
   recordMetrics,
   recordEscalation,
+  recordPolicyViolation,
   recordTurnOutcome,
   projectDir,
+  policyOf,
+  recoveryOf,
 } from "./src/config.ts";
 import type {
   PipelineRunResult,
+  PolicyReport,
   Regression,
   RollbackConflict,
   VerificationResult,
@@ -190,8 +197,21 @@ export default function (pi: ExtensionAPI) {
   let lastInjectedStateHash: string | null = null;
   /** The paths that hash referred to, so a no-op turn can be compared at all. */
   let lastInjectedPaths: string[] = [];
+  /**
+   * Checkpoint of the *first* turn in the current red cycle. Recovery
+   * exhaustion restores exactly this, so `rollbackAfterExhaustion` returns to
+   * the state before the first failed attempt rather than merely undoing the
+   * last one.
+   */
+  let recoveryStartCheckpointId: string | null = null;
   /** In-flight background verification (P5); one at a time. */
   let backgroundRun: Promise<void> | null = null;
+  /**
+   * Signature of the last policy violation we already re-prompted for. An
+   * identical violation is reported to the human but never re-sent to the
+   * agent, which is what keeps a policy stop from becoming a loop.
+   */
+  let lastPolicySignature: string | null = null;
 
   /**
    * Mutation verifications are batched: with a debounce window, edits that
@@ -202,14 +222,27 @@ export default function (pi: ExtensionAPI) {
   const mutationQueue = new VerificationQueue<string, MutationRequest, VerificationOutcome>(
     async (_key, requests) => {
       const first = requests[0];
-      return runVerification({
+      const focusPaths = [...new Set(requests.flatMap((request) => request.focusPaths))];
+      const outcome = await runVerificationSafely({
         trigger: "onFileMutation",
         cwd: first.cwd,
         ctx: first.ctx,
         // One run, the union of every request in the batch.
-        focusPaths: [...new Set(requests.flatMap((request) => request.focusPaths))],
+        focusPaths,
         toolCallIds: [...new Set(requests.flatMap((request) => request.toolCallIds))],
       });
+      if (outcome) return outcome;
+      // The runner threw: do not invent a failure. The mutation stands and the
+      // human was told the check could not complete.
+      return {
+        passed: true,
+        stateHash: "",
+        focusPaths,
+        warnings: [],
+        rolledBack: false,
+        regressions: [],
+        conflicts: [],
+      };
     },
     0,
   );
@@ -229,6 +262,8 @@ export default function (pi: ExtensionAPI) {
     autoFixAttempts = 0;
     lastInjectedStateHash = null;
     lastInjectedPaths = [];
+    recoveryStartCheckpointId = null;
+    lastPolicySignature = null;
     // A new user turn (or a repaired loop) is a fresh start for escalation.
     escalations.reset();
   }
@@ -246,6 +281,111 @@ export default function (pi: ExtensionAPI) {
     } catch {
       return paths;
     }
+  }
+
+  /**
+   * Build the change-policy view of a turn: pre-state from the snapshot
+   * journal, post-state from disk. A file whose pre-state was never captured
+   * (a bash-only change) is marked unknown, so its line counts are reported as
+   * zero instead of being invented.
+   */
+  function policyChangesFor(cwd: string, paths: string[]): PolicyChange[] {
+    const pre = new Map(snapshots.turnSnapshots().map((snap) => [snap.path, snap]));
+    const changes: PolicyChange[] = [];
+    for (const raw of [...new Set(paths.map((p) => absPath(p, cwd)))]) {
+      const snap = pre.get(raw);
+      let after: string | null = null;
+      try {
+        after = fs.readFileSync(raw, "utf-8");
+      } catch {
+        after = null;
+      }
+      if (snap && !snap.incomplete && snap.data !== null) {
+        changes.push({ path: raw, before: snap.data.toString("utf-8"), beforeKnown: true, after });
+      } else if (snap && !snap.existed) {
+        changes.push({ path: raw, before: null, beforeKnown: true, after });
+      } else {
+        changes.push({ path: raw, before: null, beforeKnown: false, after });
+      }
+    }
+    return changes;
+  }
+
+  /**
+   * Stop a turn whose change shape violates the policy.
+   *
+   * The violation is recorded, optionally rolled back, and — once per distinct
+   * violation — sent to the agent as a follow-up. A repeated identical
+   * violation is reported to the human but never re-sent, so a policy stop can
+   * never turn into a loop of its own.
+   */
+  function handlePolicyViolation(args: {
+    report: PolicyReport;
+    cwd: string;
+    ctx: { ui: ExtensionUIContext };
+    focusPaths: string[];
+  }): void {
+    const policy = policyOf(getConfig());
+    const files = [...new Set(args.report.violations.flatMap((v) => v.paths))];
+    recordPolicyViolation({
+      at: new Date().toISOString(),
+      rules: args.report.violations.map((v) => v.rule),
+      files,
+    });
+    recordMetrics({ policyViolations: 1 });
+
+    let rolledBack = false;
+    if (policy.rollbackOnViolation) {
+      const rb = rollbackTurn(args.cwd);
+      rolledBack = rb.success;
+      if (rb.conflicts && rb.conflicts.length > 0) {
+        args.ctx.ui.notify(
+          `Sentinel left ${rb.conflicts.length} file(s) untouched (policy violation).`,
+          "error",
+        );
+      } else if (rb.success) {
+        recordRollback({
+          at: new Date().toISOString(),
+          branch: rb.branch ?? "unknown",
+          head: rb.committedAt ?? "unknown",
+          reason: "policy",
+          method: rb.method,
+        });
+      }
+    }
+
+    const text =
+      formatPolicyReport(args.report, args.cwd) +
+      (rolledBack ? "\n\nThe violating files were restored to their pre-turn state." : "");
+    // Hash the offending files themselves, resolved against the project root so
+    // the signature never depends on the process working directory. A rule with
+    // no paths (maxChangedFiles/maxAddedLines) falls back to the turn scope.
+    const signaturePaths = (files.length > 0 ? files : args.focusPaths).map((p) =>
+      absPath(p, args.cwd),
+    );
+    const signature = `${stateHashOf(signaturePaths)}:${args.report.violations
+      .map((v) => v.rule)
+      .join(",")}`;
+
+    args.ctx.ui.notify(text, "error");
+
+    if (lastPolicySignature === signature) {
+      args.ctx.ui.notify(
+        "Sentinel: the same policy violation repeated — stopping instead of re-prompting.",
+        "warning",
+      );
+      return;
+    }
+    lastPolicySignature = signature;
+    pi.sendMessage(
+      {
+        customType: SENTINEL_MESSAGE_TYPE,
+        content: text,
+        display: true,
+        details: { policy: true, rules: args.report.violations.map((v) => v.rule) },
+      },
+      { deliverAs: "followUp", triggerTurn: true },
+    );
   }
 
   function notifyWarnings(ctx: { ui: ExtensionUIContext }, warnings: PipelineRunResult["warnings"], cwd: string): void {
@@ -358,6 +498,13 @@ export default function (pi: ExtensionAPI) {
         );
       } else if (rb.success) {
         args.ctx.ui.notify(`Sentinel restored your changes (${failure.step} failed)`, "error");
+      } else if (rb.method === "none") {
+        // No snapshot existed, so there was nothing safe to restore. Say so
+        // plainly instead of calling it a failure — the work is still there.
+        args.ctx.ui.notify(
+          `Sentinel did not roll back (${failure.step} failed): no snapshot was captured, so the changes are still in place.`,
+          "warning",
+        );
       } else {
         args.ctx.ui.notify(`Sentinel rollback failed: ${rb.message}`, "error");
       }
@@ -475,8 +622,11 @@ export default function (pi: ExtensionAPI) {
     focusPaths: string[];
     cwd: string;
     ctx: { ui: ExtensionUIContext };
+    /** Pre-state checkpoint of this turn, used by rollbackAfterExhaustion. */
+    checkpointId?: string;
   }): void {
     const conf = getConfig();
+    const recovery = recoveryOf(conf);
     const failure = args.outcome.failure!;
 
     // "The remaining delta stops changing" (Codex's stop condition) needs a
@@ -493,7 +643,7 @@ export default function (pi: ExtensionAPI) {
     let action: AutoFixAction = "none";
     let attemptInfo: { attempt: number; max: number; stopped?: boolean } | undefined;
 
-    if (conf.autoFix && !failure.warnOnly) {
+    if (recovery.enabled && !failure.warnOnly) {
       if (lastInjectedStateHash === stateHash) {
         action = "stop-unchanged";
         recordAutoFix({
@@ -503,20 +653,52 @@ export default function (pi: ExtensionAPI) {
           outcome: "stopped",
           reason: "identical code state",
         });
-      } else if (autoFixAttempts + 1 > conf.maxAutoRetries) {
+      } else if (autoFixAttempts + 1 > recovery.maxAttempts) {
         action = "exhausted";
+        // Bounded recovery: the attempt budget is spent. Optionally return to
+        // the state before the first turn of this failing cycle, so neither
+        // the agent nor the user inherits a half-finished edit.
+        if (recovery.rollbackAfterExhaustion && recoveryStartCheckpointId) {
+          // `force` on purpose: the conflict check refuses to overwrite a file
+          // that changed after the checkpoint, which is exactly the set of
+          // intermediate repair attempts this restore is meant to discard.
+          // Only files in the checkpoint are touched, so unrelated work stays.
+          const report = checkpoints.restore(args.cwd, recoveryStartCheckpointId, { force: true });
+          if (report.attempted) {
+            args.outcome.rolledBack = !report.partial;
+            args.outcome.conflicts = report.conflicts;
+            recordRollback({
+              at: new Date().toISOString(),
+              branch: "checkpoint",
+              head: recoveryStartCheckpointId,
+              reason: `recovery-exhausted:${failure.step}`,
+              method: "checkpoint:recovery",
+            });
+            recordMetrics({ rollbacks: 1, partialRollbacks: report.partial ? 1 : 0 });
+            args.ctx.ui.notify(
+              `Sentinel: recovery exhausted — restored the state before the failing cycle (${describeRestore(report)}).`,
+              "warning",
+            );
+          }
+        }
+        recoveryStartCheckpointId = null;
         recordAutoFix({
           at: new Date().toISOString(),
           step: failure.step,
           attempt: autoFixAttempts,
           outcome: "exhausted",
-          reason: `maxAutoRetries=${conf.maxAutoRetries}`,
+          reason: `recovery.maxAttempts=${recovery.maxAttempts}`,
         });
       } else {
         autoFixAttempts += 1;
+        // Remember where this failing cycle began: exhaustion restores from
+        // here, not from the last attempt.
+        if (recoveryStartCheckpointId === null && args.checkpointId) {
+          recoveryStartCheckpointId = args.checkpointId;
+        }
         lastInjectedStateHash = stateHash;
         lastInjectedPaths = deltaPaths;
-        attemptInfo = { attempt: autoFixAttempts, max: conf.maxAutoRetries };
+        attemptInfo = { attempt: autoFixAttempts, max: recovery.maxAttempts };
         action = "inject";
         recordAutoFix({
           at: new Date().toISOString(),
@@ -533,7 +715,7 @@ export default function (pi: ExtensionAPI) {
       args.focusPaths,
       args.cwd,
       action === "stop-unchanged"
-        ? { attempt: autoFixAttempts, max: conf.maxAutoRetries, stopped: true }
+        ? { attempt: autoFixAttempts, max: recovery.maxAttempts, stopped: true }
         : attemptInfo,
       stateHash,
     );
@@ -554,7 +736,7 @@ export default function (pi: ExtensionAPI) {
         { deliverAs: "followUp", triggerTurn: true },
       );
       args.ctx.ui.notify(
-        `Sentinel: ${failure.step} failed — re-prompting the agent (attempt ${autoFixAttempts}/${conf.maxAutoRetries})`,
+        `Sentinel: ${failure.step} failed — re-prompting the agent (attempt ${autoFixAttempts}/${recovery.maxAttempts})`,
         "warning",
       );
       return;
@@ -570,7 +752,7 @@ export default function (pi: ExtensionAPI) {
       );
     } else if (action === "exhausted") {
       args.ctx.ui.notify(
-        `Sentinel: ${conf.maxAutoRetries} repair attempts exhausted — reporting instead of editing further.`,
+        `Sentinel: ${recovery.maxAttempts} recovery attempts exhausted — reporting instead of editing further.`,
         "warning",
       );
     }
@@ -729,10 +911,17 @@ export default function (pi: ExtensionAPI) {
 
     // Prepend the pruned error while keeping the original result blocks. The
     // run may have covered more files than this hook did (coalesced batch), so
-    // the scope of the run is what the payload describes.
+    // the scope of the run is what the payload describes. Formatting is
+    // best-effort: a broken ledger must not turn into a hook exception.
+    let failureText: string;
+    try {
+      failureText = renderFailure(outcome, outcome.focusPaths, ctx.cwd);
+    } catch {
+      failureText = `[sentinel] Verification failed at step "${outcome.failure?.step ?? "unknown"}" (exit ${outcome.failure?.exitCode ?? -1}). The failure could not be formatted; inspect the output manually.`;
+    }
     return {
       content: [
-        { type: "text" as const, text: renderFailure(outcome, outcome.focusPaths, ctx.cwd) },
+        { type: "text" as const, text: failureText },
         ...(event.content ?? []),
       ],
       isError: true as const,
@@ -763,6 +952,26 @@ export default function (pi: ExtensionAPI) {
     }
 
     const focusPaths = [...new Set([...turnPaths, ...outOfBand])];
+
+    // Change policy — evaluated before anything is verified or persisted. A
+    // violation is a hard stop for the turn, and it is the one check whose
+    // whole point is that green code can still be the wrong change.
+    if (conf.enabled && conf.policy.enabled && focusPaths.length > 0) {
+      try {
+        const report = evaluatePolicy(policyChangesFor(ctx.cwd, focusPaths), conf.policy, ctx.cwd);
+        if (!report.passed) {
+          handlePolicyViolation({ report, cwd: ctx.cwd, ctx, focusPaths });
+          snapshots.beginTurn();
+          return;
+        }
+        // A clean turn reopens the policy stop, so a later identical violation
+        // is reported to the agent again.
+        lastPolicySignature = null;
+      } catch {
+        // A policy bug must never block verification: report nothing and let
+        // the normal pipeline decide.
+      }
+    }
 
     // P1 — persist the turn's pre-state so it can be rewound later. The
     // post-mutation hashes come along, so a rewind can refuse to overwrite a
@@ -803,12 +1012,18 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const outcome = await runVerification({
+    const outcome = await runVerificationSafely({
       trigger: "onTurnEnd",
       cwd: ctx.cwd,
       ctx,
       focusPaths,
     });
+
+    if (!outcome) {
+      // Verification failed in an unexpected way — never crash the session.
+      snapshots.beginTurn();
+      return;
+    }
 
     recordTurnOutcome({
       at: new Date().toISOString(),
@@ -820,12 +1035,52 @@ export default function (pi: ExtensionAPI) {
     if (outcome.passed) {
       resetRepairBudget();
     } else {
-      handleRedTurn({ outcome, focusPaths, cwd: ctx.cwd, ctx });
+      handleRedTurnSafely({ outcome, focusPaths, cwd: ctx.cwd, ctx, checkpointId });
     }
 
     // The turn is over — drop its snapshot scope either way.
     snapshots.beginTurn();
   });
+
+  /**
+   * A verification failure must never take the agent session down with it.
+   * Returns null when the runner itself threw (disk full, spawn abuse, …).
+   */
+  async function runVerificationSafely(args: {
+    trigger: "onFileMutation" | "onTurnEnd";
+    cwd: string;
+    ctx: { ui: ExtensionUIContext };
+    focusPaths: string[];
+    toolCallIds?: string[];
+    allowRollback?: boolean;
+    skipCache?: boolean;
+  }): Promise<VerificationOutcome | null> {
+    try {
+      return await runVerification(args);
+    } catch (err) {
+      args.ctx.ui.setStatus("sentinel", undefined);
+      args.ctx.ui.notify(
+        `Sentinel: verification could not complete (${(err as Error)?.message ?? "unknown error"}). The code was left untouched.`,
+        "error",
+      );
+      return null;
+    }
+  }
+
+  /** Feedback delivery is best-effort: it must not break the turn either. */
+  function handleRedTurnSafely(args: {
+    outcome: VerificationOutcome;
+    focusPaths: string[];
+    cwd: string;
+    ctx: { ui: ExtensionUIContext };
+    checkpointId?: string;
+  }): void {
+    try {
+      handleRedTurn(args);
+    } catch {
+      /* the failure is already visible through the status line */
+    }
+  }
 
   /**
    * P5 — run the slow pipelines without blocking the turn end, then wake the
@@ -898,11 +1153,12 @@ export default function (pi: ExtensionAPI) {
           }
         }
 
-        handleRedTurn({
+        handleRedTurnSafely({
           outcome,
           focusPaths: args.focusPaths,
           cwd: args.cwd,
           ctx: args.ctx,
+          checkpointId: args.checkpointId,
         });
       } catch {
         /* background verification must never crash the session */
@@ -1136,7 +1392,9 @@ export default function (pi: ExtensionAPI) {
 
     const lines = [
       "[sentinel] Status",
-      `  enabled: ${conf.enabled} | autoRollback: ${conf.autoRollback} | autoFix: ${conf.autoFix}/${conf.maxAutoRetries}`,
+      `  enabled: ${conf.enabled} | autoRollback: ${conf.autoRollback}`,
+      `  recovery: ${conf.recovery.enabled} (max ${conf.recovery.maxAttempts} attempts, rollback-after-exhaustion ${conf.recovery.rollbackAfterExhaustion})`,
+      `  policy: ${conf.policy.enabled} (max ${conf.policy.maxChangedFiles || "unlimited"} file(s), ${conf.policy.maxAddedLines || "unlimited"} added line(s))`,
       `  evidence: ${conf.trackVerifiedState} (revert ${conf.revertOnRegression}) | out-of-band: ${conf.detectOutOfBand}`,
       `  background checks: ${conf.backgroundTurnEnd} | output budget: ${conf.maxOutputTokens} tokens`,
       `  debounce: ${conf.verification.debounceMs}ms | cache: ${conf.verification.cache.enabled} | escalation: ${conf.verification.failureEscalation.enabled}`,

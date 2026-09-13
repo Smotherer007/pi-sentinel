@@ -57,18 +57,25 @@ export function parsePorcelain(stdout: string, cwd: string): OutOfBandChange[] {
  * keep working, so this is a capability gap, never a failure.
  */
 export function changedPaths(cwd: string): OutOfBandChange[] {
-  try {
-    const stdout = execSync("git status --porcelain --untracked-files=all", {
-      cwd,
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 10_000,
-      maxBuffer: 8 * 1024 * 1024,
-    });
-    return parsePorcelain(stdout, cwd);
-  } catch {
-    return [];
+  // One retry on purpose: a transient failure (fork/exec pressure, a
+  // momentarily locked index) must not silently disable out-of-band detection
+  // for a whole turn. A non-git project fails both attempts instantly, so the
+  // "capability gap" case is unchanged.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const stdout = execSync("git status --porcelain --untracked-files=all", {
+        cwd,
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 10_000,
+        maxBuffer: 8 * 1024 * 1024,
+      });
+      return parsePorcelain(stdout, cwd);
+    } catch {
+      /* retry once, then report nothing */
+    }
   }
+  return [];
 }
 
 /**

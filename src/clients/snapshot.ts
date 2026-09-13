@@ -143,13 +143,27 @@ function restoreSnapshot(snap: FileSnapshot): "restored" | "deleted" | "skipped"
     }
     if (snap.incomplete || snap.data === null) return "skipped";
     fs.mkdirSync(path.dirname(snap.path), { recursive: true });
-    fs.writeFileSync(snap.path, snap.data);
-    if (snap.mode !== undefined) {
-      try {
-        fs.chmodSync(snap.path, snap.mode);
-      } catch {
-        /* permissions are best-effort; the content is what matters */
+    // Write to a sibling temp file and rename: a crash or a full disk midway
+    // through must never leave a half-written source file behind. Rename is
+    // atomic on the same filesystem.
+    const tmp = `${snap.path}.sentinel-${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(tmp, snap.data);
+      if (snap.mode !== undefined) {
+        try {
+          fs.chmodSync(tmp, snap.mode);
+        } catch {
+          /* permissions are best-effort; the content is what matters */
+        }
       }
+      fs.renameSync(tmp, snap.path);
+    } catch (err) {
+      try {
+        fs.rmSync(tmp, { force: true });
+      } catch {
+        /* ignore */
+      }
+      throw err;
     }
     return "restored";
   } catch {

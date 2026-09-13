@@ -79,6 +79,88 @@ export interface PipelineStep {
    * Set `false` for non-deterministic steps (flaky test suites).
    */
   cacheable?: boolean;
+  /**
+   * Per-step override for how many critical error lines the pruner keeps.
+   * A noisy linter and a terse compiler want different budgets; the global
+   * `maxTraceLines` stays the default, so an unset value changes nothing.
+   */
+  maxTraceLines?: number;
+}
+
+/**
+ * Bounded automatic error correction.
+ *
+ * The recovery loop re-prompts the agent with a pruned failure. It is bounded
+ * so a coding agent can never be trapped in an endless correction cycle:
+ * after `maxAttempts` consecutive red turns the loop stops, and — when
+ * `rollbackAfterExhaustion` is set — the working tree is restored to the state
+ * it had before the first turn of the failing cycle.
+ *
+ * Legacy `autoFix` / `maxAutoRetries` are mapped onto this block by
+ * `config.ts`, so old configurations keep working unchanged.
+ */
+export interface RecoveryConfig {
+  /** Whether the agent is re-prompted on a red turn at all. */
+  enabled: boolean;
+  /** Consecutive recovery attempts before the loop stops (>= 1). */
+  maxAttempts: number;
+  /** Restore the pre-cycle state once `maxAttempts` is reached. */
+  rollbackAfterExhaustion: boolean;
+}
+
+/** Kind of sensitive file a change policy reacts to. */
+export type SensitiveKind = "package" | "lockfile" | "workflow" | "custom";
+
+/**
+ * Optional diff/change policy for a single agent turn.
+ *
+ * Disabled by default: enabling it is a deliberate choice, so upgrading never
+ * blocks an existing workflow. When enabled it turns the measured shape of a
+ * turn (how many files, how many added lines, whether sensitive files were
+ * touched) into a structured, non-negotiable error the agent must answer.
+ */
+export interface PolicyConfig {
+  enabled: boolean;
+  /** Maximum changed files per turn; `0` disables the limit. */
+  maxChangedFiles: number;
+  /** Maximum added lines per turn; `0` disables the limit. */
+  maxAddedLines: number;
+  /** May the turn change a `package.json`? */
+  allowPackageChanges: boolean;
+  /** May the turn change a lockfile (`package-lock.json`, …)? */
+  allowLockfileChanges: boolean;
+  /** May the turn change `.github/workflows/**`? */
+  allowWorkflowChanges: boolean;
+  /** Extra globs that must never be modified. */
+  sensitivePaths: string[];
+  /** Restore the turn's files when the policy is violated. */
+  rollbackOnViolation: boolean;
+}
+
+/** Aggregate shape of the changes a turn made. */
+export interface PolicyStats {
+  changedFiles: number;
+  addedFiles: number;
+  deletedFiles: number;
+  modifiedFiles: number;
+  addedLines: number;
+  removedLines: number;
+  sensitive: Array<{ path: string; kind: SensitiveKind }>;
+}
+
+/** One structured policy failure. `message` is what the agent reads. */
+export interface PolicyViolation {
+  /** Stable rule id, e.g. "maxChangedFiles" or "allowWorkflowChanges". */
+  rule: string;
+  message: string;
+  /** Project-relative paths the violation refers to (may be empty). */
+  paths: string[];
+}
+
+export interface PolicyReport {
+  passed: boolean;
+  stats: PolicyStats;
+  violations: PolicyViolation[];
 }
 
 /** Verification cache configuration. */
@@ -122,14 +204,23 @@ export interface SentinelPipelines {
 export interface SentinelConfig {
   /** Master switch. When false the extension loads but does nothing. */
   enabled: boolean;
-  /** Automatically git-rollback on invariant violation. */
+  /** Automatically restore the mutated files on a failing critical check. */
   autoRollback: boolean;
 
   // ── P0: close the loop (Stop-hook equivalent) ───────────────────────────
-  /** Re-prompt the agent with the pruned failure when a turn ends red. */
+  /**
+   * Legacy alias of `recovery.enabled`, kept in sync by `config.ts` so older
+   * configurations and readers keep working.
+   */
   autoFix: boolean;
-  /** Max consecutive auto-fix continuations before giving up. */
+  /** Legacy alias of `recovery.maxAttempts`, kept in sync by `config.ts`. */
   maxAutoRetries: number;
+
+  /** Bounded automatic error correction (the canonical recovery settings). */
+  recovery: RecoveryConfig;
+
+  /** Optional diff/change policy for a turn (disabled by default). */
+  policy: PolicyConfig;
 
   // ── P1: durable checkpoints ─────────────────────────────────────────────
   /** How many turn checkpoints to keep on disk. */
@@ -296,6 +387,8 @@ export interface SentinelMetrics {
   totalDurationMs: number;
   rollbacks: number;
   partialRollbacks: number;
+  /** Turns stopped by the change policy. */
+  policyViolations: number;
 }
 
 // ── P1: durable checkpoints ───────────────────────────────────────────────

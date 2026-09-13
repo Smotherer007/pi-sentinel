@@ -501,3 +501,51 @@ describe("PipelineRunner cache integration", () => {
     assert.equal(after.cached, undefined, "new content is a new question");
   });
 });
+
+describe("PipelineRunner — missing commands and per-step pruning budget", () => {
+  test("a missing command is a failure the agent can classify, never a crash", async () => {
+    _setConfigForTesting(
+      defineConfig({
+        pipelines: {
+          onFileMutation: [
+            { name: "missing", cmd: "sentinel-no-such-command-xyz --version", timeoutMs: 5000 },
+          ],
+          onTurnEnd: [],
+        },
+      }),
+    );
+
+    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+
+    assert.equal(run.passed, false);
+    assert.equal(run.failure?.failureKind, "command-not-found");
+    assert.notEqual(run.failure?.exitCode, 0);
+  });
+
+  test("a step's maxTraceLines overrides the global pruner budget", async () => {
+    _setConfigForTesting(
+      defineConfig({
+        maxTraceLines: 10,
+        pipelines: {
+          onFileMutation: [
+            {
+              name: "terse",
+              cmd: "printf 'error TS1: a\\nerror TS2: b\\nerror TS3: c\\n' && exit 1",
+              timeoutMs: 5000,
+              maxTraceLines: 1,
+            },
+          ],
+          onTurnEnd: [],
+        },
+      }),
+    );
+
+    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const trace = run.failure?.prunedTrace ?? "";
+
+    assert.equal(run.passed, false);
+    assert.ok(trace.includes("error TS1"), "the first diagnostic is kept");
+    assert.ok(!trace.includes("error TS2"), "the per-step budget wins over the global one");
+    assert.ok(!trace.includes("error TS3"));
+  });
+});
