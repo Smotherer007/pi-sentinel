@@ -435,7 +435,7 @@ step, so an older runtime cannot even load them. `.node-version` pins 26, and CI
 ```bash
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # node --test — 175 tests, 43 suites
+npm test              # node --test — 177 tests, 44 suites
 ```
 
 Test coverage by module:

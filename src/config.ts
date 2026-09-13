@@ -28,7 +28,7 @@ export const DEFAULT_CONFIG: SentinelConfig = {
   // Every feature is ON by default: the guard is meant to feel like Codex /
   // Claude Code out of the box, not like a switchboard to assemble first.
   // The one irreversible behaviour is autoRollback — see the README section
-  // "Vor dem ersten Einsatz: autoRollback".
+  // "Rollback model" for what it restores and how to turn it off.
   enabled: true,
   autoRollback: true,
 

@@ -3,10 +3,11 @@ import { defineConfig } from "./src/config.ts";
 /**
  * Sentinel's own configuration.
  *
- * This file is deliberately explicit: it mirrors the defaults so that a reader
- * of this repo can see every switch in one place. All features are on by
- * default, including `autoRollback` — the guard is meant to feel like Codex /
- * Claude Code out of the box, not like a switchboard to assemble first.
+ * This file is deliberately explicit: it spells out every switch in one place,
+ * at the library's defaults. The single deliberate exception is `autoRollback`,
+ * which is off *for this repository* (see below). Elsewhere the guard is meant
+ * to feel like Codex / Claude Code out of the box, not like a switchboard to
+ * assemble first.
  */
 export default defineConfig({
   // ── master switches ────────────────────────────────────────────────────
@@ -14,7 +15,13 @@ export default defineConfig({
   // A failing check restores the files that were changed. Destructive by
   // design: "bad code never pollutes the agent's context". The pre-state is
   // preserved as a checkpoint, so /sentinel rewind can still recover it.
-  autoRollback: true,
+  //
+  // Deliberately OFF while this repo itself is being worked on: a red
+  // `npm run typecheck` in the middle of a refactor would otherwise undo edits
+  // before they can be inspected. Everything else — the feedback loop, the
+  // evidence ledger, checkpoints — stays on, so nothing is verified less.
+  // Set back to `true` to arm the automatic restore again.
+  autoRollback: false,
 
   // ── P0: close the loop ─────────────────────────────────────────────────
   // Turn-end failures re-prompt the agent instead of only notifying the human.
