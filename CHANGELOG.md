@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+<!-- Add entries here. They are promoted into a version section when a release is cut. -->
+
+## [2.1.0] - 2026-09-13
+
+### Added
+- **P6 — failure classification** (`src/formatting/classify.ts`): every failed step is labelled
+  `type-error`, `lint-error`, `test-failure`, `build-failure`, `timeout`, `command-not-found`,
+  `environment-error` or `unknown`, with a one-line error summary and a stable failure signature.
+  The feedback now tells the agent what *kind* of problem it has, so a timeout or a missing binary
+  no longer sends it off rewriting working source.
+- **P6 — ranked, line-aware trace pruning** (`src/formatting/lines.ts`): compiler diagnostics and
+  failing tests outrank stack frames, source locations outrank context, and download notices rank
+  last. Context lines are kept only next to the diagnostic they belong to.
+- **P6 — file-aware pipelines**: `PipelineStep.files` restricts a step to relevant changed files
+  (e.g. `["**/*.ts"]`); no patterns means "always relevant", so existing configurations are
+  unaffected. `PipelineStep.phase` restricts a step to `mutation` or `turn`.
+- **P6 — verification coalescing** (`src/clients/queue.ts`): `verification.debounceMs` merges
+  mutations that land within a fixed short window into a single verification. `/sentinel verify` and
+  `sentinel_verify` bypass the window and take waiting requests with them.
+- **P6 — verification cache** (`src/clients/cache.ts`): `verification.cache` reuses a *passing* run
+  for a provably identical state (file contents, lock files, `tsconfig`, package.json, effective step
+  configuration, Node version, result-relevant environment). Non-deterministic steps opt out with
+  `cacheable: false`, which disables caching for that run.
+- **P6 — retry policy for infrastructure failures**: `PipelineStep.retry`
+  (`{ maxAttempts, retryOn, delayMs }`) retries only the kinds you list. Real compile and test
+  failures are never retried.
+- **P6 — repeated-failure escalation** (`src/clients/escalation.ts`): the same failure signature
+  repeated `maxRepeatedFailures` times produces an explicit "do not repeat the same approach"
+  message; a green run clears the counters.
+- **P6 — performance metrics and a compact history**: `sentinel_status` and `/sentinel status` now
+  report checks, cache hits/misses, average duration, timeouts, skipped/retried steps, escalations and
+  rollbacks (partial ones included), plus a short per-turn history.
+- **Rollback conflict detection**: the snapshot store records a post-mutation hash per file, so a
+  rollback (and a durable checkpoint restore) refuses to overwrite a file that changed after the
+  agent's own write, reports `ROLLBACK CONFLICT`, and marks the restore `partial`. Files the agent
+  did not touch are still never overwritten.
+- **Richer snapshot metadata**: pre-state `contentHash`, `size`, `mode` and `capturedAt`, restored
+  mode included; binary and oversized files are covered by tests.
+- **Process-tree termination**: steps run in their own process group and a timeout sends `SIGTERM`,
+  then `SIGKILL` after `verification.killGraceMs`, so no child process survives a killed step.
+- **Output budget per step** (`verification.maxOutputBytes`) and **secret redaction**
+  (`src/formatting/redact.ts`): command output is truncated head+tail and stripped of credential
+  values before it can reach the model; `/sentinel config` redacts configured `env` values.
+- **`cwd` containment**: a step whose `cwd` resolves outside the project root fails with an
+  environment error instead of running elsewhere.
+
+### Changed
+- **Behaviour-changing P6 features are opt-in**: `verification.debounceMs` defaults to `0`,
+  `verification.cache.enabled` and `verification.failureEscalation.enabled` default to `false`, so an
+  upgrade keeps the exact previous semantics until a project turns them on. The safety limits
+  (`maxOutputBytes`, `killGraceMs`) are unconditional.
+- `VerificationResult` gained `failureKind`, `timedOut`, `signal`, `errorSummary`, `affectedFiles`,
+  `attempts`, `signature` and `priority`; `PipelineRunResult.steps` gained `skipped`, `cached`,
+  `attempts` and `failureKind`.
+- `PipelineStep.priority` (`critical` | `normal` | `warning`) supersedes `warnOnly`, which keeps
+  working as the legacy spelling of `warning`.
+- `sentinel_verify` never serves its result from the cache (an explicit request means "run the
+  checks"), and `sentinel_rewind` reports conflicted files instead of claiming a full restore.
+- `/sentinel status` reports metrics and a compact history instead of dumping raw records.
+
+### Fixed
+- An empty pipeline group no longer clears the repeated-failure escalation counters either; it runs
+  after every edit and would otherwise make escalation impossible to reach.
+- A killed verification step used to leave its children running (`child.kill()` signals only the
+  shell), so a timed-out `jest` or compiler kept burning CPU after sentinel had reported the timeout.
+- The verification cache can no longer reuse a result after a lock file, `tsconfig.json` or a
+  result-relevant environment variable changed.
+
+## [2.0.0] - 2026-09-13
+
 ### Added
 - **P0 — the agent is re-prompted, not just reported to.** A red turn now sends the pruned
   failure back with `triggerTurn: true` (the equivalent of Claude Code's and Codex's `Stop`

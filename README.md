@@ -85,7 +85,7 @@ change — see [Synergy with pi-mindplace](#synergy-with-pi-mindplace).
                         (tool_result isError, or a follow-up turn)
 ```
 
-## The six mechanisms
+## The seven mechanisms
 
 ### P0 — close the loop: the agent is re-prompted, not just reported to
 
@@ -223,7 +223,12 @@ contract (scoped to that turn, never accumulating):
 - Never state that a check passes unless you ran it in this turn (the step's own command, or `sentinel_verify`).
 - If sentinel reports that a file regressed from a verified state, either restore that file or justify the change explicitly.
 - When sentinel lists dependents from the code graph, treat them as the blast radius: fix the cause in place, then check the dependents it names.
+- When the same failure comes back 3 times, stop varying the same edit: re-read the code and change the approach.
 ```
+
+The last rule is added when `verification.failureEscalation.enabled` is on, with the configured
+threshold; the `revertOnRegression` rule is added when evidence tracking is on, and so on — the
+contract only states rules that the active configuration can actually enforce.
 
 ```ts
 revisionContract: true,
@@ -249,6 +254,46 @@ test output is the fastest way to burn a context window on noise:
 backgroundTurnEnd: true,
 maxOutputTokens: 2500,   // 0 disables the cap
 ```
+
+### P6 — coalescing, classification, cache and escalation
+
+The loop-level optimisations. All four are **opt-in in the library** (defaults
+`debounceMs: 0`, `cache.enabled: false`, `failureEscalation.enabled: false`) so
+that upgrading sentinel never changes behaviour by surprise; this repository
+turns all of them on.
+
+**Coalescing (`verification.debounceMs`).** Four `edit` calls in one assistant
+message produce four `tool_result` hooks within a few milliseconds. With a
+window configured, they become *one* verification whose scope is the union of
+the edits. The window is fixed — it is not extended by later arrivals — so the
+latency a caller can experience is bounded. An explicit `/sentinel verify` or
+`sentinel_verify` always runs immediately and takes any waiting requests with it.
+
+**Failure classification (`src/formatting/classify.ts`).** Every failure is
+labelled `type-error`, `lint-error`, `test-failure`, `build-failure`, `timeout`,
+`command-not-found`, `environment-error` or `unknown`. The label decides what the
+agent is told to do: a timeout or a missing binary must *not* send it off
+rewriting working code.
+
+**Verification cache (`src/clients/cache.ts`).** A passing run is reused only
+when the question is provably the same: keyed by the content of every changed
+file, the content of `package*.json`/lock files/`tsconfig.json`, the effective
+step configuration, the Node version and the environment variables that can
+change a result. Two rules keep it honest — **only passing runs are cached**, and
+a step marked `cacheable: false` disables caching for the whole run (which is
+what non-deterministic test suites get).
+
+**Failure escalation (`src/clients/escalation.ts`).** The same failure signature
+(`kind` + the first diagnostic lines) repeated `maxRepeatedFailures` times means
+the *approach* is wrong, not the last edit:
+
+```
+Repeated verification failure detected.
+The same error occurred 3 time(s) (threshold 3). Do not repeat the same approach
+— re-evaluate the implementation before editing again.
+```
+
+A genuinely green run clears the counters.
 
 ## Tools
 
@@ -297,6 +342,82 @@ Guarantees and limits, stated plainly:
   changed. If you prefer to keep broken work in place and repair it by hand, set it to `false` — the
   feedback loop (P0) still runs.
 
+## Performance
+
+The rule is simple: **mutation checks must be fast, expensive checks belong in
+`onTurnEnd`.**
+
+```
+Mutation (after every edit/write)        Turn end (once per turn)
+├── syntax                              ├── complete test suite
+├── type-check (incremental)            ├── build
+└── lightweight lint (warning)          ├── integration tests
+                                        └── expensive checks
+```
+
+What keeps the mutation path cheap, in order of effect:
+
+1. **File-aware steps.** A step with `files: ["**/*.ts"]` is skipped entirely when only Rust or
+   Markdown changed. No patterns means "always relevant", so old configurations keep working.
+2. **Coalescing.** `debounceMs` merges edits that land together into one run.
+3. **The cache.** An identical code state is not re-checked; `cacheable: false` opts a step out.
+4. **Background turn-end checks.** `backgroundTurnEnd` keeps the slow group off the critical path.
+5. **A bounded output buffer.** A runaway process cannot fill the context window.
+
+`/sentinel status` (and the `sentinel_status` tool) reports the counters:
+checks, cache hits/misses, average duration, timeouts, skipped/retried steps,
+escalations and rollbacks.
+
+## Safety
+
+These rules are not configurable, and they are the reason the rollback path is
+trustworthy:
+
+1. **Nothing unrelated is ever overwritten.** Restores are file-based, from a
+   snapshot taken in `tool_call` — before the mutation. `git checkout -- .` is
+   never used while a snapshot exists, and untracked files the agent did not
+   create are never touched.
+2. **A file that changed after the agent's mutation is not restored.** Sentinel
+   records a hash of what the agent's write left on disk; if the file no longer
+   matches it, somebody else wrote it (a formatter, another process, the user)
+   and the rollback reports a conflict instead of overwriting:
+
+   ```
+   ROLLBACK CONFLICT (1 file(s)) — NOT overwritten:
+     src/foo.ts was modified after the Sentinel snapshot.
+       expected: 3f9a1c2b7d4e | current: 91b4d0aa77c1
+     The file was NOT overwritten. Manual recovery required.
+   ```
+
+   The rollback is then `partial`, `/sentinel rewind` reports the same way, and
+   the conflict is shown to the agent instead of hidden from it. An explicit,
+   user-requested overwrite is possible (`force`), which is what the destructive
+   `mode: "head"` reset is for.
+3. **Secrets never reach the model.** Step output is passed through
+   `redactSecrets` (values of credential-looking environment variables plus
+   well-known key shapes) before it leaves the runner, and `/sentinel config`
+   redacts configured `env` values.
+4. **A timeout kills the process tree.** Steps run in their own process group;
+   `SIGTERM` is followed by `SIGKILL` after `killGraceMs`, so no `sleep`, `jest`
+   or compiler keeps burning CPU after sentinel has already reported the timeout.
+5. **Output and runtime are bounded.** `maxOutputBytes` per step, `timeoutMs` per
+   step, `maxOutputTokens` for the model-visible payload.
+6. **A `cwd` cannot leave the project root.** A step whose `cwd` resolves outside
+   it fails with an environment error rather than running elsewhere.
+
+## Failure recovery
+
+| Situation | What sentinel does | What you (or the agent) should do |
+|-----------|--------------------|-----------------------------------|
+| A check fails | Prunes the trace to the valuable lines, adds the kind, the error summary, the blast radius and the bounded-retry budget. | Fix the cause; the message says whether the changes were restored. |
+| `autoRollback` is on | Restores that mutation (or the whole turn) from the snapshot. | Re-apply the edit only after fixing the cause. |
+| A conflicted file exists | Restores everything else, **leaves the conflicted file alone**, marks the rollback `partial`. | Review the file by hand; sentinel will not guess. |
+| A step times out | Kills the tree, reports `timeout` and says the code is not the problem. | Re-run, or raise `timeoutMs`. Do not rewrite working code. |
+| The command is missing | Reports `command-not-found` and says the pipeline or the tool is at fault. | Fix the configuration or install the tool. |
+| The same error repeats | After `maxRepeatedFailures` identical failures it says so explicitly and tells the agent to change approach. | Re-evaluate the implementation, not the last edit. |
+| The code state stops changing | The repair loop stops instead of re-prompting (`autoFix`). | Read the report; another identical attempt would repeat itself. |
+| A file regressed from a verified state | Reported as a regression; with `revertOnRegression` that single file is restored. | Restore the file or justify the change — never silently keep both. |
+
 ## Configuration
 
 Create `sentinel.config.ts` in the project root (or `~/.sentinel.config.ts`). Resolution order:
@@ -334,6 +455,23 @@ export default defineConfig({
   backgroundTurnEnd: true,     // do not block the turn on slow checks
   maxOutputTokens: 2500,       // model-visible output budget (0 = off)
 
+  // ── P6: performance, cache & escalation ───────────────────────────────
+  verification: {
+    debounceMs: 150,           // 0 = verify every mutation immediately
+    maxOutputBytes: 262144,    // per-step output buffer (head+tail kept)
+    killGraceMs: 500,          // SIGTERM → SIGKILL grace period
+    cache: {
+      enabled: true,           // reuse a passing run for an identical state
+      ttlMs: 300000,           // 0 = never expire
+      maxEntries: 50,
+      persist: true,           // survive a session restart
+    },
+    failureEscalation: {
+      enabled: true,           // say so when the same error repeats
+      maxRepeatedFailures: 3,
+    },
+  },
+
   // ── mindplace synergy ─────────────────────────────────────────────────
   impactAwareFocus: true,      // add graph dependents to the focus
 
@@ -342,12 +480,30 @@ export default defineConfig({
   pipelines: {
     // Keep per-mutation checks FAST — they run after every edit.
     onFileMutation: [
-      { name: "type-check", cmd: "npm run typecheck", timeoutMs: 60000 },
-      { name: "linter", cmd: "npx eslint --quiet", timeoutMs: 8000, warnOnly: true },
+      {
+        name: "type-check",
+        cmd: "npm run typecheck",
+        timeoutMs: 60000,
+        priority: "critical",              // critical | normal | warning
+        files: ["**/*.ts", "**/*.tsx"],    // only relevant file types
+      },
+      {
+        name: "linter",
+        cmd: "npx eslint --quiet",
+        timeoutMs: 8000,
+        priority: "warning",               // never fails a turn, never rolls back
+        files: ["**/*.ts", "**/*.tsx"],
+      },
     ],
     // Put the slow, whole-project checks here — they run once per turn.
     onTurnEnd: [
-      { name: "unit-tests", cmd: "npm test", timeoutMs: 120000 },
+      {
+        name: "unit-tests",
+        cmd: "npm test",
+        timeoutMs: 120000,
+        priority: "critical",
+        cacheable: false,       // a flaky suite must never be served from cache
+      },
     ],
   },
 
@@ -374,12 +530,33 @@ export default defineConfig({
 | `maxOutputTokens` | number | `2500` | Token budget for model-visible verification output; `0` = off. |
 | `impactAwareFocus` | boolean | `true` | Extend the verification focus with code-graph dependents. |
 | `maxTraceLines` | number | `12` | Critical error lines kept by the pruner. |
+| `verification.debounceMs` | number | `0` | Coalesce mutations that land within this window (P6). |
+| `verification.maxOutputBytes` | number | `262144` | Cap on one step's combined stdout+stderr before truncation. |
+| `verification.killGraceMs` | number | `500` | Grace between `SIGTERM` and `SIGKILL` for a timed-out process tree. |
+| `verification.cache.enabled` | boolean | `false` | Reuse a passing run for an identical code state (P6). |
+| `verification.cache.ttlMs` | number | `300000` | Entry lifetime; `0` = never expire. |
+| `verification.cache.maxEntries` | number | `50` | Entries kept before the oldest are evicted. |
+| `verification.cache.persist` | boolean | `true` | Keep the cache on disk across sessions. |
+| `verification.cache.steps` | string[] | — | Restrict caching to these step names. |
+| `verification.failureEscalation.enabled` | boolean | `false` | Report a failure that keeps repeating (P6). |
+| `verification.failureEscalation.maxRepeatedFailures` | number | `3` | Identical failures before escalation. |
 | `pipelines.onFileMutation` | `PipelineStep[]` | type-check + warnOnly linter | Runs after every `edit`/`write`. |
 | `pipelines.onTurnEnd` | `PipelineStep[]` | unit-tests | Runs once per turn. |
 | `include` | string[] | `[]` | Globs that trigger verification; empty = all non-excluded files. |
 | `exclude` | string[] | node_modules, .git, *.md, dist | Globs that never trigger verification. |
 
-`PipelineStep`: `{ name, cmd, timeoutMs, cwd?, env?, warnOnly? }`.
+`PipelineStep`:
+`{ name, cmd, timeoutMs, cwd?, env?, warnOnly?, priority?, phase?, files?, retry?, cacheable? }`.
+
+- `priority`: `critical` | `normal` (default) | `warning`. `warning` never blocks a turn and never
+  triggers a rollback; `warnOnly: true` is the older spelling of the same thing.
+- `phase`: `mutation` | `turn` — restricts a step to one pipeline group (unset = both).
+- `files`: globs the step applies to, e.g. `["**/*.ts"]`. Empty/absent = always relevant, so an
+  unconfigured step behaves exactly as before.
+- `retry`: `{ maxAttempts, retryOn: FailureKind[], delayMs? }` — retries **only** the infrastructure
+  kinds you list (`timeout`, `environment-error`, ...). A real compile or test error is never retried.
+- `cacheable`: set `false` for non-deterministic steps; it disables caching for that run.
+- `cwd` is resolved inside the project root; a value that escapes it fails the step instead of running.
 
 **Three gotchas worth knowing:**
 
