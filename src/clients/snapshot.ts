@@ -58,6 +58,11 @@ function emptyReport(): RestoreReport {
   return { attempted: false, restored: [], deleted: [], skipped: [], partial: false };
 }
 
+/** Exported so the checkpoint store can report restores the same way. */
+export function emptyRestoreReport(): RestoreReport {
+  return emptyReport();
+}
+
 function readSnapshot(absPath: string): FileSnapshot {
   try {
     const stat = fs.statSync(absPath);
@@ -84,6 +89,32 @@ function restoreSnapshot(snap: FileSnapshot): "restored" | "deleted" | "skipped"
   } catch {
     return "skipped";
   }
+}
+
+/**
+ * Write a snapshot back to disk. Exported because the durable checkpoint
+ * store restores the very same `FileSnapshot` shape it reads from disk.
+ */
+export const restoreFileSnapshot = restoreSnapshot;
+
+/** Read the pre-state of a file, for callers outside the capture hooks. */
+export function snapshotFile(absPath: string): FileSnapshot {
+  return readSnapshot(absPath);
+}
+
+/** Pure-ish restore driver shared with the checkpoint store. */
+export function restoreSnapshots(scope: Map<string, FileSnapshot>): RestoreReport {
+  const report = emptyReport();
+  report.attempted = true;
+  // Reverse insertion order: later mutations of the same file undo first.
+  for (const snap of [...scope.values()].reverse()) {
+    const outcome = restoreSnapshot(snap);
+    if (outcome === "restored") report.restored.push(snap.path);
+    else if (outcome === "deleted") report.deleted.push(snap.path);
+    else report.skipped.push(snap.path);
+  }
+  report.partial = report.skipped.length > 0;
+  return report;
 }
 
 export class SnapshotStore {
@@ -136,6 +167,25 @@ export class SnapshotStore {
     return this.turnScope.size > 0;
   }
 
+  /** Absolute paths captured this turn (first touch per path). */
+  turnPaths(): string[] {
+    return [...this.turnScope.keys()];
+  }
+
+  /**
+   * The raw turn snapshots, so the checkpoint store can persist exactly what
+   * the in-memory rollback would have restored — no second disk read.
+   */
+  turnSnapshots(): FileSnapshot[] {
+    return [...this.turnScope.values()];
+  }
+
+  /** Pre-state of a single tool call, for the verified-state ledger. */
+  callSnapshots(toolCallId: string): FileSnapshot[] {
+    const scope = this.callScopes.get(toolCallId);
+    return scope ? [...scope.values()] : [];
+  }
+
   // ── Rollback ───────────────────────────────────────────────────────────
 
   /** Undo a single mutation by restoring its captured pre-state. */
@@ -171,17 +221,7 @@ export class SnapshotStore {
   }
 
   private restoreAll(scope: Map<string, FileSnapshot>): RestoreReport {
-    const report = emptyReport();
-    report.attempted = true;
-    // Reverse insertion order: later mutations of the same file undo first.
-    for (const snap of [...scope.values()].reverse()) {
-      const outcome = restoreSnapshot(snap);
-      if (outcome === "restored") report.restored.push(snap.path);
-      else if (outcome === "deleted") report.deleted.push(snap.path);
-      else report.skipped.push(snap.path);
-    }
-    report.partial = report.skipped.length > 0;
-    return report;
+    return restoreSnapshots(scope);
   }
 
   private evictStaleScopes(): void {

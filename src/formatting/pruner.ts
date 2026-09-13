@@ -56,6 +56,8 @@ function dedupe(lines: string[]): string[] {
  * @param maxLines     Hard cap on returned lines (including the "..." marker).
  * @param focusPaths   Optional file paths to prioritise (absolute or relative).
  */
+import type { GraphImpact, Regression, SpillResult } from "../types.ts";
+
 export function pruneTrace(rawOutput: string, maxLines: number, focusPaths: string[] = []): string {
   if (!rawOutput.trim()) return "";
   if (maxLines <= 0) return "";
@@ -125,6 +127,14 @@ export function formatError(failure: {
   rawOutput: string;
   warnOnly: boolean;
   rolledBack?: boolean;
+  /** P2: files that dropped away from a state that used to pass. */
+  regressions?: Regression[];
+  /** Mindplace synergy: blast radius of the files involved. */
+  impact?: GraphImpact[];
+  /** Identity of the code state this result refers to. */
+  stateHash?: string;
+  /** P0: bounded-retry accounting for this attempt. */
+  attempt?: { attempt: number; max: number; stopped?: boolean };
 }): string {
   const header = `[sentinel] Verification failed at step "${failure.step}"`;
   const exit = `exit code: ${failure.exitCode} | duration: ${failure.durationMs}ms`;
@@ -140,12 +150,57 @@ export function formatError(failure: {
       "Your changes are still in place. Fix the reported error; do not repeat the same edit.";
   }
 
-  return [
-    header,
-    exit,
-    "─".repeat(60),
-    trace,
-    "─".repeat(60),
-    advice,
-  ].join("\n");
+  const lines = [header, exit];
+  if (failure.stateHash) lines.push(`state: ${failure.stateHash}`);
+  lines.push("─".repeat(60), trace, "─".repeat(60));
+
+  // P2: the strongest signal sentinel can give — this used to be green.
+  const regressions = failure.regressions ?? [];
+  if (regressions.length > 0) {
+    lines.push(`Regressed from a verified state (${regressions.length} file(s)):`);
+    for (const r of regressions.slice(0, 5)) {
+      const when = r.verifiedAt.replace("T", " ").slice(0, 19);
+      const action = r.reverted ? " — restored to the verified state" : "";
+      lines.push(`  • ${shortPath(r.path)} — was green at ${when} (${r.verifiedStep})${action}`);
+      if (!r.reverted) {
+        lines.push(
+          `    current: ${r.currentHash.slice(0, 12)} vs verified: ${r.verifiedHash.slice(0, 12)}`,
+        );
+      }
+    }
+  }
+
+  // Mindplace synergy: what else this change can break.
+  const impact = failure.impact ?? [];
+  if (impact.length > 0) {
+    lines.push("Impact (code graph):");
+    for (const i of impact.slice(0, 4)) {
+      const deps = i.dependents.length > 0 ? i.dependents.join(", ") : "none";
+      const symbols = i.symbols.length > 0 ? ` [${i.symbols.slice(0, 4).join(", ")}]` : "";
+      lines.push(`  • ${i.file}${symbols} → ${deps}`);
+    }
+  }
+
+  lines.push(advice);
+
+  // P0: bounded retries, reported to the model so it knows when to stop.
+  if (failure.attempt && !failure.warnOnly) {
+    const { attempt, max, stopped } = failure.attempt;
+    lines.push(
+      stopped
+        ? `Repair attempt ${attempt}/${max} produced an identical code state — stop editing and report instead.`
+        : `Repair attempt ${attempt}/${max}. After ${max}, stop and report what still fails instead of editing again.`,
+    );
+  }
+
+  return lines.join("\n");
 }
+
+/** Keep feedback terse: absolute paths burn context for no benefit. */
+function shortPath(absPath: string): string {
+  const parts = absPath.split(/[\\/]/);
+  return parts.length > 2 ? parts.slice(-2).join("/") : absPath;
+}
+
+/** Re-exported so callers can type their spill results. */
+export type { SpillResult };

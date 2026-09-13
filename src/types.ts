@@ -37,6 +37,43 @@ export interface SentinelConfig {
   enabled: boolean;
   /** Automatically git-rollback on invariant violation. */
   autoRollback: boolean;
+
+  // ── P0: close the loop (Stop-hook equivalent) ───────────────────────────
+  /** Re-prompt the agent with the pruned failure when a turn ends red. */
+  autoFix: boolean;
+  /** Max consecutive auto-fix continuations before giving up. */
+  maxAutoRetries: number;
+
+  // ── P1: durable checkpoints ─────────────────────────────────────────────
+  /** How many turn checkpoints to keep on disk. */
+  checkpointRetention: number;
+
+  // ── P2: state-bound evidence ────────────────────────────────────────────
+  /** Remember content hashes of files whose checks passed. */
+  trackVerifiedState: boolean;
+  /** Restore a file that regressed away from its last verified state. */
+  revertOnRegression: boolean;
+  /** Mark older sentinel failure messages as superseded before each LLM call. */
+  pruneStaleTraces: boolean;
+
+  // ── P3: out-of-band mutations ───────────────────────────────────────────
+  /** Also verify files changed outside edit/write (bash, formatters, git). */
+  detectOutOfBand: boolean;
+
+  // ── P4: revision contract ───────────────────────────────────────────────
+  /** Inject the repair rules (bounded retries, never revise green code). */
+  revisionContract: boolean;
+
+  // ── P5: background checks & output budget ───────────────────────────────
+  /** Run onTurnEnd pipelines in the background and re-wake on failure. */
+  backgroundTurnEnd: boolean;
+  /** Approximate token cap for model-visible verification output. */
+  maxOutputTokens: number;
+
+  // ── Mindplace synergy ───────────────────────────────────────────────────
+  /** Extend verification focus to graph dependents of mutated files. */
+  impactAwareFocus: boolean;
+
   /** Max number of critical error lines to keep in pruned trace. */
   maxTraceLines: number;
   /** Validation pipelines for each trigger point. */
@@ -102,6 +139,86 @@ export interface RollbackResult {
   command: string;
   committedAt?: string;
   branch?: string;
+}
+
+// ── P1: durable checkpoints ───────────────────────────────────────────────
+
+export interface CheckpointSummary {
+  id: string;
+  /** Monotonic sequence number; higher is newer. */
+  seq: number;
+  at: string;
+  turnIndex: number;
+  /** Human label, e.g. "parseConfig, deepMerge (src/config.ts)". */
+  label: string;
+  fileCount: number;
+  /** Session-tree entry the turn started from (for conversation rewind). */
+  entryId?: string;
+  files: string[];
+}
+
+// ── P2: state-bound evidence ──────────────────────────────────────────────
+
+/** A file state that passed verification, with a restorable copy of it. */
+export interface VerifiedStateEntry {
+  path: string;
+  hash: string;
+  at: string;
+  /** Pipeline step that was green for this state. */
+  step: string;
+  /** Blob name inside the verified store, when the content was kept. */
+  blob?: string;
+}
+
+/**
+ * A file that previously passed verification and no longer matches that
+ * state — i.e. a revision regressed something that used to be green.
+ */
+export interface Regression {
+  path: string;
+  verifiedAt: string;
+  verifiedStep: string;
+  verifiedHash: string;
+  currentHash: string;
+  /** True when sentinel restored the verified state instead of reporting. */
+  reverted: boolean;
+}
+
+// ── P3: out-of-band changes ───────────────────────────────────────────────
+
+export interface OutOfBandChange {
+  /** Git porcelain status code, e.g. " M", "??". */
+  status: string;
+  /** Absolute path. */
+  path: string;
+}
+
+// ── P5: output budget ─────────────────────────────────────────────────────
+
+export interface SpillResult {
+  text: string;
+  /** Set when the full output was written to disk instead of inlined. */
+  spilledPath?: string;
+}
+
+// ── Mindplace synergy ─────────────────────────────────────────────────────
+
+/** Impact of a file according to the code knowledge graph. */
+export interface GraphImpact {
+  file: string;
+  /** Files that depend on `file`, most connected first. */
+  dependents: string[];
+  /** Symbols defined in `file`, most central first. */
+  symbols: string[];
+}
+
+export interface GraphStatus {
+  present: boolean;
+  stale: boolean;
+  nodeCount: number;
+  edgeCount: number;
+  /** ISO timestamp derived from graph.json's mtime. */
+  builtAt?: string;
 }
 
 // ── Tool events ───────────────────────────────────────────────────────────

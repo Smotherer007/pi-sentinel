@@ -105,4 +105,105 @@ describe("formatError", () => {
     const text = formatError({ ...base, step: "linter", warnOnly: true });
     assert.ok(text.includes("WARNING only"));
   });
+
+  test("prints the code state the result refers to", () => {
+    const text = formatError({ ...base, stateHash: "abc123abc123" });
+    assert.ok(text.includes("state: abc123abc123"));
+  });
+
+  test("reports regressed verified states", () => {
+    const text = formatError({
+      ...base,
+      regressions: [
+        {
+          path: "/repo/src/config.ts",
+          verifiedAt: "2026-09-13T09:07:38.000Z",
+          verifiedStep: "onTurnEnd:unit-tests",
+          verifiedHash: "aaaaaaaaaaaa",
+          currentHash: "bbbbbbbbbbbb",
+          reverted: false,
+        },
+      ],
+    });
+
+    assert.ok(text.includes("Regressed from a verified state (1 file(s))"), text);
+    assert.ok(text.includes("src/config.ts"), "names the regressed file");
+    assert.ok(text.includes("onTurnEnd:unit-tests"));
+    assert.ok(text.includes("current: bbbbbbbbbbbb vs verified: aaaaaaaaaaaa"));
+    assert.equal(text.includes("rolled back"), false, "a regression is not a rollback");
+  });
+
+  test("marks a regression that was reverted", () => {
+    const text = formatError({
+      ...base,
+      regressions: [
+        {
+          path: "/repo/src/config.ts",
+          verifiedAt: "2026-09-13T09:07:38.000Z",
+          verifiedStep: "step",
+          verifiedHash: "aaaa",
+          currentHash: "bbbb",
+          reverted: true,
+        },
+      ],
+    });
+    assert.ok(text.includes("restored to the verified state"));
+  });
+
+  test("lists the code-graph blast radius", () => {
+    const text = formatError({
+      ...base,
+      impact: [
+        { file: "src/config.ts", symbols: ["parseConfig", "deepMerge"], dependents: ["src/index.ts"] },
+      ],
+    });
+    assert.ok(text.includes("Impact (code graph):"));
+    assert.ok(text.includes("src/config.ts"));
+    assert.ok(text.includes("parseConfig, deepMerge"));
+    assert.ok(text.includes("src/index.ts"));
+  });
+
+  test("says none when a file has no dependents", () => {
+    const text = formatError({
+      ...base,
+      impact: [{ file: "src/leaf.ts", symbols: ["leaf"], dependents: [] }],
+    });
+    assert.ok(text.includes("→ none"));
+  });
+
+  test("reports the bounded-retry budget", () => {
+    const text = formatError({ ...base, attempt: { attempt: 2, max: 3 } });
+    assert.ok(text.includes("Repair attempt 2/3"));
+    assert.ok(text.includes("stop and report"));
+  });
+
+  test("explains a stop caused by an unchanged code state", () => {
+    const text = formatError({ ...base, attempt: { attempt: 3, max: 3, stopped: true } });
+    assert.ok(text.includes("identical code state"));
+  });
+
+  test("keeps the original ordering of sections", () => {
+    const text = formatError({
+      ...base,
+      stateHash: "deadbeefdead",
+      regressions: [
+        {
+          path: "/repo/a.ts",
+          verifiedAt: "2026-09-13T09:00:00.000Z",
+          verifiedStep: "step",
+          verifiedHash: "1",
+          currentHash: "2",
+          reverted: false,
+        },
+      ],
+      impact: [{ file: "a.ts", symbols: [], dependents: ["b.ts"] }],
+    });
+
+    const traceAt = text.indexOf("error TS2304");
+    const regressionAt = text.indexOf("Regressed from a verified state");
+    const impactAt = text.indexOf("Impact (code graph):");
+    const adviceAt = text.indexOf("still in place");
+
+    assert.ok(traceAt < regressionAt && regressionAt < impactAt && impactAt < adviceAt, text);
+  });
 });

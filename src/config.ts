@@ -25,11 +25,39 @@ export type SentinelConfigInput = DeepPartial<SentinelConfig>;
 // ── Defaults ──────────────────────────────────────────────────────────────
 
 export const DEFAULT_CONFIG: SentinelConfig = {
+  // Every feature is ON by default: the guard is meant to feel like Codex /
+  // Claude Code out of the box, not like a switchboard to assemble first.
+  // The one irreversible behaviour is autoRollback — see the README section
+  // "Vor dem ersten Einsatz: autoRollback".
   enabled: true,
-  // Rollback is opt-in & manual (Claude Code / Codex). A failing check is fed
-  // back to the agent to self-correct; `autoRollback` is a deliberate
-  // per-project choice for an automatic restore.
-  autoRollback: false,
+  autoRollback: true,
+
+  // P0 — feedback is the product: re-prompt the agent on a red turn.
+  autoFix: true,
+  maxAutoRetries: 3,
+
+  // P1 — keep enough checkpoints to undo a working session, not the repo.
+  checkpointRetention: 50,
+
+  // P2 — hashes of green states, regression revert, stale-trace hygiene.
+  trackVerifiedState: true,
+  revertOnRegression: true,
+  pruneStaleTraces: true,
+
+  // P3 — bash/formatter/git changes are otherwise invisible to the hooks.
+  detectOutOfBand: true,
+
+  // P4 — bounded repair rules in the system prompt.
+  revisionContract: true,
+
+  // P5 — checks run in the background and re-wake the agent on failure.
+  // Set false to get a deterministic turn ending at the cost of latency.
+  backgroundTurnEnd: true,
+  maxOutputTokens: 2500,
+
+  // Mindplace synergy — impact analysis when a graph is present.
+  impactAwareFocus: true,
+
   maxTraceLines: 12,
   pipelines: {
     onFileMutation: [
@@ -71,24 +99,61 @@ export interface SentinelState {
     exitCode: number;
     durationMs: number;
   }>;
+  /**
+   * P0 audit trail: every auto-fix decision, including the ones where the
+   * guard stopped the loop. Mirrors Codex's continuation-prompt receipts.
+   */
+  autoFixHistory: Array<{
+    at: string;
+    step: string;
+    attempt: number;
+    /** injected = the agent was re-prompted; stopped = guard gave up. */
+    outcome: "injected" | "stopped" | "exhausted";
+    reason: string;
+  }>;
+  /** P2 audit trail: files detected as regressed from a verified state. */
+  regressions: Array<{
+    at: string;
+    path: string;
+    verifiedAt: string;
+    reverted: boolean;
+  }>;
 }
 
-let state: SentinelState = { rollbackHistory: [], lastVerifications: [] };
+function emptyState(): SentinelState {
+  return {
+    rollbackHistory: [],
+    lastVerifications: [],
+    autoFixHistory: [],
+    regressions: [],
+  };
+}
+
+let state: SentinelState = emptyState();
 let activeConfig: SentinelConfig = DEFAULT_CONFIG;
 let stateScope: string | null = null;
 
 // ── Path resolution ───────────────────────────────────────────────────────
 
-function homeDir(): string {
+export function homeDir(): string {
   return process.env.HOME || process.env.USERPROFILE || "~";
 }
 
 /** Stable, filesystem-safe key for a project directory. */
-function scopeKey(cwd: string): string {
+export function scopeKey(cwd: string): string {
   const resolved = path.resolve(cwd);
   const hash = createHash("sha1").update(resolved).digest("hex").slice(0, 10);
   const base = path.basename(resolved).replace(/[^a-zA-Z0-9._-]/g, "_") || "root";
   return `${base}-${hash}`;
+}
+
+/**
+ * Per-project directory for everything sentinel persists: state, checkpoints,
+ * verified states and spilled output. Derived from the cwd rather than from
+ * `stateScope`, so helpers can be called before `loadConfig()` ran.
+ */
+export function projectDir(cwd: string): string {
+  return path.join(homeDir(), ".pi", "sentinel-state", scopeKey(cwd));
 }
 
 function statePath(): string {
@@ -213,6 +278,8 @@ export function loadState(): void {
         state = {
           rollbackHistory: Array.isArray(raw.rollbackHistory) ? raw.rollbackHistory : [],
           lastVerifications: Array.isArray(raw.lastVerifications) ? raw.lastVerifications : [],
+          autoFixHistory: Array.isArray(raw.autoFixHistory) ? raw.autoFixHistory : [],
+          regressions: Array.isArray(raw.regressions) ? raw.regressions : [],
         };
         return;
       }
@@ -220,7 +287,7 @@ export function loadState(): void {
   } catch {
     /* fall through to a clean state */
   }
-  state = { rollbackHistory: [], lastVerifications: [] };
+  state = emptyState();
 }
 
 // ── State accessors & mutations ───────────────────────────────────────────
@@ -245,6 +312,20 @@ export function recordVerifications(entries: SentinelState["lastVerifications"])
 
 export function recordVerification(entry: SentinelState["lastVerifications"][number]): void {
   recordVerifications([entry]);
+}
+
+/** P0: log an auto-fix decision (injected / stopped / exhausted). */
+export function recordAutoFix(entry: SentinelState["autoFixHistory"][number]): void {
+  state.autoFixHistory.unshift(entry);
+  if (state.autoFixHistory.length > 20) state.autoFixHistory.length = 20;
+  persistState();
+}
+
+/** P2: log a regressed file (optionally one that was reverted). */
+export function recordRegression(entry: SentinelState["regressions"][number]): void {
+  state.regressions.unshift(entry);
+  if (state.regressions.length > 20) state.regressions.length = 20;
+  persistState();
 }
 
 // ── Glob matching ─────────────────────────────────────────────────────────
@@ -334,7 +415,7 @@ export function isPipelineStep(value: unknown): value is PipelineStep {
 
 /** @internal Reset internals — for testing only */
 export function _resetForTesting(): void {
-  state = { rollbackHistory: [], lastVerifications: [] };
+  state = emptyState();
   activeConfig = DEFAULT_CONFIG;
   stateScope = null;
 }

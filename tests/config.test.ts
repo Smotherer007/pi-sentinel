@@ -18,6 +18,63 @@ describe("defineConfig", () => {
     assert.equal(conf.pipelines.onFileMutation.length, 2);
   });
 
+  test("every feature is on by default", () => {
+    const conf = DEFAULT_CONFIG;
+
+    // Master switches.
+    assert.equal(conf.enabled, true);
+    assert.equal(conf.autoRollback, true);
+
+    // P0 close the loop.
+    assert.equal(conf.autoFix, true);
+    assert.equal(conf.maxAutoRetries, 3);
+
+    // P1 checkpoints.
+    assert.equal(conf.checkpointRetention, 50);
+
+    // P2 state-bound evidence.
+    assert.equal(conf.trackVerifiedState, true);
+    assert.equal(conf.revertOnRegression, true);
+    assert.equal(conf.pruneStaleTraces, true);
+
+    // P3 out-of-band detection.
+    assert.equal(conf.detectOutOfBand, true);
+
+    // P4 revision contract.
+    assert.equal(conf.revisionContract, true);
+
+    // P5 background checks & output budget.
+    assert.equal(conf.backgroundTurnEnd, true);
+    assert.equal(conf.maxOutputTokens, 2500);
+
+    // Mindplace synergy.
+    assert.equal(conf.impactAwareFocus, true);
+  });
+
+  test("a project can switch any feature back off", () => {
+    const conf = defineConfig({
+      autoRollback: false,
+      autoFix: false,
+      backgroundTurnEnd: false,
+      detectOutOfBand: false,
+      revisionContract: false,
+      revertOnRegression: false,
+      pruneStaleTraces: false,
+      trackVerifiedState: false,
+      impactAwareFocus: false,
+    });
+
+    assert.equal(conf.autoRollback, false);
+    assert.equal(conf.autoFix, false);
+    assert.equal(conf.backgroundTurnEnd, false);
+    assert.equal(conf.detectOutOfBand, false);
+    assert.equal(conf.revisionContract, false);
+    assert.equal(conf.revertOnRegression, false);
+    assert.equal(conf.pruneStaleTraces, false);
+    assert.equal(conf.trackVerifiedState, false);
+    assert.equal(conf.impactAwareFocus, false);
+  });
+
   test("deep merges nested pipelines", () => {
     const conf = defineConfig({
       pipelines: { onTurnEnd: [{ name: "t", cmd: "npm test", timeoutMs: 5000 }] },
