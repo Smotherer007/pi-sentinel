@@ -196,7 +196,7 @@ const SUPERSEDED_TRACE =
  * bound to a state that no longer exists. The diagnostics are kept — some of
  * them may still be unfixed — but they stop being treated as current.
  */
-const STALE_TRACE_NOTICE =
+export const STALE_TRACE_NOTICE =
   "[sentinel] STALE: the files this result describes have changed since it was produced, so it no longer proves anything about the current code. Re-run the check before concluding that something still fails — and never report these diagnostics as the present state.";
 
 /** How many diagnostics from dependents we promote into the pruner focus. */
@@ -2334,7 +2334,22 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
 
       if (!newestIsStale || containsText(message.content, STALE_TRACE_NOTICE)) return message;
       changed = true;
-      return { ...message, content: prefixContent(message.content, STALE_TRACE_NOTICE) };
+      // Replace, do not prefix.
+      //
+      // A background verdict is true when it is produced and possibly false when
+      // it is read: the check ran 19 s ago, the agent kept working, the payload is
+      // obsolete on arrival — and pi has no API to retract a message it has
+      // already queued. The one place sentinel still decides what the *model*
+      // sees is this hook, so the model gets the one-liner while the full payload
+      // stays in the session for the human, who may still want the diagnostics.
+      // That closes the late-delivery problem without hiding anything: nothing
+      // reaches the model as an instruction about a state that no longer exists.
+      return {
+        ...message,
+        content: Array.isArray(message.content)
+          ? [{ type: "text", text: STALE_TRACE_NOTICE }]
+          : STALE_TRACE_NOTICE,
+      };
     });
 
     if (!changed) return;
@@ -2588,13 +2603,7 @@ function containsText(content: unknown, needle: string): boolean {
 }
 
 /** Put `prefix` in front of a message body, whatever shape it has. */
-function prefixContent(content: unknown, prefix: string): unknown {
-  if (Array.isArray(content)) return [{ type: "text", text: prefix }, ...content];
-  return `${prefix}\n\n${typeof content === "string" ? content : ""}`;
-}
-
-/** Session file of the active session, when available. */
-function safeSessionFile(ctx: {
+/** Session file of the active session, when available. */function safeSessionFile(ctx: {
   sessionManager: { getSessionFile(): string | undefined };
 }): string | undefined {
   try {

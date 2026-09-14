@@ -42,9 +42,13 @@ runs.
 **A verdict is only true of the tree it read.** So a red payload that outlived its own state is not
 re-delivered as current: it is kept — the diagnostics are the reader's, not sentinel's to throw away
 — marked `[sentinel] STALE:` with the files that moved, delivered without waking the agent, and
-recorded as `superseded` in the auto-fix history. The same rule applies at the moment the model
-reads it: a payload carries its own state hash and file list, so a delivery that has been overtaken
-is demoted again rather than presented as an instruction.
+recorded as `superseded` in the auto-fix history. The same rule applies at the moment the model reads
+it, and there it is a *replacement* rather than a prefix: a payload carries its own state hash and
+file list, and a delivery that has been overtaken by an edit hands the model the one-line stale
+notice instead of the body — the session keeps the full payload for the person reading it. Nothing
+reaches the model as an instruction about a state that no longer exists, and nothing is hidden from
+the human. (pi has no API to retract a message it has already queued, so this hook is the earliest
+point sentinel can still decide what the model sees.)
 
 ## Contents
 

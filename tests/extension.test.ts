@@ -15,7 +15,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { execSync } from "node:child_process";
 
-import extensionFactory, { SENTINEL_MESSAGE_TYPE, SENTINEL_NOTICE_TYPE } from "../index.ts";
+import extensionFactory, {
+  SENTINEL_MESSAGE_TYPE,
+  SENTINEL_NOTICE_TYPE,
+  STALE_TRACE_NOTICE,
+} from "../index.ts";
 import { projectDir } from "../src/config.ts";
 import { verifiedEntry, allVerified } from "../src/clients/evidence.ts";
 import { createRuntime } from "../src/runtime.ts";
@@ -1803,12 +1807,23 @@ describe("P5 — output budget and background checks", () => {
     assert.equal(String(fresh?.messages?.[0]?.content).includes("STALE"), false);
 
     // The agent fixed the file after the payload was composed. The verdict is
-    // now about a tree that no longer exists — and the delivery must say so
-    // rather than present it as current. This is what the repair cycle's own
+    // now about a tree that no longer exists — and the delivery must not hand the
+    // model an instruction it cannot act on. This is what the repair cycle's own
     // state cannot answer once the cycle is over or the session moved on.
     fs.writeFileSync(path.join(project, "src/a.ts"), "export const a = 2;\n");
     const delivered = await asContext(injected);
-    assert.match(String(delivered?.messages?.[0]?.content), /\[sentinel\] STALE:/);
+    const content = String(delivered?.messages?.[0]?.content);
+    assert.match(content, /\[sentinel\] STALE:/);
+    // Replaced, not prefixed: the *model* gets the one-liner, so however late the
+    // verdict arrives it cannot arrive as an instruction. The payload itself is
+    // untouched in the session — the hook shapes the request, not the transcript
+    // — which is why nothing is hidden from the person reading it.
+    assert.equal(content, STALE_TRACE_NOTICE, "the model sees the one-liner, not the body");
+    assert.equal(
+      String(injected.content).includes("Verification failed"),
+      true,
+      "the payload stays in the transcript for the human",
+    );
   });
 
   test("a green run clears a stall, so a later failure is reported again", async () => {
