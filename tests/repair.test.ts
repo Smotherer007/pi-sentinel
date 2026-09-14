@@ -12,9 +12,11 @@ import assert from "node:assert/strict";
 
 import {
   autoFixOutcomeOf,
+  bindingIsStale,
   decideRepair,
   deltaPathsOf,
   initialRepairState,
+  readTraceBinding,
   scopeEscapeOf,
   traceIsStale,
   withPolicySignature,
@@ -367,5 +369,44 @@ describe("the background slot", () => {
     assert.deepEqual(merged.focusPaths, ["/p/a.ts", "/p/shared.ts", "/p/b.ts"]);
     assert.deepEqual(merged.changedPaths, ["/p/a.ts", "/p/b.ts"]);
     assert.deepEqual(merged.mutablePaths, ["/p/a.ts", "/p/b.ts"]);
+  });
+});
+
+describe("trace bindings: does a delivered payload still describe the tree?", () => {
+  const hashOf = (paths: readonly string[]) => `hash(${[...paths].sort().join(",")})`;
+
+  test("a message that carries its binding is read back exactly", () => {
+    const binding = readTraceBinding({ stateHash: "abc", paths: ["/p/a.ts"], attempt: 1 });
+    assert.deepEqual(binding, { stateHash: "abc", paths: ["/p/a.ts"] });
+  });
+
+  test("messages without a binding fall through to the caller's old behaviour", () => {
+    assert.equal(readTraceBinding({ resolved: true }), null);
+    assert.equal(readTraceBinding({ stateHash: "abc" }), null); // no paths
+    assert.equal(readTraceBinding({ paths: ["/p/a.ts"] }), null); // no hash
+    assert.equal(readTraceBinding({ stateHash: "abc", paths: [] }), null);
+    assert.equal(readTraceBinding({ stateHash: "abc", paths: [42, null] }), null);
+    assert.equal(readTraceBinding(undefined), null);
+    assert.equal(readTraceBinding("nonsense"), null);
+  });
+
+  test("a moved state is stale, an unmoved one is not", () => {
+    const binding = { stateHash: hashOf(["/p/a.ts"]), paths: ["/p/a.ts"] };
+    assert.equal(bindingIsStale(binding, hashOf), false);
+    // The file changed after the payload was composed: the payload describes a
+    // tree that no longer exists, which is exactly what must be said out loud
+    // at delivery time instead of presenting it as current.
+    assert.equal(bindingIsStale({ ...binding, stateHash: "older" }, hashOf), true);
+  });
+
+  test("no binding means no claim either way", () => {
+    assert.equal(bindingIsStale(null, hashOf), false);
+  });
+
+  test("a failing hash never turns into a stale claim", () => {
+    const exploding = () => {
+      throw new Error("unreadable");
+    };
+    assert.equal(bindingIsStale({ stateHash: "abc", paths: ["/p/a.ts"] }, exploding), false);
   });
 });

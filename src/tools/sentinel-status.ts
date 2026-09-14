@@ -87,6 +87,16 @@ export function createSentinelStatusTool(runtime: SentinelRuntime) {
             : "absent (impact analysis disabled)"
         }`,
         `  verified states: ${evidence.length}`,
+        // Which undeclared tools sentinel learned to snapshot is a decision it
+        // makes on its own, so it belongs where the user can read it: here, and
+        // in `/sentinel doctor`. Empty until a project has such a tool.
+        `  learned writers: ${
+          state.learnedMutationTools.length > 0
+            ? `${state.learnedMutationTools.join(", ")} (snapshotted before they run${conf.learnMutationTools ? "" : "; learning now off"})`
+            : conf.learnMutationTools
+              ? "none yet (undeclared writers are learned from observation)"
+              : "none (learning disabled)"
+        }`,
         "",
         ...metricsLines(state.metrics),
         "",
@@ -121,8 +131,7 @@ export function createSentinelStatusTool(runtime: SentinelRuntime) {
               .join("\n")}`
           : "Recent policy violations: none",
         "",
-        trackedEscalations.length > 0
-          ? `Escalating failures (this session):\n${trackedEscalations
+        trackedEscalations.length > 0          ? `Escalating failures (this session):\n${trackedEscalations
               .slice(0, 5)
               .map((e) => `  ${e.signature} — seen ${e.count}x`)
               .join("\n")}`
@@ -137,8 +146,7 @@ export function createSentinelStatusTool(runtime: SentinelRuntime) {
       ].join("\n");
 
       return {
-        content: [{ type: "text" as const, text }],
-        details: {
+        content: [{ type: "text" as const, text }],        details: {
           enabled: conf.enabled,
           autoRollback: conf.autoRollback,
           autoFix: conf.autoFix,

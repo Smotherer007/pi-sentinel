@@ -45,6 +45,8 @@ function facts(overrides: Partial<DoctorFacts> = {}): DoctorFacts {
       bashEnabled: true,
       bashMode: "block",
       protectedPaths: 4,
+      learnMutationTools: true,
+      learnedTools: [],
       onFileMutation: [{ name: "type-check", timeoutMs: 60_000, files: 2, cacheable: true }],
       onTurnEnd: [{ name: "unit-tests", timeoutMs: 120_000, files: 0, cacheable: false }],
       missingCommands: [],
@@ -267,6 +269,27 @@ describe("doctor: safety", () => {
   test("with autoRollback off the cost of a bad turn is stated", () => {
     const report = buildDoctorReport(facts(), NOW);
     assert.equal(find(report.safety, "rollback off")?.level, "warn");
+  });
+
+  test("learned writers are shown, because learning is sentinel's own decision", () => {
+    const base = facts();
+    const learned = buildDoctorReport(
+      { ...base, config: { ...base.config, learnedTools: ["replace", "insert"] } },
+      NOW,
+    );
+    const check = find(learned.safety, "learned writers: 2");
+    assert.equal(check?.level, "ok");
+    assert.match(check!.detail ?? "", /replace, insert/);
+    assert.match(check!.detail ?? "", /only refuses through the policy/);
+
+    const none = buildDoctorReport(base, NOW);
+    assert.ok(find(none.safety, "learned writers: none yet"));
+
+    const off = buildDoctorReport(
+      { ...base, config: { ...base.config, learnMutationTools: false } },
+      NOW,
+    );
+    assert.ok(find(off.safety, "tool learning off"));
   });
 });
 

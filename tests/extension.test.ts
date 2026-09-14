@@ -1751,6 +1751,45 @@ describe("P5 — output budget and background checks", () => {
     assert.ok(fake.sent.length >= 1, "the folded run produced fresh feedback");
   });
 
+  test("a delivered payload is demoted once the state it names moved", async () => {
+    await configure({
+      autoRollback: false,
+      backgroundTurnEnd: false,
+      include: ["**/*.ts"],
+      pipelines: { onFileMutation: [], onTurnEnd: [{ name: "tests", cmd: "exit 1", timeoutMs: 5000 }] },
+    });
+
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+    const injected = fake.sent[0]?.message;
+    assert.ok(injected, "the red turn was re-prompted");
+    assert.deepEqual(
+      injected.details?.paths,
+      [path.join(project, "src/a.ts")],
+      "the payload carries the files its state hash covers",
+    );
+
+    const asContext = (message: any) =>
+      emit(
+        fake,
+        "context",
+        { type: "context", messages: [{ role: "custom", ...message }] },
+        ctx,
+      );
+
+    // The code still matches the payload: nothing to demote.
+    const fresh = await asContext(injected);
+    assert.equal(fresh?.changed, undefined);
+    assert.equal(String(fresh?.messages?.[0]?.content).includes("STALE"), false);
+
+    // The agent fixed the file after the payload was composed. The verdict is
+    // now about a tree that no longer exists — and the delivery must say so
+    // rather than present it as current. This is what the repair cycle's own
+    // state cannot answer once the cycle is over or the session moved on.
+    fs.writeFileSync(path.join(project, "src/a.ts"), "export const a = 2;\n");
+    const delivered = await asContext(injected);
+    assert.match(String(delivered?.messages?.[0]?.content), /\[sentinel\] STALE:/);
+  });
+
   test("a retired session does not start another background check", async () => {
     await configure({
       autoRollback: false,
@@ -2530,6 +2569,11 @@ describe("background staleness — a moved tree invalidates the result", () => {
     await waitFor(() =>
       ctx._notifications.some((n) => n.text.includes("stale result was discarded")),
     );
-    assert.equal(fake.sent.length, 0, "the agent must not be re-prompted on a stale result");
+    // Demoted rather than dropped: the diagnostics are delivered, marked, and
+    // without `triggerTurn` — so no repair attempt is spent on a state that has
+    // moved on, and the information is still available to whoever reads it.
+    assert.equal(fake.sent.length, 1, "the payload is kept, the repair is not");
+    assert.equal(fake.sent[0]?.options?.triggerTurn, false);
+    assert.match(String(fake.sent[0]?.message?.content), /\[sentinel\] STALE:/);
   });
 });

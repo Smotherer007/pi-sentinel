@@ -313,6 +313,19 @@ export interface SentinelConfig {
   // ── P5: background checks & output budget ───────────────────────────────
   /** Run onTurnEnd pipelines in the background and re-wake on failure. */
   backgroundTurnEnd: boolean;
+  /**
+   * Learn, from observation, which undeclared tools write files.
+   *
+   * A tool nobody declared — a hashline editor, an apply-patch — is caught by
+   * comparing the file before and after one of its calls. Learning it means the
+   * *next* call is snapshotted before it runs, so a failed turn stays undoable.
+   *
+   * Off means sentinel falls back to the declared names and their shapes only:
+   * less protection, and nothing about a project's own tooling is remembered.
+   * Which tools were learned is shown by `sentinel_status` and `/sentinel
+   * doctor`, because a decision like this has to be readable, not implicit.
+   */
+  learnMutationTools: boolean;
   /** Approximate token cap for model-visible verification output. */
   maxOutputTokens: number;
 
@@ -420,7 +433,7 @@ export interface PipelineRunResult {
  *   - `stopped`:    the code state did not move, so the loop stopped itself.
  *   - `exhausted`:  the attempt budget is spent.
  */
-export type AutoFixOutcome = "injected" | "stopped" | "exhausted";
+export type AutoFixOutcome = "injected" | "stopped" | "exhausted" | "superseded";
 
 /**
  * The decision the repair state machine reached for a red turn.

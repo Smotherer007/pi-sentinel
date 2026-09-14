@@ -646,6 +646,7 @@ never blocks a turn and never triggers a rollback.
 | `revisionContract` | boolean | `true` | Inject the bounded-repair rules into the system prompt (P4). |
 | `backgroundTurnEnd` | boolean | `true` | Run `onTurnEnd` without blocking the turn, re-wake on failure (P5). |
 | `maxOutputTokens` | number | `2500` | Token budget for model-visible verification output; `0` = off. |
+| `learnMutationTools` | boolean | `true` | Learn from observation which undeclared tools write files, so the next call gets a pre-state. Off = only declared names and their argument shapes are treated as writers. Learned names are shown by `/sentinel status` and `/sentinel doctor`; learning itself never widens the pre-write gate, which stays `policy`'s call. |
 | `impactAwareFocus` | boolean | `true` | Extend the verification focus with code-graph dependents. |
 | `maxTraceLines` | number | `12` | Critical error lines kept by the pruner. |
 | `verification.debounceMs` | number | `0` | Coalesce mutations that land within this window (P6). |

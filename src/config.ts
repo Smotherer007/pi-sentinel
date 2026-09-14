@@ -113,6 +113,11 @@ export const DEFAULT_CONFIG: SentinelConfig = {
   backgroundTurnEnd: true,
   maxOutputTokens: 2500,
 
+  // Protection, not authority: a tool learned by observation gets a pre-state
+  // and is verified. Whether a protected path makes it *refuse* stays the user's
+  // call, through `policy.enabled` — never a side effect of learning.
+  learnMutationTools: true,
+
   // Mindplace synergy — impact analysis when a graph is present.
   impactAwareFocus: true,
 

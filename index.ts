@@ -115,6 +115,7 @@ import type { EventBusLike } from "./src/clients/bus.ts";
 import { describeMoved, fingerprintInputs, movedInputs } from "./src/clients/freshness.ts";
 import type { InputPatterns, RunInputs } from "./src/clients/freshness.ts";
 import { shouldEscalate } from "./src/clients/escalation.ts";
+import { bindingIsStale, readTraceBinding } from "./src/clients/repair.ts";
 import {
   autoFixOutcomeOf,
   decideRepair,
@@ -1289,6 +1290,12 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
           details: {
             step: failure.step,
             stateHash,
+            // The paths this verdict is about, carried with it so a later
+            // delivery can tell whether it still describes the tree. Without
+            // them the delivery check can only ask the *current* repair cycle,
+            // which by then may be a different cycle — or none at all, in which
+            // case an obsolete "fix this" reads as current.
+            paths: [...args.outcome.changedPaths],
             attempt: decision.attempt?.attempt,
             max: decision.attempt?.max,
           },
@@ -1545,8 +1552,11 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
 
     // Tier 3: the call names a path but carries no content, so it may or may not
     // write. Capture the pre-state speculatively — it is one file read — and let
-    // `tool_result` drop it again if nothing changed.
+    // `tool_result` drop it again if nothing changed. Off with
+    // `learnMutationTools: false`: no speculative capture, and a project's own
+    // tooling is never remembered.
     if (hint.kind === "unknown") {
+      if (!conf.learnMutationTools) return;
       let armed = false;
       for (const path of hint.paths) {
         if (!targetInScope(path, ctx.cwd)) continue;
@@ -1648,8 +1658,14 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     // call's snapshot *is* the pre-state.
     if (observed) {
       if (runtime.config.learnMutationTool(event.toolName)) {
+        // Say both consequences, not just the convenient one: from here on this
+        // tool is treated as a writer, which means a pre-state *and* — if the
+        // project turns the pre-write policy on — a refusal on protected paths.
         ctx.ui.notify(
-          `Sentinel observed "${event.toolName}" writing files — it will be snapshotted before it runs from now on.`,
+          `Sentinel observed "${event.toolName}" writing files — it will be snapshotted before it runs from now on` +
+            (conf.policy.enabled && conf.policy.blockBeforeWrite
+              ? ", and the pre-write policy applies to it like an edit. Disable with learnMutationTools: false."
+              : ". Disable with learnMutationTools: false."),
           "info",
         );
       }
@@ -1695,11 +1711,17 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     // assert a failure the agent cannot reproduce.
     const stale = outcome.staleInputs ?? [];
     if (stale.length > 0) {
+      // Demoted, not dropped: the diagnostics ride along, marked as describing a
+      // state that has moved, and the tool result stays unflagged so the agent is
+      // not told to repair something it cannot reproduce.
+      const note = reportSuperseded({ outcome, cwd: ctx.cwd, ctx, moved: stale });
       ctx.ui.notify(
-        `Sentinel: check "${outcome.failure?.step ?? "unknown"}" failed, but ${stale.length} input file(s) changed while it ran (${describeMoved(stale, ctx.cwd)}) — the stale result was discarded and cost no repair attempt.`,
+        `Sentinel: stale result was discarded — ${stale.length} input file(s) changed while the check ran.`,
         "warning",
       );
-      return;
+      return {
+        content: [...(event.content ?? []), { type: "text" as const, text: note }],
+      };
     }
 
     // Prepend the pruned error while keeping the original result blocks. The
@@ -1883,10 +1905,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
         paths: focusPaths,
       });
     } else if (moved.length > 0) {
-      ctx.ui.notify(
-        `Sentinel: check "${outcome.failure?.step ?? "unknown"}" failed, but ${moved.length} input file(s) changed while it ran (${describeMoved(moved, ctx.cwd)}) — the stale result was discarded and cost no repair attempt.`,
-        "warning",
-      );
+      sendSuperseded({ outcome, cwd: ctx.cwd, ctx, moved });
     } else {
       handleRedTurnSafely({
         outcome,
@@ -1931,6 +1950,93 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
         "error",
       );
       return null;
+    }
+  }
+
+  /**
+   * Report a verdict whose inputs moved while the run held them.
+   *
+   * Deliberately *not* "discard and forget". Dropping the payload would keep the
+   * agent from spending a bounded attempt on a state that no longer exists —
+   * which is right — but it would also throw the diagnostics away, and the
+   * reader may still need them. So the verdict is **demoted**: the content is
+   * kept, marked as describing a state that has moved, delivered without
+   * `triggerTurn` so it can never re-open a repair cycle, and recorded, because
+   * a decision without a trail is the one thing sentinel must not make.
+   */
+  function reportSuperseded(args: {
+    outcome: VerificationOutcome;
+    cwd: string;
+    ctx: { ui: ExtensionUIContext };
+    moved: readonly string[];
+  }): string {
+    const moved = args.moved;
+    const step = args.outcome.failure?.step ?? "unknown";
+    const stateHash = args.outcome.stateHash;
+
+    // Audited first: if anything below throws, the decision is still on record.
+    try {
+      runtime.config.recordAutoFix({
+        at: new Date().toISOString(),
+        step,
+        attempt: repair.attempts,
+        outcome: "superseded",
+        reason: `inputs moved during the run: ${moved.length} file(s)`,
+      });
+    } catch {
+      /* the trail is best-effort; the demotion is not */
+    }
+
+    let body: string;
+    try {
+      body = renderFailure(args.outcome, args.cwd);
+    } catch {
+      body = "";
+    }
+
+    return [
+      `[sentinel] STALE: check "${step}" failed, but ${moved.length} of its input file(s) changed while it ran` +
+        ` (${describeMoved(moved, args.cwd)}).`,
+      "This verdict describes a state that no longer exists, so it cost no repair attempt and sentinel did not act on it.",
+      "The diagnostics below are kept for reference only — re-run the check before treating any of them as the present state.",
+      body ? `\n${body}` : "",
+    ]
+      .filter((line) => line.length > 0)
+      .join("\n");
+  }
+
+  /**
+   * Hand a superseded verdict to the conversation without waking the agent.
+   *
+   * `followUp` with `triggerTurn: false`: the payload lands at the next turn
+   * boundary, and it carries its own binding so the delivery check can demote it
+   * again if the state moves once more before the model reads it.
+   */
+  function sendSuperseded(args: {
+    outcome: VerificationOutcome;
+    cwd: string;
+    ctx: { ui: ExtensionUIContext };
+    moved: readonly string[];
+  }): void {
+    const text = reportSuperseded(args);
+    args.ctx.ui.notify(`Sentinel: stale result was discarded — ${args.moved.length} input file(s) changed while the check ran.`, "warning");
+    try {
+      pi.sendMessage(
+        {
+          customType: SENTINEL_MESSAGE_TYPE,
+          content: text,
+          display: true,
+          details: {
+            stale: true,
+            step: args.outcome.failure?.step,
+            stateHash: args.outcome.stateHash,
+            paths: [...args.outcome.changedPaths],
+          },
+        },
+        { deliverAs: "followUp", triggerTurn: false },
+      );
+    } catch {
+      /* a notice that cannot be delivered must not break the green path */
     }
   }
 
@@ -2049,10 +2155,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
         // run itself decided this, before any of its own restores ran.
         const moved = outcome.staleInputs ?? [];
         if (moved.length > 0) {
-          args.ctx.ui.notify(
-            `Sentinel: background check "${outcome.failure?.step ?? "unknown"}" failed, but ${moved.length} of its input file(s) changed while it ran (${describeMoved(moved, args.cwd)}) — the stale result was discarded and cost no repair attempt.`,
-            "warning",
-          );
+          sendSuperseded({ outcome, cwd: args.cwd, ctx: args.ctx, moved });
           return;
         }
 
@@ -2179,7 +2282,14 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
 
     const ordered = [...sentinelIndices];
     const newest = ordered[ordered.length - 1];
-    const newestIsStale = injectedTraceIsStale();
+    // Prefer the newest message's own binding: it answers the question that
+    // matters at delivery — does the state *this payload names* still exist? —
+    // whereas the current repair cycle can only answer for the last cycle it
+    // knows about. A message without its own binding keeps the old behaviour.
+    const newestIsStale =
+      bindingIsStale(readTraceBinding(messages[newest]?.details), (paths) =>
+        stateHashOf([...paths]),
+      ) || injectedTraceIsStale();
 
     let changed = false;
     const next = messages.map((message, i) => {

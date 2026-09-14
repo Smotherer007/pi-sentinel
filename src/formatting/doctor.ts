@@ -71,6 +71,10 @@ export interface DoctorFacts {
     readonly bashEnabled: boolean;
     readonly bashMode: string;
     readonly protectedPaths: number;
+    /** Whether undeclared writers are learned from observation. */
+    readonly learnMutationTools: boolean;
+    /** Tool names learned so far — sentinel's own decision, shown not hidden. */
+    readonly learnedTools: readonly string[];
     readonly onFileMutation: readonly DoctorStep[];
     readonly onTurnEnd: readonly DoctorStep[];
     /** Programs a step names that could not be found on PATH. */
@@ -320,6 +324,16 @@ export function buildDoctorReport(facts: DoctorFacts, now = Date.now()): DoctorR
       `protected paths: ${config.protectedPaths}`,
       config.protectedPaths === 0 ? "none configured — policy is off or empty" : undefined,
     ),
+  );
+  safety.push(
+    config.learnedTools.length > 0
+      ? ok(
+          `learned writers: ${config.learnedTools.length}`,
+          `${config.learnedTools.join(", ")} — snapshotted before they run; a protected path only refuses through the policy`,
+        )
+      : config.learnMutationTools
+        ? ok("learned writers: none yet", "undeclared writers are learned from observation")
+        : ok("tool learning off", "only declared names and their shapes are treated as writers"),
   );
   if (session.turnSnapshotFiles > 0) {
     safety.push(ok(`rollback READY (${session.turnSnapshotFiles} file(s) captured this turn)`));

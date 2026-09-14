@@ -191,6 +191,8 @@ export function createSentinelDoctorTool(
           bashEnabled: conf.bash.enabled,
           bashMode: conf.bash.mode,
           protectedPaths: conf.policy.sensitivePaths.length,
+          learnMutationTools: conf.learnMutationTools,
+          learnedTools: [...state.learnedMutationTools],
           onFileMutation: conf.pipelines.onFileMutation.map(reduce),
           onTurnEnd: conf.pipelines.onTurnEnd.map(reduce),
           missingCommands: missing,

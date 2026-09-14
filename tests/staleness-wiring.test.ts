@@ -134,7 +134,7 @@ describe("staleness: a verdict whose inputs moved", () => {
     await fire(fake, "turn_start", { type: "turn_start", turnIndex: 1 }, ctx);
   });
 
-  test("is discarded, spends no attempt, and never reaches the agent", async () => {
+  test("is demoted, spends no attempt, and cannot re-prompt the agent", async () => {
     await fire(fake, "turn_end", { type: "turn_end", turnIndex: 1 }, ctx);
 
     // The check is now running. Move a file it reads but the turn never touched
@@ -142,20 +142,30 @@ describe("staleness: a verdict whose inputs moved", () => {
     fs.writeFileSync(path.join(project, "src", "moved.ts"), "export const moved = 1;\n");
 
     await waitFor(() => fake.notifications.some((n) => n.text.includes("discarded")));
-
     const notice = fake.notifications.find((n) => n.text.includes("discarded"))!;
     assert.match(notice.text, /stale result was discarded/);
-    assert.match(notice.text, /src\/moved\.ts/);
-    assert.match(notice.text, /cost no repair attempt/);
 
-    // Nothing was sent to the model, and the red verdict is not history.
-    assert.equal(fake.sent.length, 0, "a stale verdict must not re-prompt the agent");
+    // Demoted, not dropped: the payload is delivered so the diagnostics survive,
+    // but marked as describing a state that has moved — and delivered without
+    // `triggerTurn`, which is what keeps a bounded repair attempt out of it.
+    assert.equal(fake.sent.length, 1, "the diagnostics are kept, not thrown away");
+    const sent = fake.sent[0];
+    assert.equal(sent.options?.triggerTurn, false, "a stale verdict must never wake the agent");
+    assert.equal(sent.message?.details?.stale, true);
+    assert.match(String(sent.message?.content), /\[sentinel\] STALE:/);
+    assert.match(String(sent.message?.content), /src\/moved\.ts/);
+    assert.match(String(sent.message?.content), /cost no repair attempt/);
+
+    // The red verdict is not history, and the decision has a trail.
     assert.deepEqual(
       runtime.config.state().turnHistory.filter((entry) => !entry.passed),
       [],
       "a stale verdict must not become the newest red turn",
     );
-    assert.deepEqual(runtime.config.state().autoFixHistory, [], "no attempt was spent");
+    const audits = runtime.config.state().autoFixHistory;
+    assert.equal(audits.length, 1, "the decision to not act is recorded");
+    assert.equal(audits[0].outcome, "superseded");
+    assert.match(audits[0].reason, /inputs moved during the run/);
   });
 
   test("control: an unchanged tree still delivers the failure", async () => {

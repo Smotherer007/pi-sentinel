@@ -283,6 +283,23 @@ describe("mutation seam: a tool nobody declared", () => {
     assert.equal(fs.readFileSync(abs, "utf-8"), "before the call");
   });
 
+  test("learning can be switched off, and then nothing is remembered", async () => {
+    // Fresh session with the switch off: sentinel falls back to the declared
+    // names and their shapes, keeps no opinion about this project's tooling, and
+    // captures nothing speculatively.
+    fs.rmSync(path.join(home, ".pi"), { recursive: true, force: true });
+    await startSession({ learnMutationTools: false });
+    await fire(fake, "turn_start", { type: "turn_start", turnIndex: 1 }, ctx);
+
+    const rel = "unlearned.txt";
+    const abs = path.join(project, rel);
+    fs.writeFileSync(abs, "original");
+    await callObserved("frobnicate", rel, "changed", "c-off");
+
+    assert.deepEqual(runtime.config.state().learnedMutationTools, []);
+    assert.equal(runtime.snapshots.turnPaths().includes(abs), false);
+  });
+
   test("a read-shaped call is not armed, so nothing is captured", async () => {
     const rel = "read-only.txt";
     const abs = path.join(project, rel);

@@ -282,6 +282,55 @@ export function traceIsStale(state: RepairState, currentStateHash: string): bool
   return currentStateHash !== state.injectedStateHash;
 }
 
+/**
+ * The state a sentinel message was bound to, as it travels through the session.
+ *
+ * A verification payload is composed when a run finishes and delivered at the
+ * next turn boundary — minutes later, in the worst case. By then the code it
+ * describes may be fixed, and the payload that says "fix this" is describing a
+ * tree that no longer exists. Reading the binding back off the message is what
+ * lets the delivery check ask *its own* question instead of the current repair
+ * cycle's: "is the state this message names still the state on disk?".
+ */
+export interface TraceBinding {
+  readonly stateHash: string;
+  readonly paths: readonly string[];
+}
+
+/**
+ * Read a message's own binding, or `null` when it carries none.
+ *
+ * Messages sent before this existed, notices and resolutions carry no paths —
+ * for those the caller keeps whatever behaviour it had.
+ */
+export function readTraceBinding(details: unknown): TraceBinding | null {
+  if (typeof details !== "object" || details === null) return null;
+  const record = details as { stateHash?: unknown; paths?: unknown };
+  if (typeof record.stateHash !== "string" || record.stateHash.length === 0) return null;
+  if (!Array.isArray(record.paths) || record.paths.length === 0) return null;
+  const paths = record.paths.filter((p): p is string => typeof p === "string" && p.length > 0);
+  if (paths.length === 0) return null;
+  return { stateHash: record.stateHash, paths };
+}
+
+/**
+ * Did the state this message names move since it was written?
+ *
+ * `hashOf` is injected so this stays pure: the caller brings the hashing, the
+ * decision is testable without a filesystem.
+ */
+export function bindingIsStale(
+  binding: TraceBinding | null,
+  hashOf: (paths: readonly string[]) => string,
+): boolean {
+  if (!binding) return false;
+  try {
+    return hashOf(binding.paths) !== binding.stateHash;
+  } catch {
+    return false;
+  }
+}
+
 /** Remember (or, with null, reopen) the policy violation already re-prompted for. */
 export function withPolicySignature(
   state: RepairState,
