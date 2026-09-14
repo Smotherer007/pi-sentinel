@@ -364,6 +364,59 @@ export interface PipelineRunResult {
   cached?: boolean;
 }
 
+// ── P0: the repair loop ───────────────────────────────────────────────────
+
+/**
+ * What the guard did with a red turn, as written to `.autoFixHistory`.
+ *
+ *   - `injected`:   the agent was re-prompted with the pruned failure.
+ *   - `stopped`:    the code state did not move, so the loop stopped itself.
+ *   - `exhausted`:  the attempt budget is spent.
+ */
+export type AutoFixOutcome = "injected" | "stopped" | "exhausted";
+
+/**
+ * The decision the repair state machine reached for a red turn.
+ *
+ * `none` means the failure was reported without being repaired — a `warnOnly`
+ * step or an environment failure, neither of which says anything about the
+ * code.
+ */
+export type AutoFixAction = "inject" | "stop-unchanged" | "exhausted" | "none";
+
+/**
+ * Everything one verification run concluded, including what it did to the
+ * working tree.
+ *
+ * Produced by the runner (`onFileMutation` and `onTurnEnd` both), consumed by
+ * the failure feedback and by the repair state machine. The two file sets it
+ * carries are deliberately distinct: `focusPaths` is what the run was about,
+ * `regressions`/`conflicts`/`restoreSkipped` describe what happened to them.
+ */
+export interface VerificationOutcome {
+  passed: boolean;
+  /** Identity of the code state the outcome refers to. */
+  stateHash: string;
+  /** The files the run actually covered (a coalesced batch covers several). */
+  focusPaths: string[];
+  /** First critical failure, when the run failed. */
+  failure?: VerificationResult;
+  warnings: PipelineRunResult["warnings"];
+  /** True when the working tree was restored as part of this outcome. */
+  rolledBack: boolean;
+  /**
+   * Regressions as they were *before* sentinel restored anything, so the
+   * feedback can say "this was green, I put it back" instead of hiding it.
+   */
+  regressions: Regression[];
+  /** Files left untouched because they changed after the agent's mutation. */
+  conflicts: RollbackConflict[];
+  /** Files the rollback could not restore at all, so their state is unknown. */
+  restoreSkipped: string[];
+  /** Set once the same failure has been seen often enough to escalate. */
+  escalation?: { count: number; max: number };
+}
+
 // ── Rollback results ──────────────────────────────────────────────────────
 
 /**

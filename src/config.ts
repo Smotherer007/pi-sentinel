@@ -15,6 +15,7 @@ import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
 import type {
+  AutoFixOutcome,
   PipelineStep,
   PolicyConfig,
   RecoveryConfig,
@@ -173,8 +174,7 @@ export interface SentinelState {
     at: string;
     step: string;
     attempt: number;
-    /** injected = the agent was re-prompted; stopped = guard gave up. */
-    outcome: "injected" | "stopped" | "exhausted";
+    outcome: AutoFixOutcome;
     reason: string;
   }>;
   /** P2 audit trail: files detected as regressed from a verified state. */

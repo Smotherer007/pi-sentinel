@@ -31,8 +31,14 @@
  *   - I/O isolated in clients/ (pipeline-runner, git-client, snapshot,
  *     checkpoints, evidence, workspace, spill, mindplace)
  *   - Pure formatting functions in formatting/ (pruner, feedback)
+ *   - The repair loop's state and stop conditions are data with a pure
+ *     transition (clients/repair.ts), so this file only performs the effects a
+ *     decision asks for
  *   - Each capability is a single-responsibility tool module (tools/)
  *   - Config/state in config.ts with atomic, permission-safe persistence
+ *
+ * This file is the wiring: it registers the tools and commands, maps host
+ * hooks onto the clients, and decides nothing that a client could decide.
  *
  * Tools:
  *   - sentinel_verify:   Run verification pipelines on demand
@@ -96,6 +102,23 @@ import type { WorkspaceBaseline } from "./src/clients/workspace.ts";
 import { describeChange, expandWithDependents } from "./src/clients/mindplace.ts";
 import { VerificationQueue } from "./src/clients/queue.ts";
 import { escalations, shouldEscalate } from "./src/clients/escalation.ts";
+import {
+  autoFixOutcomeOf,
+  decideRepair,
+  deltaPathsOf,
+  initialRepairState,
+  scopeEscapeOf,
+  traceIsStale,
+  withPolicySignature,
+  writeInScope,
+} from "./src/clients/repair.ts";
+import type { RepairState } from "./src/clients/repair.ts";
+import {
+  EMPTY_BACKGROUND_SLOT,
+  foldBackgroundRequest,
+  takeBackgroundRequest,
+} from "./src/clients/background.ts";
+import type { BackgroundRequest, BackgroundSlot } from "./src/clients/background.ts";
 import { buildFailureFeedback, spillDir } from "./src/formatting/feedback.ts";
 import { applyOutputCap } from "./src/clients/spill.ts";
 import { metricsLines, turnHistoryLines } from "./src/formatting/status.ts";
@@ -123,7 +146,7 @@ import type {
   PolicyReport,
   Regression,
   RollbackConflict,
-  VerificationResult,
+  VerificationOutcome,
 } from "./src/types.ts";
 
 import { SentinelVerifyTool } from "./src/tools/sentinel-verify.ts";
@@ -223,70 +246,17 @@ function isSentinelArtifact(cwd: string, absTarget: string): boolean {
   return absTarget.startsWith(graphOut) || absTarget.startsWith(projectDir(cwd) + sep);
 }
 
-interface VerificationOutcome {
-  passed: boolean;
-  /** Identity of the code state the outcome refers to. */
-  stateHash: string;
-  /** The files the run actually covered (a coalesced batch covers several). */
-  focusPaths: string[];
-  /** First critical failure, when the run failed. */
-  failure?: VerificationResult;
-  warnings: PipelineRunResult["warnings"];
-  /** True when the working tree was restored as part of this outcome. */
-  rolledBack: boolean;
-  /**
-   * Regressions as they were *before* sentinel restored anything, so the
-   * feedback can say "this was green, I put it back" instead of hiding it.
-   */
-  regressions: Regression[];
-  /** Files left untouched because they changed after the agent's mutation. */
-  conflicts: RollbackConflict[];
-  /** Files the rollback could not restore at all, so their state is unknown. */
-  restoreSkipped: string[];
-  /** Set once the same failure has been seen often enough to escalate. */
-  escalation?: { count: number; max: number };
+interface VerificationState {
+  // placeholder — unused
 }
 
 /**
- * One turn's background verification request (P5). Named so a turn that could
- * not start immediately can be kept and folded into the next run.
- */
-interface BackgroundRequest {
-  cwd: string;
-  ctx: { ui: ExtensionUIContext };
-  focusPaths: string[];
-  checkpointId?: string;
-  /** Files the agent wrote this turn; the regression revert is scoped to them. */
-  mutablePaths?: string[];
-  /** Post-mutation hashes for `mutablePaths`. */
-  postHashes?: Map<string, string | null>;
-}
-
-/**
- * Fold a turn that had to wait into the run that will cover it.
+ * One mutation's verification request, batched by the queue.
  *
- * The union of both scopes is verified. The *newer* checkpoint wins, because
- * it is the only one a restore may still target: the older turn's tree has
- * already been written over by the newer one.
+ * Kept here rather than in the queue module because it is the payload the
+ * `tool_result` hook builds, including a host context object — the queue
+ * itself is transport-agnostic.
  */
-function mergeBackgroundRequests(
-  waiting: BackgroundRequest | null,
-  next: BackgroundRequest,
-): BackgroundRequest {
-  if (!waiting) return next;
-  const postHashes = new Map(waiting.postHashes ?? []);
-  for (const [path, hash] of next.postHashes ?? []) postHashes.set(path, hash);
-  return {
-    cwd: next.cwd,
-    ctx: next.ctx,
-    focusPaths: [...new Set([...waiting.focusPaths, ...next.focusPaths])],
-    checkpointId: next.checkpointId,
-    mutablePaths: [...new Set([...(waiting.mutablePaths ?? []), ...(next.mutablePaths ?? [])])],
-    postHashes,
-  };
-}
-
-/** One mutation's verification request, batched by the queue. */
 interface MutationRequest {
   cwd: string;
   ctx: { ui: ExtensionUIContext };
@@ -294,48 +264,26 @@ interface MutationRequest {
   toolCallIds: string[];
 }
 
-type AutoFixAction = "inject" | "stop-unchanged" | "exhausted" | "none";
-
 export default function (pi: ExtensionAPI) {
-  // ── Repair-loop bookkeeping (P0) ────────────────────────────────────────
+  // ── Repair-loop bookkeeping (P0 + P8) ───────────────────────────────────
+  //
+  // The loop's memory is one plain value in src/clients/repair.ts, so its stop
+  // conditions are a pure function of (state, red turn) rather than something
+  // only observable by driving the whole extension. Everything below performs
+  // the effects a decision asks for; nothing decides on its own.
 
-  /** Consecutive auto-fix continuations since the last green run / prompt. */
-  let autoFixAttempts = 0;
-  /** State hash we already re-prompted for — stops the loop when nothing moves. */
-  let lastInjectedStateHash: string | null = null;
-  /** The paths that hash referred to, so a no-op turn can be compared at all. */
-  let lastInjectedPaths: string[] = [];
-  /**
-   * Checkpoint of the *first* turn in the current red cycle. Recovery
-   * exhaustion restores exactly this, so `rollbackAfterExhaustion` returns to
-   * the state before the first failed attempt rather than merely undoing the
-   * last one.
-   */
-  let recoveryStartCheckpointId: string | null = null;
-  /**
-   * The files the current red cycle is about. A repair attempt is expected to
-   * fix the cause *here*; reaching past it is the earliest observable sign
-   * that the agent has started varying an approach instead of fixing a cause,
-   * and `recovery.scopeGuard` decides whether that is reported or refused.
-   */
-  let recoveryScope: Set<string> | null = null;
+  let repair: RepairState = initialRepairState();
   /** In-flight background verification (P5); one at a time. */
   let backgroundRun: Promise<void> | null = null;
   /**
    * A turn whose background checks could not start because an earlier run was
    * still going. Dropping it would let a turn reach the user unverified, which
    * is the one outcome the guard exists to prevent, so it is folded into the
-   * next run instead.
+   * next run instead (see src/clients/background.ts).
    */
-  let pendingBackground: BackgroundRequest | null = null;
+  let background: BackgroundSlot = EMPTY_BACKGROUND_SLOT;
   /** Working-tree fingerprint when the current turn started (P3 baseline). */
   let turnBaseline: WorkspaceBaseline | null = null;
-  /**
-   * Signature of the last policy violation we already re-prompted for. An
-   * identical violation is reported to the human but never re-sent to the
-   * agent, which is what keeps a policy stop from becoming a loop.
-   */
-  let lastPolicySignature: string | null = null;
 
   /**
    * Mutation verifications are batched: with a debounce window, edits that
@@ -400,12 +348,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function resetRepairBudget(): void {
-    autoFixAttempts = 0;
-    lastInjectedStateHash = null;
-    lastInjectedPaths = [];
-    recoveryStartCheckpointId = null;
-    recoveryScope = null;
-    lastPolicySignature = null;
+    repair = initialRepairState();
     // A new user turn (or a repaired loop) is a fresh start for escalation.
     escalations.reset();
   }
@@ -494,8 +437,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     const recovery = recoveryOf(conf);
-    if (recovery.scopeGuard === "block" && recoveryScope && !recoveryScope.has(abs)) {
-      const allowed = [...recoveryScope].slice(0, 5).map((p) => relativePath(cwd, p));
+    if (!writeInScope(repair, abs, recovery.scopeGuard)) {
+      const allowed = (repair.scope ?? []).slice(0, 5).map((p) => relativePath(cwd, p));
       return {
         summary: `${rel} is outside the current repair scope`,
         reason:
@@ -569,14 +512,14 @@ export default function (pi: ExtensionAPI) {
 
     args.ctx.ui.notify(text, "error");
 
-    if (lastPolicySignature === signature) {
+    if (repair.policySignature === signature) {
       args.ctx.ui.notify(
         "Sentinel: the same policy violation repeated — stopping instead of re-prompting.",
         "warning",
       );
       return;
     }
-    lastPolicySignature = signature;
+    repair = withPolicySignature(repair, signature);
     pi.sendMessage(
       {
         customType: SENTINEL_MESSAGE_TYPE,
@@ -888,103 +831,73 @@ export default function (pi: ExtensionAPI) {
     // Measured against the scope as it stands *before* this attempt can set
     // it: the first failing turn defines the scope, later attempts are judged
     // against it.
-    const scopeEscape =
-      recovery.scopeGuard !== "off" && recoveryScope
-        ? (args.touchedPaths ?? []).filter((path) => !recoveryScope!.has(path))
-        : [];
+    const scopeEscape = scopeEscapeOf(repair, args.touchedPaths, recovery.scopeGuard);
 
-    // "The remaining delta stops changing" (Codex's stop condition) needs a
-    // stable subject: a turn that changed nothing still refers to the files of
-    // the previous attempt, so both are hashed over the same path set.
-    const deltaPaths =
-      args.focusPaths.length > 0
-        ? args.focusPaths
-        : lastInjectedPaths.length > 0
-          ? lastInjectedPaths
-          : args.focusPaths;
-    const stateHash = stateHashOf(deltaPaths);
+    // The state the stop condition is judged against. A turn that changed
+    // nothing still refers to the files of the previous attempt, so both are
+    // hashed over the same path set.
+    const deltaPaths = deltaPathsOf(repair, args.focusPaths);
+    const stateHash = stateHashOf([...deltaPaths]);
 
-    let action: AutoFixAction = "none";
-    let attemptInfo: { attempt: number; max: number; stopped?: boolean } | undefined;
+    const decision = decideRepair(repair, {
+      recoverable:
+        recovery.enabled && !failure.warnOnly && !isInfrastructureFailure(failure.failureKind),
+      maxAttempts: recovery.maxAttempts,
+      scopeGuard: recovery.scopeGuard,
+      rollbackAfterExhaustion: recovery.rollbackAfterExhaustion,
+      step: failure.step,
+      stateHash,
+      paths: deltaPaths,
+      checkpointId: args.checkpointId,
+    });
+    repair = decision.state;
 
-    if (recovery.enabled && !failure.warnOnly && !isInfrastructureFailure(failure.failureKind)) {
-      if (lastInjectedStateHash === stateHash) {
-        action = "stop-unchanged";
-        recordAutoFix({
+    // The effects the decision asked for. Everything below is I/O or host
+    // interaction; nothing here makes a policy choice of its own.
+    if (decision.restoreCheckpointId) {
+      // Bounded recovery: the attempt budget is spent, so return to the state
+      // before the first turn of this failing cycle — neither the agent nor
+      // the user should inherit a half-finished edit.
+      //
+      // `force` on purpose: the conflict check refuses to overwrite a file
+      // that changed after the checkpoint, which is exactly the set of
+      // intermediate repair attempts this restore is meant to discard. Only
+      // files in the checkpoint are touched, so unrelated work stays.
+      const report = checkpoints.restore(args.cwd, decision.restoreCheckpointId, { force: true });
+      if (report.attempted) {
+        args.outcome.rolledBack = !report.partial;
+        args.outcome.conflicts = report.conflicts;
+        recordRollback({
           at: new Date().toISOString(),
-          step: failure.step,
-          attempt: autoFixAttempts,
-          outcome: "stopped",
-          reason: "identical code state",
+          branch: "checkpoint",
+          head: decision.restoreCheckpointId,
+          reason: `recovery-exhausted:${failure.step}`,
+          method: "checkpoint:recovery",
         });
-      } else if (autoFixAttempts + 1 > recovery.maxAttempts) {
-        action = "exhausted";
-        // Bounded recovery: the attempt budget is spent. Optionally return to
-        // the state before the first turn of this failing cycle, so neither
-        // the agent nor the user inherits a half-finished edit.
-        if (recovery.rollbackAfterExhaustion && recoveryStartCheckpointId) {
-          // `force` on purpose: the conflict check refuses to overwrite a file
-          // that changed after the checkpoint, which is exactly the set of
-          // intermediate repair attempts this restore is meant to discard.
-          // Only files in the checkpoint are touched, so unrelated work stays.
-          const report = checkpoints.restore(args.cwd, recoveryStartCheckpointId, { force: true });
-          if (report.attempted) {
-            args.outcome.rolledBack = !report.partial;
-            args.outcome.conflicts = report.conflicts;
-            recordRollback({
-              at: new Date().toISOString(),
-              branch: "checkpoint",
-              head: recoveryStartCheckpointId,
-              reason: `recovery-exhausted:${failure.step}`,
-              method: "checkpoint:recovery",
-            });
-            recordMetrics({ rollbacks: 1, partialRollbacks: report.partial ? 1 : 0 });
-            args.ctx.ui.notify(
-              `Sentinel: recovery exhausted — restored the state before the failing cycle (${describeRestore(report)}).`,
-              "warning",
-            );
-          }
-        }
-        recoveryStartCheckpointId = null;
-        recordAutoFix({
-          at: new Date().toISOString(),
-          step: failure.step,
-          attempt: autoFixAttempts,
-          outcome: "exhausted",
-          reason: `recovery.maxAttempts=${recovery.maxAttempts}`,
-        });
-      } else {
-        autoFixAttempts += 1;
-        // Remember where this failing cycle began: exhaustion restores from
-        // here, not from the last attempt.
-        if (recoveryStartCheckpointId === null && args.checkpointId) {
-          recoveryStartCheckpointId = args.checkpointId;
-        }
-        // The first attempt of a cycle fixes what the cycle may touch.
-        if (recoveryScope === null && recovery.scopeGuard !== "off") {
-          recoveryScope = new Set(deltaPaths);
-        }
-        lastInjectedStateHash = stateHash;
-        lastInjectedPaths = deltaPaths;
-        attemptInfo = { attempt: autoFixAttempts, max: recovery.maxAttempts };
-        action = "inject";
-        recordAutoFix({
-          at: new Date().toISOString(),
-          step: failure.step,
-          attempt: autoFixAttempts,
-          outcome: "injected",
-          reason: failure.step,
-        });
+        recordMetrics({ rollbacks: 1, partialRollbacks: report.partial ? 1 : 0 });
+        args.ctx.ui.notify(
+          `Sentinel: recovery exhausted — restored the state before the failing cycle (${describeRestore(report)}).`,
+          "warning",
+        );
       }
+    }
+
+    const auditOutcome = autoFixOutcomeOf(decision.action);
+    if (auditOutcome) {
+      recordAutoFix({
+        at: new Date().toISOString(),
+        step: failure.step,
+        attempt: repair.attempts,
+        outcome: auditOutcome,
+        reason: decision.reason,
+      });
     }
 
     const text = renderFailure(
       args.outcome,
       args.focusPaths,
       args.cwd,
-      action === "stop-unchanged"
-        ? { attempt: autoFixAttempts, max: recovery.maxAttempts, stopped: true }
-        : attemptInfo,
+      decision.attempt,
       stateHash,
       scopeEscape,
     );
@@ -996,7 +909,7 @@ export default function (pi: ExtensionAPI) {
       );
     }
 
-    if (action === "inject") {
+    if (decision.action === "inject") {
       pi.sendMessage(
         {
           customType: SENTINEL_MESSAGE_TYPE,
@@ -1005,14 +918,14 @@ export default function (pi: ExtensionAPI) {
           details: {
             step: failure.step,
             stateHash,
-            attempt: attemptInfo?.attempt,
-            max: attemptInfo?.max,
+            attempt: decision.attempt?.attempt,
+            max: decision.attempt?.max,
           },
         },
         { deliverAs: "followUp", triggerTurn: true },
       );
       args.ctx.ui.notify(
-        `Sentinel: ${failure.step} failed — re-prompting the agent (attempt ${autoFixAttempts}/${recovery.maxAttempts})`,
+        `Sentinel: ${failure.step} failed — re-prompting the agent (attempt ${repair.attempts}/${decision.maxAttempts})`,
         "warning",
       );
       return;
@@ -1020,15 +933,15 @@ export default function (pi: ExtensionAPI) {
 
     args.ctx.ui.notify(text, "error");
 
-    if (action === "stop-unchanged") {
+    if (decision.action === "stop-unchanged") {
       resetRepairBudget();
       args.ctx.ui.notify(
         "Sentinel: the code state did not change since the last repair attempt — stopping the loop instead of repeating it.",
         "warning",
       );
-    } else if (action === "exhausted") {
+    } else if (decision.action === "exhausted") {
       args.ctx.ui.notify(
-        `Sentinel: ${recovery.maxAttempts} recovery attempts exhausted — reporting instead of editing further.`,
+        `Sentinel: ${decision.maxAttempts} recovery attempts exhausted — reporting instead of editing further.`,
         "warning",
       );
     } else if (isInfrastructureFailure(failure.failureKind)) {
@@ -1289,7 +1202,7 @@ export default function (pi: ExtensionAPI) {
         }
         // A clean turn reopens the policy stop, so a later identical violation
         // is reported to the agent again.
-        lastPolicySignature = null;
+        repair = withPolicySignature(repair, null);
       } catch {
         // A policy bug must never block verification: report nothing and let
         // the normal pipeline decide.
@@ -1440,7 +1353,7 @@ export default function (pi: ExtensionAPI) {
       // Never drop the turn. Skipping it would let unverified code reach the
       // user with no trace at all — the silent version of exactly the failure
       // this guard exists to prevent.
-      pendingBackground = mergeBackgroundRequests(pendingBackground, args);
+      background = foldBackgroundRequest(background, args);
       args.ctx.ui.notify(
         "Sentinel: a background verification is still running — this turn was folded into the next run.",
         "info",
@@ -1528,9 +1441,9 @@ export default function (pi: ExtensionAPI) {
         backgroundRun = null;
         args.ctx.ui.setStatus("sentinel", undefined);
         // A turn that arrived while this one ran is now owed a verification.
-        const queued = pendingBackground;
-        pendingBackground = null;
-        if (queued) startBackgroundChecks(queued);
+        const next = takeBackgroundRequest(background);
+        background = next.slot;
+        if (next.request) startBackgroundChecks(next.request);
       }
     })();
   }
@@ -1563,10 +1476,10 @@ export default function (pi: ExtensionAPI) {
     const contract = revisionContractText(conf, contractEvidence(ctx.cwd, conf));
     if (contract) lines.push("", contract);
 
-    if (autoFixAttempts > 0) {
+    if (repair.attempts > 0) {
       lines.push(
         "",
-        `Repair budget carried over: attempt ${autoFixAttempts} of ${recovery.maxAttempts} in the cycle that is still open. Compaction does not reset it.`,
+        `Repair budget carried over: attempt ${repair.attempts} of ${recovery.maxAttempts} in the cycle that is still open. Compaction does not reset it.`,
       );
     }
 
@@ -1576,7 +1489,7 @@ export default function (pi: ExtensionAPI) {
           customType: SENTINEL_NOTICE_TYPE,
           content: lines.join("\n"),
           display: false,
-          details: { compaction: true, attempt: autoFixAttempts },
+          details: { compaction: true, attempt: repair.attempts },
         },
         { deliverAs: "nextTurn", triggerTurn: false },
       );
@@ -1644,9 +1557,9 @@ export default function (pi: ExtensionAPI) {
    * is the whole test.
    */
   function injectedTraceIsStale(): boolean {
-    if (lastInjectedStateHash === null || lastInjectedPaths.length === 0) return false;
+    if (repair.injectedPaths.length === 0) return false;
     try {
-      return stateHashOf(lastInjectedPaths) !== lastInjectedStateHash;
+      return traceIsStale(repair, stateHashOf([...repair.injectedPaths]));
     } catch {
       return false;
     }

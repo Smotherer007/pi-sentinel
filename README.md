@@ -865,6 +865,7 @@ Test coverage by module:
 | `tests/spill.test.ts` | output budget, head/tail preview, spill-to-file fallback |
 | `tests/feedback.test.ts` | composed failure payload, regression + impact sections, budget cap |
 | `tests/contract.test.ts` | revision contract content and switches |
+| `tests/repair.test.ts` | the repair loop's stop conditions and the background slot, as pure data |
 | `tests/smoke.test.ts` | imports, tool schemas, graceful non-repo behaviour |
 
 The extension suite drives the real factory against a fake `ExtensionAPI`, so the paths that only
@@ -892,6 +893,12 @@ src/clients/
   workspace.ts         out-of-band change detection (P3)
   spill.ts             output budget & spill-to-file (P5)
   mindplace.ts         code-graph impact adapter
+  policy.ts            change-policy engine (P7)
+  queue.ts             coalescing verification runs (P6)
+  repair.ts            the repair loop's state & stop conditions (P0 + P8)
+  background.ts        the turn-end run slot (P5)
+  cache.ts             verification result reuse (P6)
+  escalation.ts        repeated-failure tracker (P6)
   rollback.ts          rollback strategy orchestration
 src/formatting/
   pruner.ts            pure trace pruning & failure formatting
@@ -899,6 +906,23 @@ src/formatting/
 src/prompt/
   contract.ts          revision contract (P4)
 ```
+
+### The repair loop is data, not a closure
+
+The loop that makes sentinel useful is also the one that can do damage, so what
+bounds it is worth being able to test on its own. `src/clients/repair.ts` holds
+the loop's entire memory as one plain value (`RepairState`: attempts spent, the
+code state already re-prompted for, the file set the cycle is about, where the
+cycle began) plus a single pure transition, `decideRepair(state, redTurn)`,
+which returns the next state and the decision together.
+
+Nothing in that module reads a file, writes one or talks to the host. The
+effects a decision asks for — restoring the cycle's start checkpoint,
+re-prompting the agent, notifying the human — are performed by the caller. The
+three stop conditions (not a repair target, the state did not move, the budget
+is spent) are therefore a truth table with unit tests
+(`tests/repair.test.ts`) instead of something only observable by driving the
+whole extension against a fake host.
 
 ## License
 
