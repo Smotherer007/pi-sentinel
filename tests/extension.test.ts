@@ -1811,6 +1811,44 @@ describe("P5 — output budget and background checks", () => {
     assert.match(String(delivered?.messages?.[0]?.content), /\[sentinel\] STALE:/);
   });
 
+  test("a green run clears a stall, so a later failure is reported again", async () => {
+    const marker = path.join(project, "fixed.marker");
+    fs.rmSync(marker, { force: true });
+
+    // The step reads a marker outside the verified set, so the *code* never
+    // changes: the state hash stays identical while the verdict flips. That is
+    // the only way to tell "the loop stopped for this state" apart from "the
+    // state moved", and it is the case the stall fix exists for.
+    await configure({
+      autoRollback: false,
+      backgroundTurnEnd: false,
+      include: ["**/*.ts"],
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [{ name: "gate", cmd: "test -f fixed.marker", timeoutMs: 5000 }],
+      },
+    });
+
+    const reds = () =>
+      fake.sent.filter((sent) => sent.message?.details?.attempt !== undefined).length;
+
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+    assert.equal(reds(), 1, "the first failure is reported and re-prompted");
+
+    await runTurn(2, "src/a.ts", "export const a = 1;\n");
+    assert.equal(reds(), 1, "a failure over the same state says nothing the second time");
+
+    // Green, with the *same* state hash: the fix came from outside the code.
+    fs.writeFileSync(marker, "1");
+    await runTurn(3, "src/a.ts", "export const a = 1;\n");
+
+    // And broken again, same code. A stall that outlived its fix would swallow
+    // this — sentinel would be permanently deaf to a real, repeating failure.
+    fs.rmSync(marker);
+    await runTurn(4, "src/a.ts", "export const a = 1;\n");
+    assert.equal(reds(), 2, "a failure after a green run is reported again");
+  });
+
   test("a retired session does not start another background check", async () => {
     await configure({
       autoRollback: false,

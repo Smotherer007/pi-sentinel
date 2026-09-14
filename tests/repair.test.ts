@@ -172,13 +172,18 @@ describe("the stop conditions", () => {
     assert.equal(moved.state.attempts, 2, "and it is charged to the same cycle");
   });
 
-  test("a green turn or a user message clears the stall", () => {
+  test("a stall is part of the cycle state, so a reset clears it", () => {
     let state = decideRepair(initialRepairState(), input()).state;
     state = decideRepair(state, input()).state;
     assert.notEqual(state.stalledStateHash, null);
 
-    // Both paths go through the same reset.
+    // Both production paths — a real user message and a green run — end a cycle
+    // by rebuilding it from `initialRepairState`, which is where the stall
+    // lives. That is the whole lift mechanism; the two paths themselves are
+    // asserted end to end in `extension.test.ts` ("a green run clears a stall"),
+    // because a unit test here could only assert a constant.
     assert.equal(initialRepairState().stalledStateHash, null);
+    assert.equal(initialRepairState().injectedStateHash, null);
   });
 
   test("the budget bounds the loop", () => {
