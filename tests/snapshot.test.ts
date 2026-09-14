@@ -88,6 +88,31 @@ describe("SnapshotStore.rollbackTurn", () => {
   });
 });
 
+describe("SnapshotStore and symlinks", () => {
+  test("a restore never replaces a link with a regular file", () => {
+    // The invariant: restoring a symlink's *target bytes* at the link path would
+    // replace the link with a copy while the real target stays changed — a
+    // corrupt state that looks like a successful restore. `readSnapshot` marks a
+    // link incomplete for exactly this reason; this is the test that was missing.
+    const store = new SnapshotStore();
+    const target = path.join(dir, "link-target.txt");
+    const link = path.join(dir, "link.txt");
+    fs.writeFileSync(target, "target content");
+    fs.rmSync(link, { force: true });
+    fs.symlinkSync(target, link);
+
+    store.captureCall("call-link", link);
+    store.captureTurn(link);
+    fs.writeFileSync(target, "changed through the link");
+
+    const report = store.rollbackCall("call-link");
+    assert.equal(fs.lstatSync(link).isSymbolicLink(), true, "the link must still be a link");
+    assert.equal(fs.readlinkSync(link), target);
+    assert.deepEqual(report.restored, [], "nothing was restored, and nothing was claimed");
+    assert.deepEqual(report.skipped, [link], "the link is reported as skipped, not silently ignored");
+  });
+});
+
 describe("SnapshotStore.promoteCall", () => {
   test("a speculative call snapshot becomes the turn's pre-state", () => {
     const store = new SnapshotStore();

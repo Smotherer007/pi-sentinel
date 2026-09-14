@@ -1849,6 +1849,37 @@ describe("P5 — output budget and background checks", () => {
     assert.equal(reds(), 2, "a failure after a green run is reported again");
   });
 
+  test("a retired session does not spawn a mutation check either", async () => {
+    // Same invariant as the background one, reached through the other door: the
+    // mutation queue runs after retirement unless it asks, and a spawn is a
+    // spawn whatever asked for it.
+    await configure({
+      autoRollback: false,
+      backgroundTurnEnd: false,
+      include: ["**/*.ts"],
+      pipelines: {
+        onFileMutation: [
+          {
+            name: "marker",
+            cmd: "node -e \"require('fs').writeFileSync('mutation-ran.marker','x')\"",
+            timeoutMs: 5000,
+          },
+        ],
+        onTurnEnd: [],
+      },
+    });
+    fs.rmSync(path.join(project, "mutation-ran.marker"), { force: true });
+
+    await emit(fake, "session_shutdown", { type: "session_shutdown" }, ctx);
+    await mutate("src/a.ts", "export const a = 1;\n");
+
+    assert.equal(
+      fs.existsSync(path.join(project, "mutation-ran.marker")),
+      false,
+      "nothing is spawned for a session that can no longer be answered",
+    );
+  });
+
   test("a retired session does not start another background check", async () => {
     await configure({
       autoRollback: false,
