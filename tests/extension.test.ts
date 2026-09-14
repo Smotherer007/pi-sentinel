@@ -1212,15 +1212,29 @@ describe("a trace stops being current when the code moves", () => {
     );
   }
 
-  test("the live trace is marked stale once its files change", async () => {
+  test("the live trace stops being current once its files change", async () => {
     const result = await redTurnThenContext(() => {
       fs.writeFileSync(path.join(project, "src/a.ts"), "export const a = 2;\n");
     });
 
     assert.ok(result?.messages, "the context is rewritten");
     const body = String(result.messages[1].content);
-    assert.ok(body.includes("STALE"), "the agent is told the result is out of date");
-    assert.ok(body.includes("error TS2322"), "the diagnostics themselves are kept");
+    // Replaced, not prefixed. A stale verdict is not a hint with a caveat: its
+    // line numbers and error text describe a tree that no longer exists, which is
+    // the documented way a repair loop ends up revising code against evidence
+    // bound to an earlier state. So the model gets the notice and nothing else —
+    // the payload stays in the session for the person reading it (asserted in the
+    // delivery test), and a fresh verdict arrives from the next run anyway.
+    assert.equal(body, STALE_TRACE_NOTICE, "the model is given the notice, not the payload");
+    assert.equal(
+      body.includes("error TS2322"),
+      false,
+      "stale diagnostics are not handed to the model as current",
+    );
+    assert.ok(
+      String(fake.sent[0].message.content).includes("error TS2322"),
+      "and the session still holds them for the human",
+    );
   });
 
   test("an unchanged tree leaves the live trace alone", async () => {
