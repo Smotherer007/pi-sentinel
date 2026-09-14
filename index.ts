@@ -1178,6 +1178,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
         conf.autoRollback ? "auto-rollback" : null,
         conf.trackVerifiedState ? "evidence" : null,
         conf.detectOutOfBand ? "out-of-band" : null,
+        conf.bash.enabled && conf.bash.mode !== "off" ? `shell guard (${conf.bash.mode})` : null,
         mutationQueue.debouncing ? `debounce ${conf.verification.debounceMs}ms` : null,
         conf.verification.cache.enabled ? "cache" : null,
         conf.verification.failureEscalation.enabled ? "escalation" : null,
