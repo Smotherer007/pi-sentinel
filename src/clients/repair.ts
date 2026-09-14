@@ -68,6 +68,19 @@ export interface RepairState {
    * it shares the lifecycle: a new user message or a green turn reopens it.
    */
   readonly policySignature: string | null;
+  /**
+   * The code state a cycle already gave up on.
+   *
+   * Stopping used to *clear* the loop's memory, which erased the very record
+   * that had detected the stall: the next red turn found no hash to compare
+   * against, re-prompted, stalled again, cleared again. A live session turned
+   * `maxAttempts: 2` into eight alternating inject/stop cycles that way — the
+   * guard's own reset was the thing keeping the loop alive.
+   *
+   * A stall is therefore remembered rather than forgotten. It is lifted the
+   * only two ways a cycle should end: a real user message, or a green run.
+   */
+  readonly stalledStateHash: string | null;
 }
 
 /** The state a fresh cycle starts from — also the reset after a green turn. */
@@ -79,6 +92,7 @@ export function initialRepairState(): RepairState {
     startCheckpointId: null,
     scope: null,
     policySignature: null,
+    stalledStateHash: null,
   };
 }
 
@@ -174,9 +188,23 @@ export function decideRepair(state: RepairState, input: RepairInput): RepairDeci
     };
   }
 
-  if (state.injectedStateHash !== null && state.injectedStateHash === input.stateHash) {
+  // Already given up on exactly this state: say nothing at all. Repeating the
+  // report every turn would be noise, and re-deciding would restart the loop.
+  if (state.stalledStateHash !== null && state.stalledStateHash === input.stateHash) {
     return {
       state,
+      action: "none",
+      maxAttempts: max,
+      reason: "the loop already stopped for this code state",
+      restoreCheckpointId: null,
+    };
+  }
+
+  if (state.injectedStateHash !== null && state.injectedStateHash === input.stateHash) {
+    return {
+      // The stall is recorded, not cleared. Everything else is kept so a later
+      // turn cannot mistake an abandoned cycle for a fresh one.
+      state: { ...state, stalledStateHash: input.stateHash },
       action: "stop-unchanged",
       maxAttempts: max,
       reason: "identical code state",
@@ -212,6 +240,9 @@ export function decideRepair(state: RepairState, input: RepairInput): RepairDeci
       // Likewise the scope is set by the first attempt and never widened.
       scope: state.scope ?? (input.scopeGuard === "off" ? null : unique(input.paths)),
       policySignature: state.policySignature,
+      // A genuinely new state is worth an attempt, so the old stall no longer
+      // describes anything.
+      stalledStateHash: null,
     },
     action: "inject",
     maxAttempts: max,

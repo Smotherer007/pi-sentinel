@@ -1312,7 +1312,9 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     args.ctx.ui.notify(text, "error");
 
     if (decision.action === "stop-unchanged") {
-      resetRepairBudget();
+      // Deliberately *not* resetRepairBudget(): clearing the loop's memory here
+      // is what used to restart it. The stall is recorded in the state instead,
+      // and only a user message or a green run reopens the cycle.
       args.ctx.ui.notify(
         "Sentinel: the code state did not change since the last repair attempt — stopping the loop instead of repeating it.",
         "warning",

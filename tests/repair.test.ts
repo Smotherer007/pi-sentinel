@@ -121,8 +121,64 @@ describe("the stop conditions", () => {
 
     assert.equal(again.action, "stop-unchanged");
     assert.deepEqual(again.attempt, { attempt: 1, max: 3, stopped: true });
-    assert.equal(again.state, first.state, "a turn that said nothing new spends nothing");
     assert.equal(again.reason, "identical code state");
+    assert.equal(
+      again.state.attempts,
+      first.state.attempts,
+      "a turn that said nothing new spends nothing",
+    );
+    assert.equal(
+      again.state.stalledStateHash,
+      first.state.injectedStateHash,
+      "the stall is recorded rather than forgotten",
+    );
+  });
+
+  test("a stalled cycle stays stalled", () => {
+    // The regression this exists for: stopping used to clear the loop's memory,
+    // so the next red turn found no hash to compare against and re-prompted —
+    // stall, clear, re-prompt, stall. A live session turned `maxAttempts: 2`
+    // into eight alternating cycles that way, and no unit test saw it because
+    // none of them drove a *third* red turn over an unchanged tree.
+    let state = initialRepairState();
+    const actions: string[] = [];
+
+    for (let turn = 0; turn < 6; turn += 1) {
+      const decision = decideRepair(state, input());
+      actions.push(decision.action);
+      state = decision.state;
+    }
+
+    assert.deepEqual(
+      actions,
+      ["inject", "stop-unchanged", "none", "none", "none", "none"],
+      "one attempt, one report, then silence",
+    );
+    assert.equal(
+      actions.filter((a) => a === "inject").length,
+      1,
+      "the agent is woken exactly once for a state that never moves",
+    );
+  });
+
+  test("a genuinely new state reopens the loop after a stall", () => {
+    let state = decideRepair(initialRepairState(), input()).state;
+    state = decideRepair(state, input()).state; // stalls here
+
+    const moved = decideRepair(state, input({ stateHash: "moved" }));
+
+    assert.equal(moved.action, "inject", "real progress is still worth an attempt");
+    assert.equal(moved.state.stalledStateHash, null, "the old stall no longer describes anything");
+    assert.equal(moved.state.attempts, 2, "and it is charged to the same cycle");
+  });
+
+  test("a green turn or a user message clears the stall", () => {
+    let state = decideRepair(initialRepairState(), input()).state;
+    state = decideRepair(state, input()).state;
+    assert.notEqual(state.stalledStateHash, null);
+
+    // Both paths go through the same reset.
+    assert.equal(initialRepairState().stalledStateHash, null);
   });
 
   test("the budget bounds the loop", () => {
