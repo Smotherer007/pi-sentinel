@@ -243,10 +243,6 @@ function emptyState(): SentinelState {
   };
 }
 
-let state: SentinelState = emptyState();
-let activeConfig: SentinelConfig = DEFAULT_CONFIG;
-let stateScope: string | null = null;
-
 // ── Path resolution ───────────────────────────────────────────────────────
 
 export function homeDir(): string {
@@ -263,26 +259,16 @@ export function scopeKey(cwd: string): string {
 
 /**
  * Per-project directory for everything sentinel persists: state, checkpoints,
- * verified states and spilled output. Derived from the cwd rather than from
- * `stateScope`, so helpers can be called before `loadConfig()` ran.
+ * verified states and spilled output. Derived from the cwd itself rather than
+ * from the store's scope, so helpers can be called before any load ran.
  */
 export function projectDir(cwd: string): string {
   return path.join(homeDir(), ".pi", "sentinel-state", scopeKey(cwd));
 }
 
-function statePath(): string {
-  return path.join(homeDir(), ".pi", "sentinel-state", `${stateScope ?? "global"}.json`);
-}
-
-/**
- * Point the state store at a project. Reloads persisted state when the
- * scope actually changes, so switching sessions never shows stale history.
- */
-export function setStateScope(cwd: string): void {
-  const key = scopeKey(cwd);
-  if (key === stateScope) return;
-  stateScope = key;
-  loadState();
+/** Where a project's runtime state is persisted. `null` is the global file. */
+function statePath(scope: string | null): string {
+  return path.join(homeDir(), ".pi", "sentinel-state", `${scope ?? "global"}.json`);
 }
 
 // ── Config loading ────────────────────────────────────────────────────────
@@ -366,191 +352,239 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 }
 
 /**
- * Load configuration. Tries, in order:
- *   1. `sentinel.config.ts` in cwd
- *   2. `sentinel.config.js` in cwd
- *   3. `~/.sentinel.config.ts`
- *   4. Defaults
+ * ConfigStore — one session's configuration and its runtime state.
  *
- * Config files are imported dynamically (ESM), so they can contain code.
+ * Both used to be module-level: an `activeConfig`, a `state` record, and a
+ * `stateScope` that the last `loadConfig()` had set. That made the store
+ * process-wide, so two sessions in one process wrote their history into
+ * whichever state file the other had loaded last — and it is why the extension
+ * could not be exercised in a test without `_resetForTesting` and
+ * `_setConfigForTesting` seeding the globals.
+ *
+ * As a value it is created once per session (see `src/runtime.ts`) and handed
+ * to whatever needs it: the extension, the pipeline runner, the tools.
+ *
+ * The pure configuration helpers deliberately stay free functions —
+ * `defineConfig`, `policyOf`, `recoveryOf`, `shouldVerify`, `projectDir` and
+ * friends take the configuration they need as an argument and hold no session
+ * state.
  */
-export async function loadConfig(cwd: string): Promise<SentinelConfig> {
-  setStateScope(cwd);
+export class ConfigStore {
+  private active: SentinelConfig = DEFAULT_CONFIG;
+  private current: SentinelState = emptyState();
+  private scope: string | null = null;
 
-  const candidates = [
-    path.join(cwd, "sentinel.config.ts"),
-    path.join(cwd, "sentinel.config.js"),
-    path.join(homeDir(), ".sentinel.config.ts"),
-  ];
+  /** The configuration in force for this session. */
+  config(): SentinelConfig {
+    return this.active;
+  }
 
-  for (const file of candidates) {
-    if (!fs.existsSync(file)) continue;
-    try {
-      // Cache-bust by *content*, not by mtime. Node's ESM loader caches by URL,
-      // and mtime has inconsistent resolution across filesystems (coarse on
-      // some CI containers and network mounts). Two edits inside one mtime tick
-      // would then silently keep the old config — the hash cannot collide that
-      // way, and an unchanged file is still served from the module cache.
-      const stamp = createHash("sha1")
-        .update(fs.readFileSync(file))
-        .digest("hex")
-        .slice(0, 16);
-      const url = pathToFileURL(file);
-      url.searchParams.set("v", stamp);
-      const mod = await import(url.href);
-      const raw = mod.default ?? mod.config;
-      if (raw && typeof raw === "object") {
-        activeConfig = normaliseConfig(deepMerge(DEFAULT_CONFIG, raw as Partial<SentinelConfig>), raw as SentinelConfigInput);
-        // Report dangerous values early and by name. They are *not* silently
-        // repaired: the user should see exactly what is wrong and fix it.
-        for (const problem of configProblems(activeConfig)) {
-          console.warn(`[sentinel] config: ${problem}`);
+  /** Adopt a configuration value directly (programmatic setup, tests). */
+  use(config: SentinelConfig): void {
+    this.active = config;
+  }
+
+  /**
+   * Load configuration. Tries, in order:
+   *   1. `sentinel.config.ts` in cwd
+   *   2. `sentinel.config.js` in cwd
+   *   3. `~/.sentinel.config.ts`
+   *   4. Defaults
+   *
+   * Config files are imported dynamically (ESM), so they can contain code.
+   *
+   * Also points the runtime state at `cwd`, reloading the persisted history
+   * when the scope actually changes so that switching projects never shows
+   * another project's record.
+   */
+  async load(cwd: string): Promise<SentinelConfig> {
+    this.setScope(cwd);
+
+    const candidates = [
+      path.join(cwd, "sentinel.config.ts"),
+      path.join(cwd, "sentinel.config.js"),
+      path.join(homeDir(), ".sentinel.config.ts"),
+    ];
+
+    for (const file of candidates) {
+      if (!fs.existsSync(file)) continue;
+      try {
+        // Cache-bust by *content*, not by mtime. Node's ESM loader caches by URL,
+        // and mtime has inconsistent resolution across filesystems (coarse on
+        // some CI containers and network mounts). Two edits inside one mtime tick
+        // would then silently keep the old config — the hash cannot collide that
+        // way, and an unchanged file is still served from the module cache.
+        const stamp = createHash("sha1")
+          .update(fs.readFileSync(file))
+          .digest("hex")
+          .slice(0, 16);
+        const url = pathToFileURL(file);
+        url.searchParams.set("v", stamp);
+        const mod = await import(url.href);
+        const raw = mod.default ?? mod.config;
+        if (raw && typeof raw === "object") {
+          this.active = normaliseConfig(
+            deepMerge(DEFAULT_CONFIG, raw as Partial<SentinelConfig>),
+            raw as SentinelConfigInput,
+          );
+          // Report dangerous values early and by name. They are *not* silently
+          // repaired: the user should see exactly what is wrong and fix it.
+          for (const problem of configProblems(this.active)) {
+            console.warn(`[sentinel] config: ${problem}`);
+          }
+          return this.active;
         }
-        return activeConfig;
+      } catch (err) {
+        console.warn(`[sentinel] Could not load config ${file}:`, err);
       }
-    } catch (err) {
-      console.warn(`[sentinel] Could not load config ${file}:`, err);
     }
+
+    this.active = DEFAULT_CONFIG;
+    return this.active;
   }
 
-  activeConfig = DEFAULT_CONFIG;
-  return activeConfig;
-}
+  /** The runtime state of the project this session is scoped to. */
+  state(): SentinelState {
+    return this.current;
+  }
 
-export function getConfig(): SentinelConfig {
-  return activeConfig;
-}
+  /**
+   * Point the state store at a project. Reloads persisted state when the
+   * scope actually changes, so switching sessions never shows stale history.
+   */
+  private setScope(cwd: string): void {
+    const key = scopeKey(cwd);
+    if (key === this.scope) return;
+    this.scope = key;
+    this.reload();
+  }
 
-// ── State persistence (atomic, permission-safe) ───────────────────────────
-
-function persistState(): void {
-  const filePath = statePath();
-  const dir = path.dirname(filePath);
-  const tmpPath = `${filePath}.${process.pid}.tmp`;
-  try {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    }
-    fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2), {
-      encoding: "utf-8",
-      mode: 0o600,
-    });
-    fs.chmodSync(tmpPath, 0o600);
-    fs.renameSync(tmpPath, filePath);
-  } catch (err) {
-    // Persisting history is an audit convenience, never a reason to fail a
-    // verification run or crash a hook. A full/read-only disk must not turn
-    // "checks passed" into an exception the agent sees.
+  /**
+   * Write the state file atomically and permission-safely. A failure to
+   * persist history is reported and swallowed: a full or read-only disk must
+   * never turn "checks passed" into an exception the agent sees.
+   */
+  private persist(): void {
+    const filePath = statePath(this.scope);
+    const dir = path.dirname(filePath);
+    const tmpPath = `${filePath}.${process.pid}.tmp`;
     try {
-      fs.unlinkSync(tmpPath);
-    } catch {
-      /* ignore */
-    }
-    console.warn("[sentinel] could not persist state:", err);
-  }
-}
-
-export function loadState(): void {
-  try {
-    const filePath = statePath();
-    if (fs.existsSync(filePath)) {
-      const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
-      if (raw && typeof raw === "object") {
-        state = {
-          rollbackHistory: Array.isArray(raw.rollbackHistory) ? raw.rollbackHistory : [],
-          lastVerifications: Array.isArray(raw.lastVerifications) ? raw.lastVerifications : [],
-          autoFixHistory: Array.isArray(raw.autoFixHistory) ? raw.autoFixHistory : [],
-          regressions: Array.isArray(raw.regressions) ? raw.regressions : [],
-          // Merge onto zeros: a state file from an older version has no
-          // counters at all, and a partial write must not yield NaN totals.
-          metrics: { ...emptyMetrics(), ...(raw.metrics ?? {}) },
-          turnHistory: Array.isArray(raw.turnHistory) ? raw.turnHistory : [],
-          escalations: Array.isArray(raw.escalations) ? raw.escalations : [],
-          policyViolations: Array.isArray(raw.policyViolations) ? raw.policyViolations : [],
-        };
-        return;
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       }
+      fs.writeFileSync(tmpPath, JSON.stringify(this.current, null, 2), {
+        encoding: "utf-8",
+        mode: 0o600,
+      });
+      fs.chmodSync(tmpPath, 0o600);
+      fs.renameSync(tmpPath, filePath);
+    } catch (err) {
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch {
+        /* ignore */
+      }
+      console.warn("[sentinel] could not persist state:", err);
     }
-  } catch {
-    /* fall through to a clean state */
   }
-  state = emptyState();
-}
 
-// ── State accessors & mutations ───────────────────────────────────────────
-
-export function getState(): SentinelState {
-  return state;
-}
-
-export function recordRollback(entry: SentinelState["rollbackHistory"][number]): void {
-  state.rollbackHistory.unshift(entry);
-  if (state.rollbackHistory.length > 50) state.rollbackHistory.pop();
-  persistState();
-}
-
-/** Batch variant: persists once instead of once per step. */
-export function recordVerifications(entries: SentinelState["lastVerifications"]): void {
-  if (entries.length === 0) return;
-  for (const entry of entries) state.lastVerifications.unshift(entry);
-  if (state.lastVerifications.length > 20) state.lastVerifications.length = 20;
-  persistState();
-}
-
-export function recordVerification(entry: SentinelState["lastVerifications"][number]): void {
-  recordVerifications([entry]);
-}
-
-/** P0: log an auto-fix decision (injected / stopped / exhausted). */
-export function recordAutoFix(entry: SentinelState["autoFixHistory"][number]): void {
-  state.autoFixHistory.unshift(entry);
-  if (state.autoFixHistory.length > 20) state.autoFixHistory.length = 20;
-  persistState();
-}
-
-/** P2: log a regressed file (optionally one that was reverted). */
-export function recordRegression(entry: SentinelState["regressions"][number]): void {
-  state.regressions.unshift(entry);
-  if (state.regressions.length > 20) state.regressions.length = 20;
-  persistState();
-}
-
-/** P6: add a batch of counters (one call per verification run). */
-export function recordMetrics(delta: Partial<SentinelMetrics>): void {
-  for (const [key, value] of Object.entries(delta)) {
-    if (typeof value !== "number" || !Number.isFinite(value)) continue;
-    const current = state.metrics[key as keyof SentinelMetrics] ?? 0;
-    state.metrics[key as keyof SentinelMetrics] = current + value;
+  /** Read the persisted state for the current scope, or start clean. */
+  private reload(): void {
+    try {
+      const filePath = statePath(this.scope);
+      if (fs.existsSync(filePath)) {
+        const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+        if (raw && typeof raw === "object") {
+          this.current = {
+            rollbackHistory: Array.isArray(raw.rollbackHistory) ? raw.rollbackHistory : [],
+            lastVerifications: Array.isArray(raw.lastVerifications) ? raw.lastVerifications : [],
+            autoFixHistory: Array.isArray(raw.autoFixHistory) ? raw.autoFixHistory : [],
+            regressions: Array.isArray(raw.regressions) ? raw.regressions : [],
+            // Merge onto zeros: a state file from an older version has no
+            // counters at all, and a partial write must not yield NaN totals.
+            metrics: { ...emptyMetrics(), ...(raw.metrics ?? {}) },
+            turnHistory: Array.isArray(raw.turnHistory) ? raw.turnHistory : [],
+            escalations: Array.isArray(raw.escalations) ? raw.escalations : [],
+            policyViolations: Array.isArray(raw.policyViolations) ? raw.policyViolations : [],
+          };
+          return;
+        }
+      }
+    } catch {
+      /* fall through to a clean state */
+    }
+    this.current = emptyState();
   }
-  persistState();
-}
 
-/** P6: log a failure that repeated often enough to escalate. */
-export function recordEscalation(entry: SentinelState["escalations"][number]): void {
-  state.escalations.unshift(entry);
-  if (state.escalations.length > 20) state.escalations.length = 20;
-  persistState();
-}
-
-/** Change policy: log a violation (rule ids + the files it concerned). */
-export function recordPolicyViolation(entry: SentinelState["policyViolations"][number]): void {
-  state.policyViolations.unshift(entry);
-  if (state.policyViolations.length > 20) state.policyViolations.length = 20;
-  persistState();
-}
-
-/** P6: record the outcome of a turn, for the compact history block. */
-export function recordTurnOutcome(entry: SentinelState["turnHistory"][number]): void {
-  const newest = state.turnHistory[0];
-  // A turn can produce several runs (mutation + turn end). Keep the newest,
-  // but never append a second line for the same turn index and outcome.
-  if (newest && newest.turnIndex === entry.turnIndex && newest.passed === entry.passed) {
-    state.turnHistory[0] = entry;
-  } else {
-    state.turnHistory.unshift(entry);
+  recordRollback(entry: SentinelState["rollbackHistory"][number]): void {
+    this.current.rollbackHistory.unshift(entry);
+    if (this.current.rollbackHistory.length > 50) this.current.rollbackHistory.pop();
+    this.persist();
   }
-  if (state.turnHistory.length > 20) state.turnHistory.length = 20;
-  persistState();
+
+  /** Batch variant: persists once instead of once per step. */
+  recordVerifications(entries: SentinelState["lastVerifications"]): void {
+    if (entries.length === 0) return;
+    for (const entry of entries) this.current.lastVerifications.unshift(entry);
+    if (this.current.lastVerifications.length > 20) this.current.lastVerifications.length = 20;
+    this.persist();
+  }
+
+  recordVerification(entry: SentinelState["lastVerifications"][number]): void {
+    this.recordVerifications([entry]);
+  }
+
+  /** P0: log an auto-fix decision (injected / stopped / exhausted). */
+  recordAutoFix(entry: SentinelState["autoFixHistory"][number]): void {
+    this.current.autoFixHistory.unshift(entry);
+    if (this.current.autoFixHistory.length > 20) this.current.autoFixHistory.length = 20;
+    this.persist();
+  }
+
+  /** P2: log a regressed file (optionally one that was reverted). */
+  recordRegression(entry: SentinelState["regressions"][number]): void {
+    this.current.regressions.unshift(entry);
+    if (this.current.regressions.length > 20) this.current.regressions.length = 20;
+    this.persist();
+  }
+
+  /** P6: add a batch of counters (one call per verification run). */
+  recordMetrics(delta: Partial<SentinelMetrics>): void {
+    for (const [key, value] of Object.entries(delta)) {
+      if (typeof value !== "number" || !Number.isFinite(value)) continue;
+      const current = this.current.metrics[key as keyof SentinelMetrics] ?? 0;
+      this.current.metrics[key as keyof SentinelMetrics] = current + value;
+    }
+    this.persist();
+  }
+
+  /** P6: log a failure that repeated often enough to escalate. */
+  recordEscalation(entry: SentinelState["escalations"][number]): void {
+    this.current.escalations.unshift(entry);
+    if (this.current.escalations.length > 20) this.current.escalations.length = 20;
+    this.persist();
+  }
+
+  /** Change policy: log a violation (rule ids + the files it concerned). */
+  recordPolicyViolation(entry: SentinelState["policyViolations"][number]): void {
+    this.current.policyViolations.unshift(entry);
+    if (this.current.policyViolations.length > 20) this.current.policyViolations.length = 20;
+    this.persist();
+  }
+
+  /** P6: record the outcome of a turn, for the compact history block. */
+  recordTurnOutcome(entry: SentinelState["turnHistory"][number]): void {
+    const newest = this.current.turnHistory[0];
+    // A turn can produce several runs (mutation + turn end). Keep the newest,
+    // but never append a second line for the same turn index and outcome.
+    if (newest && newest.turnIndex === entry.turnIndex && newest.passed === entry.passed) {
+      this.current.turnHistory[0] = entry;
+    } else {
+      this.current.turnHistory.unshift(entry);
+    }
+    if (this.current.turnHistory.length > 20) this.current.turnHistory.length = 20;
+    this.persist();
+  }
 }
 
 // ── Glob matching ─────────────────────────────────────────────────────────
@@ -739,16 +773,4 @@ export function configProblems(config: SentinelConfig): string[] {
     problems.push("verification.cache.maxEntries <= 0 leaves the cache unbounded");
   }
   return problems;
-}
-
-/** @internal Reset internals — for testing only */
-export function _resetForTesting(): void {
-  state = emptyState();
-  activeConfig = DEFAULT_CONFIG;
-  stateScope = null;
-}
-
-/** @internal Override the active config — for testing only */
-export function _setConfigForTesting(config: SentinelConfig): void {
-  activeConfig = config;
 }

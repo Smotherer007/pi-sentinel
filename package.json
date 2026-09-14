@@ -8,6 +8,7 @@
   "exports": {
     ".": "./index.ts",
     "./src/config.ts": "./src/config.ts",
+    "./src/runtime.ts": "./src/runtime.ts",
     "./src/types.ts": "./src/types.ts",
     "./package.json": "./package.json"
   },

@@ -14,7 +14,6 @@ import { allVerified } from "../clients/evidence.ts";
 import { graphStatus } from "../clients/mindplace.ts";
 import { peekVerificationCache } from "../clients/cache.ts";
 import { metricsLines, turnHistoryLines, verificationLines } from "../formatting/status.ts";
-import { getConfig, getState } from "../config.ts";
 
 export function createSentinelStatusTool(runtime: SentinelRuntime) {
   return {
@@ -31,10 +30,10 @@ export function createSentinelStatusTool(runtime: SentinelRuntime) {
       _onUpdate: unknown,
       ctx?: { cwd: string },
     ) {
-      const conf = getConfig();
+      const conf = runtime.config.config();
       const cwd = ctx?.cwd ?? process.cwd();
       const repo = GitClient.gitMeta(cwd);
-      const state = getState();
+      const state = runtime.config.state();
 
       const gitOk = repo
         ? `Git: ${repo.branch} @ ${repo.head}`

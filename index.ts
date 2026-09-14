@@ -35,7 +35,9 @@
  *     transition (clients/repair.ts), so this file only performs the effects a
  *     decision asks for
  *   - Each capability is a single-responsibility tool module (tools/)
- *   - Config/state in config.ts with atomic, permission-safe persistence
+ *   - Config/state lives in `ConfigStore` and everything a session owns in
+ *     `SentinelRuntime`, both created here and handed down as values
+ *     (config.ts, runtime.ts) with atomic, permission-safe persistence
  *
  * This file is the wiring: it registers the tools and commands, maps host
  * hooks onto the clients, and decides nothing that a client could decide.
@@ -124,23 +126,14 @@ import { metricsLines, turnHistoryLines } from "./src/formatting/status.ts";
 import { redactEnv } from "./src/formatting/redact.ts";
 import { revisionContractText } from "./src/prompt/contract.ts";
 import {
-  loadConfig,
-  getConfig,
   shouldVerify,
-  getState,
-  recordRollback,
-  recordAutoFix,
-  recordRegression,
-  recordMetrics,
-  recordEscalation,
-  recordPolicyViolation,
-  recordTurnOutcome,
   projectDir,
   policyOf,
   recoveryOf,
 } from "./src/config.ts";
 import type {
   FailureKind,
+  SentinelConfig,
   PipelineRunResult,
   PolicyReport,
   Regression,
@@ -149,6 +142,7 @@ import type {
 } from "./src/types.ts";
 
 import { createRuntime } from "./src/runtime.ts";
+import type { SentinelRuntime } from "./src/runtime.ts";
 import { createSentinelVerifyTool } from "./src/tools/sentinel-verify.ts";
 import { createSentinelRollbackTool } from "./src/tools/sentinel-rollback.ts";
 import { createSentinelRewindTool } from "./src/tools/sentinel-rewind.ts";
@@ -267,11 +261,19 @@ interface MutationRequest {
   toolCallIds: string[];
 }
 
-export default function (pi: ExtensionAPI) {
+/**
+ * The host calls this with the extension API alone.
+ *
+ * A runtime may be injected instead: it is the session's whole state, so a test
+ * can assert on what the extension recorded without reading a global, and an
+ * embedder can hand two extensions the same session.
+ */
+export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } = {}) {
   // Every store that belongs to *this* session. Created here rather than at
-  // module scope, so a second session in the same process gets its own turn
-  // snapshots, its own checkpoints and its own failure counters.
-  const runtime = createRuntime();
+  // module scope, so a second session in the same process gets its own
+  // configuration, its own turn snapshots, its own checkpoints and its own
+  // failure counters.
+  const runtime = deps.runtime ?? createRuntime();
   // ── Repair-loop bookkeeping (P0 + P8) ───────────────────────────────────
   //
   // The loop's memory is one plain value in src/clients/repair.ts, so its stop
@@ -332,12 +334,12 @@ export default function (pi: ExtensionAPI) {
   /**
    * Resolve configuration on every session event (cwd-aware). We reload
    * each time so editing `sentinel.config.ts` takes effect without a pi
-   * restart — loadConfig cache-busts the module by its file content.
+   * restart — `ConfigStore.load` cache-busts the module by its file content.
    */
   async function ensureConfig(cwd: string): Promise<void> {
-    await loadConfig(cwd);
+    await runtime.config.load(cwd);
     // The debounce window is configuration, and configuration can change.
-    mutationQueue.setDebounce(getConfig().verification.debounceMs);
+    mutationQueue.setDebounce(runtime.config.config().verification.debounceMs);
   }
 
   /**
@@ -346,7 +348,7 @@ export default function (pi: ExtensionAPI) {
    * Reading it is best-effort: an unreadable ledger costs the contract one
    * sentence, never the turn.
    */
-  function contractEvidence(cwd: string, conf: ReturnType<typeof getConfig>) {
+  function contractEvidence(cwd: string, conf: SentinelConfig) {
     if (!conf.trackVerifiedState) return {};
     try {
       const entries = currentlyVerified(cwd);
@@ -368,7 +370,7 @@ export default function (pi: ExtensionAPI) {
    * being buried under unrelated output.
    */
   function focusFor(cwd: string, paths: string[]): string[] {
-    const conf = getConfig();
+    const conf = runtime.config.config();
     if (!conf.impactAwareFocus || paths.length === 0) return paths;
     try {
       return expandWithDependents(cwd, paths, MAX_IMPACT_FOCUS);
@@ -417,7 +419,7 @@ export default function (pi: ExtensionAPI) {
   function refuseMutation(
     target: string,
     cwd: string,
-    conf: ReturnType<typeof getConfig>,
+    conf: SentinelConfig,
   ): { reason: string; summary: string } | null {
     const abs = absPath(target, cwd);
     if (isSentinelArtifact(cwd, abs)) return null;
@@ -428,12 +430,12 @@ export default function (pi: ExtensionAPI) {
       const kind = forbiddenKind(rel, policy);
       if (kind) {
         const violation = violationFor(kind, rel);
-        recordPolicyViolation({
+        runtime.config.recordPolicyViolation({
           at: new Date().toISOString(),
           rules: [violation.rule],
           files: [rel],
         });
-        recordMetrics({ policyViolations: 1 });
+        runtime.config.recordMetrics({ policyViolations: 1 });
         return {
           summary: `${rel} is protected (${violation.rule})`,
           reason:
@@ -477,14 +479,14 @@ export default function (pi: ExtensionAPI) {
     ctx: { ui: ExtensionUIContext };
     focusPaths: string[];
   }): void {
-    const policy = policyOf(getConfig());
+    const policy = policyOf(runtime.config.config());
     const files = [...new Set(args.report.violations.flatMap((v) => v.paths))];
-    recordPolicyViolation({
+    runtime.config.recordPolicyViolation({
       at: new Date().toISOString(),
       rules: args.report.violations.map((v) => v.rule),
       files,
     });
-    recordMetrics({ policyViolations: 1 });
+    runtime.config.recordMetrics({ policyViolations: 1 });
 
     let rolledBack = false;
     if (policy.rollbackOnViolation) {
@@ -496,7 +498,7 @@ export default function (pi: ExtensionAPI) {
           "error",
         );
       } else if (rb.success) {
-        recordRollback({
+        runtime.config.recordRollback({
           at: new Date().toISOString(),
           branch: rb.branch ?? "unknown",
           head: rb.committedAt ?? "unknown",
@@ -542,7 +544,7 @@ export default function (pi: ExtensionAPI) {
 
   function notifyWarnings(ctx: { ui: ExtensionUIContext }, warnings: PipelineRunResult["warnings"], cwd: string): void {
     if (warnings.length === 0) return;
-    const conf = getConfig();
+    const conf = runtime.config.config();
     const detail = warnings
       .map((w) => `${w.step} (exit ${w.exitCode}):\n${w.prunedTrace}`)
       .join("\n");
@@ -593,8 +595,8 @@ export default function (pi: ExtensionAPI) {
     /** Bypass the verification cache (explicit runs). */
     skipCache?: boolean;
   }): Promise<VerificationOutcome> {
-    const conf = getConfig();
-    const runner = new PipelineRunner();
+    const conf = runtime.config.config();
+    const runner = new PipelineRunner(runtime.config);
     const run = await runner.runAll(args.trigger, args.cwd, {
       focusPaths: args.focusPaths,
       changedFiles: args.changedPaths,
@@ -682,10 +684,10 @@ export default function (pi: ExtensionAPI) {
       rolledBack = rb.success;
       conflicts = rb.conflicts ?? [];
       restoreSkipped = rb.skipped ?? [];
-      recordMetrics({ rollbacks: 1, partialRollbacks: rb.partial ? 1 : 0 });
+      runtime.config.recordMetrics({ rollbacks: 1, partialRollbacks: rb.partial ? 1 : 0 });
       // The rollback *was* attempted, so it belongs in the history even when
       // it came back partial — that is exactly the case a user must know about.
-      recordRollback({
+      runtime.config.recordRollback({
         at: new Date().toISOString(),
         branch: rb.branch ?? "unknown",
         head: rb.committedAt ?? "unknown",
@@ -732,7 +734,7 @@ export default function (pi: ExtensionAPI) {
         if (!postHashes.has(regression.path)) return regression;
         if (hashFile(regression.path) !== postHashes.get(regression.path)) return regression;
         if (!revertToVerified(args.cwd, regression.path)) return regression;
-        recordRegression({
+        runtime.config.recordRegression({
           at: new Date().toISOString(),
           path: regression.path,
           verifiedAt: regression.verifiedAt,
@@ -758,14 +760,14 @@ export default function (pi: ExtensionAPI) {
     let escalation: { count: number; max: number } | undefined;
     if (escalationSettings.enabled && shouldEscalate(seen, escalationSettings.maxRepeatedFailures)) {
       escalation = { count: seen, max: escalationSettings.maxRepeatedFailures };
-      recordEscalation({
+      runtime.config.recordEscalation({
         at: new Date().toISOString(),
         step: failure.step,
         kind: failure.failureKind,
         count: seen,
         signature: failure.signature,
       });
-      recordMetrics({ escalations: 1 });
+      runtime.config.recordMetrics({ escalations: 1 });
     }
 
     notifyWarnings(args.ctx, run.warnings, args.cwd);
@@ -800,7 +802,7 @@ export default function (pi: ExtensionAPI) {
     stateHashOverride?: string,
     scopeEscape?: string[],
   ): string {
-    const conf = getConfig();
+    const conf = runtime.config.config();
     const failure = outcome.failure!;
     return buildFailureFeedback({
       cwd,
@@ -847,7 +849,7 @@ export default function (pi: ExtensionAPI) {
     /** Files the agent itself wrote this turn, for the cycle scope check. */
     touchedPaths?: string[];
   }): void {
-    const conf = getConfig();
+    const conf = runtime.config.config();
     const recovery = recoveryOf(conf);
     const failure = args.outcome.failure!;
 
@@ -890,14 +892,14 @@ export default function (pi: ExtensionAPI) {
       if (report.attempted) {
         args.outcome.rolledBack = !report.partial;
         args.outcome.conflicts = report.conflicts;
-        recordRollback({
+        runtime.config.recordRollback({
           at: new Date().toISOString(),
           branch: "checkpoint",
           head: decision.restoreCheckpointId,
           reason: `recovery-exhausted:${failure.step}`,
           method: "checkpoint:recovery",
         });
-        recordMetrics({ rollbacks: 1, partialRollbacks: report.partial ? 1 : 0 });
+        runtime.config.recordMetrics({ rollbacks: 1, partialRollbacks: report.partial ? 1 : 0 });
         args.ctx.ui.notify(
           `Sentinel: recovery exhausted — restored the state before the failing cycle (${describeRestore(report)}).`,
           "warning",
@@ -907,7 +909,7 @@ export default function (pi: ExtensionAPI) {
 
     const auditOutcome = autoFixOutcomeOf(decision.action);
     if (auditOutcome) {
-      recordAutoFix({
+      runtime.config.recordAutoFix({
         at: new Date().toISOString(),
         step: failure.step,
         attempt: repair.attempts,
@@ -986,7 +988,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     await ensureConfig(ctx.cwd);
     resetRepairBudget();
-    const conf = getConfig();
+    const conf = runtime.config.config();
     if (conf.enabled) {
       const extras = [
         conf.autoFix ? "auto-fix" : null,
@@ -1007,7 +1009,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event, ctx) => {
     await ensureConfig(ctx.cwd);
-    const conf = getConfig();
+    const conf = runtime.config.config();
     if (!conf.enabled) return;
 
     const contract = revisionContractText(conf, contractEvidence(ctx.cwd, conf));
@@ -1032,7 +1034,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_start", async (event, ctx) => {
     runtime.snapshots.beginTurn();
     await ensureConfig(ctx.cwd);
-    const conf = getConfig();
+    const conf = runtime.config.config();
     if (!conf.enabled) return;
 
     // P3 — what was already dirty before the agent did anything. Without this
@@ -1066,7 +1068,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_call", async (event: ToolCallEvent, ctx) => {
     await ensureConfig(ctx.cwd);
-    const conf = getConfig();
+    const conf = runtime.config.config();
     if (!conf.enabled) return;
 
     const isMutation =
@@ -1085,7 +1087,7 @@ export default function (pi: ExtensionAPI) {
       const refusal = refuseMutation(target, ctx.cwd, conf);
       if (refusal) {
         ctx.ui.notify(`Sentinel refused a write: ${refusal.summary}`, "error");
-        recordMetrics({ blockedWrites: 1 });
+        runtime.config.recordMetrics({ blockedWrites: 1 });
         return { block: true, reason: refusal.reason };
       }
     }
@@ -1107,7 +1109,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_result", async (event: ToolResultEvent, ctx) => {
     await ensureConfig(ctx.cwd);
-    const conf = getConfig();
+    const conf = runtime.config.config();
     if (!conf.enabled) return;
 
     const isMutation = event.toolName === "edit" || event.toolName === "write";
@@ -1180,7 +1182,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("turn_end", async (event, ctx) => {
     await ensureConfig(ctx.cwd);
-    const conf = getConfig();
+    const conf = runtime.config.config();
 
     // Everything below must read the turn scope *before* it is cleared.
     const turnPaths = runtime.snapshots.turnPaths();
@@ -1303,7 +1305,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    recordTurnOutcome({
+    runtime.config.recordTurnOutcome({
       at: new Date().toISOString(),
       turnIndex: turnIndexOf(event),
       passed: outcome.passed,
@@ -1391,7 +1393,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const conf = getConfig();
+    const conf = runtime.config.config();
     args.ctx.ui.setStatus("sentinel", "Checks running in background…");
 
     backgroundRun = (async () => {
@@ -1428,7 +1430,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        recordTurnOutcome({
+        runtime.config.recordTurnOutcome({
           at: new Date().toISOString(),
           turnIndex: -1,
           passed: false,
@@ -1444,7 +1446,7 @@ export default function (pi: ExtensionAPI) {
           const report = runtime.checkpoints.restore(args.cwd, args.checkpointId);
           if (report.attempted) {
             outcome.rolledBack = !report.partial;
-            recordRollback({
+            runtime.config.recordRollback({
               at: new Date().toISOString(),
               branch: "unknown",
               head: "checkpoint",
@@ -1493,7 +1495,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_compact", async (_event, ctx) => {
     await ensureConfig(ctx.cwd);
-    const conf = getConfig();
+    const conf = runtime.config.config();
     if (!conf.enabled) return;
 
     const recovery = recoveryOf(conf);
@@ -1534,7 +1536,7 @@ export default function (pi: ExtensionAPI) {
   // newest trace live and marks older ones superseded.
 
   pi.on("context", async (event) => {
-    const conf = getConfig();
+    const conf = runtime.config.config();
     if (!conf.enabled || !conf.pruneStaleTraces) return;
 
     const messages = event.messages as unknown as Array<Record<string, unknown>>;
@@ -1605,7 +1607,7 @@ export default function (pi: ExtensionAPI) {
     },
     handler: async (args, ctx) => {
       await ensureConfig(ctx.cwd);
-      const conf = getConfig();
+      const conf = runtime.config.config();
       const [sub = "help"] = (args ?? "").trim().split(/\s+/);
 
       switch (sub) {
@@ -1614,7 +1616,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         case "verify": {
-          const runner = new PipelineRunner();
+          const runner = new PipelineRunner(runtime.config);
           const run = await runner.runAll("onFileMutation", ctx.cwd);
           ctx.ui.setWidget(
             "sentinel",
@@ -1625,7 +1627,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         case "test": {
-          const runner = new PipelineRunner();
+          const runner = new PipelineRunner(runtime.config);
           const run = await runner.runAll("onTurnEnd", ctx.cwd);
           ctx.ui.setWidget(
             "sentinel",
@@ -1726,7 +1728,7 @@ export default function (pi: ExtensionAPI) {
     if (action === "Code only" || action === "Code and conversation") {
       const report = runtime.checkpoints.restore(ctx.cwd, checkpoint.id);
       if (report.attempted) {
-        recordRollback({
+        runtime.config.recordRollback({
           at: new Date().toISOString(),
           branch: GitClient.gitMeta(ctx.cwd)?.branch ?? "unknown",
           head: checkpoint.id,
@@ -1772,9 +1774,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** Read-only status lines, shared by the command and kept testable. */
-  function statusLines(cwd: string, conf: ReturnType<typeof getConfig>): string[] {
+  function statusLines(cwd: string, conf: SentinelConfig): string[] {
     const repo = GitClient.gitMeta(cwd);
-    const state = getState();
+    const state = runtime.config.state();
     const latest = runtime.checkpoints.latest(cwd);
 
     const lines = [

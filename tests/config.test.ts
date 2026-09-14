@@ -1,4 +1,4 @@
-import { test, describe, before, after } from "node:test";
+import { test, describe, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -10,18 +10,12 @@ import {
   isExcluded,
   shouldVerify,
   matchesGlob,
-  loadConfig,
-  getConfig,
+  ConfigStore,
   priorityOf,
   stepMatchesFiles,
   stepPhaseMatches,
-  getState,
-  recordMetrics,
-  recordEscalation,
-  recordTurnOutcome,
   policyOf,
   recoveryOf,
-  _resetForTesting,
 } from "../src/config.ts";
 import type { SentinelConfig } from "../src/types.ts";
 
@@ -39,6 +33,17 @@ before(() => {
 after(() => {
   fs.rmSync(home, { recursive: true, force: true });
   fs.rmSync(project, { recursive: true, force: true });
+});
+
+/**
+ * One store per test. It used to be `_resetForTesting()` on a module-level
+ * record — the write half of the state file, the read half, and the active
+ * configuration all belonged to the process rather than to a session.
+ */
+let store: ConfigStore;
+
+beforeEach(() => {
+  store = new ConfigStore();
 });
 
 describe("defineConfig", () => {
@@ -264,8 +269,11 @@ describe("shouldVerify", () => {
   });
 });
 
-test("reset helper restores defaults", () => {
-  _resetForTesting();
+test("a fresh store starts from the defaults", () => {
+  // The old suite needed `_resetForTesting()` here to undo whatever the
+  // previous test had made the process-wide configuration.
+  store = new ConfigStore();
+  assert.equal(store.config(), DEFAULT_CONFIG);
   assert.equal(isExcluded("README.md", DEFAULT_CONFIG), true);
 });
 
@@ -280,27 +288,27 @@ describe("loadConfig", () => {
 
     fs.writeFileSync(file, "export default { maxTraceLines: 1 };\n", "utf-8");
     fs.utimesSync(file, fixed, fixed);
-    await loadConfig(project);
-    assert.equal(getConfig().maxTraceLines, 1);
+    await store.load(project);
+    assert.equal(store.config().maxTraceLines, 1);
 
     fs.writeFileSync(file, "export default { maxTraceLines: 2 };\n", "utf-8");
     fs.utimesSync(file, fixed, fixed);
-    await loadConfig(project);
-    assert.equal(getConfig().maxTraceLines, 2, "an unchanged mtime must not pin the old config");
+    await store.load(project);
+    assert.equal(store.config().maxTraceLines, 2, "an unchanged mtime must not pin the old config");
 
     fs.rmSync(file);
-    await loadConfig(project);
-    assert.equal(getConfig().maxTraceLines, DEFAULT_CONFIG.maxTraceLines);
+    await store.load(project);
+    assert.equal(store.config().maxTraceLines, DEFAULT_CONFIG.maxTraceLines);
   });
 
   test("re-reads an unchanged file without re-evaluating a stale module", async () => {
     const file = path.join(project, "sentinel.config.js");
     fs.writeFileSync(file, "export default { maxTraceLines: 9 };\n", "utf-8");
 
-    await loadConfig(project);
-    assert.equal(getConfig().maxTraceLines, 9);
-    await loadConfig(project);
-    assert.equal(getConfig().maxTraceLines, 9, "idempotent across events");
+    await store.load(project);
+    assert.equal(store.config().maxTraceLines, 9);
+    await store.load(project);
+    assert.equal(store.config().maxTraceLines, 9, "idempotent across events");
   });
 });
 
@@ -400,15 +408,14 @@ describe("stepMatchesFiles", () => {
 
 describe("P6 state persistence", () => {
   test("metrics start at zero and accumulate", () => {
-    _resetForTesting();
-    const state = getState();
+    const state = store.state();
     assert.equal(state.metrics.checks, 0);
     assert.equal(state.metrics.cacheHits, 0);
 
-    recordMetrics({ checks: 2, successes: 2, totalDurationMs: 100 });
-    recordMetrics({ checks: 1, failures: 1, timeouts: 1, totalDurationMs: 50 });
+    store.recordMetrics({ checks: 2, successes: 2, totalDurationMs: 100 });
+    store.recordMetrics({ checks: 1, failures: 1, timeouts: 1, totalDurationMs: 50 });
 
-    const after = getState();
+    const after = store.state();
     assert.equal(after.metrics.checks, 3);
     assert.equal(after.metrics.successes, 2);
     assert.equal(after.metrics.failures, 1);
@@ -417,27 +424,24 @@ describe("P6 state persistence", () => {
   });
 
   test("an unknown metric key is ignored, not written as NaN", () => {
-    _resetForTesting();
-    recordMetrics({ notAMetric: 5 } as never);
-    assert.equal(Number.isFinite(getState().metrics.checks), true);
+    store.recordMetrics({ notAMetric: 5 } as never);
+    assert.equal(Number.isFinite(store.state().metrics.checks), true);
   });
 
   test("turn outcomes are recorded newest-first and deduplicated per turn", () => {
-    _resetForTesting();
-    recordTurnOutcome({ at: "2026-01-01T00:00:00.000Z", turnIndex: 1, passed: true });
-    recordTurnOutcome({ at: "2026-01-01T00:01:00.000Z", turnIndex: 2, passed: false, step: "tests" });
-    recordTurnOutcome({ at: "2026-01-01T00:02:00.000Z", turnIndex: 2, passed: false, step: "lint" });
+    store.recordTurnOutcome({ at: "2026-01-01T00:00:00.000Z", turnIndex: 1, passed: true });
+    store.recordTurnOutcome({ at: "2026-01-01T00:01:00.000Z", turnIndex: 2, passed: false, step: "tests" });
+    store.recordTurnOutcome({ at: "2026-01-01T00:02:00.000Z", turnIndex: 2, passed: false, step: "lint" });
 
-    const state = getState();
+    const state = store.state();
     assert.equal(state.turnHistory.length, 2, "same turn + outcome replaces the entry");
     assert.equal(state.turnHistory[0].step, "lint");
     assert.equal(state.turnHistory[1].turnIndex, 1);
   });
 
   test("escalations are logged with a cap", () => {
-    _resetForTesting();
     for (let i = 0; i < 25; i += 1) {
-      recordEscalation({
+      store.recordEscalation({
         at: new Date().toISOString(),
         step: "tests",
         kind: "test-failure",
@@ -445,7 +449,62 @@ describe("P6 state persistence", () => {
         signature: `sig-${i}`,
       });
     }
-    assert.equal(getState().escalations.length, 20);
-    assert.equal(getState().escalations[0].signature, "sig-24");
+    assert.equal(store.state().escalations.length, 20);
+    assert.equal(store.state().escalations[0].signature, "sig-24");
+  });
+});
+
+describe("ConfigStore", () => {
+  test("two stores keep their own configuration", () => {
+    const a = new ConfigStore();
+    const b = new ConfigStore();
+
+    a.use(defineConfig({ maxTraceLines: 5 }));
+
+    assert.equal(a.config().maxTraceLines, 5);
+    assert.equal(
+      b.config().maxTraceLines,
+      DEFAULT_CONFIG.maxTraceLines,
+      "adopting a configuration is not a process-wide act",
+    );
+  });
+
+  test("state is scoped to the store, and persisted per project", async () => {
+    // The hazard this replaces: the state file was chosen by whichever
+    // `loadConfig()` had run last, so two sessions in one process wrote their
+    // history into each other's project.
+    const one = fs.mkdtempSync(path.join(os.tmpdir(), "sentinel-scope-one-"));
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), "sentinel-scope-two-"));
+    try {
+      const a = new ConfigStore();
+      const b = new ConfigStore();
+      await a.load(one);
+      await b.load(other);
+
+      a.recordMetrics({ checks: 3 });
+
+      assert.equal(a.state().metrics.checks, 3);
+      assert.equal(b.state().metrics.checks, 0, "a different scope reads its own file");
+
+      const reopened = new ConfigStore();
+      await reopened.load(one);
+      assert.equal(reopened.state().metrics.checks, 3, "and the record was persisted");
+    } finally {
+      fs.rmSync(one, { recursive: true, force: true });
+      fs.rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  test("loading the same scope twice does not discard the record", async () => {
+    const same = fs.mkdtempSync(path.join(os.tmpdir(), "sentinel-scope-same-"));
+    try {
+      const store = new ConfigStore();
+      await store.load(same);
+      store.recordMetrics({ checks: 2 });
+      await store.load(same);
+      assert.equal(store.state().metrics.checks, 2);
+    } finally {
+      fs.rmSync(same, { recursive: true, force: true });
+    }
   });
 });

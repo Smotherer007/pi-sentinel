@@ -25,14 +25,8 @@ import { isAbsolute, relative, resolve } from "node:path";
 import { pruneTrace, formatError } from "../formatting/pruner.ts";
 import { classifyFailure, failureSignature, summarizeFailure } from "../formatting/classify.ts";
 import { redactSecrets } from "../formatting/redact.ts";
-import {
-  getConfig,
-  recordMetrics,
-  recordVerifications,
-  priorityOf,
-  stepMatchesFiles,
-  stepPhaseMatches,
-} from "../config.ts";
+import { priorityOf, stepMatchesFiles, stepPhaseMatches } from "../config.ts";
+import type { ConfigStore } from "../config.ts";
 import { getVerificationCache, createCacheKey } from "./cache.ts";
 import type {
   FailureKind,
@@ -154,6 +148,17 @@ interface Attempt {
 
 export class PipelineRunner {
   /**
+   * The runner reads its configuration and writes its history through the
+   * session's store. It used to reach for a process-wide active configuration,
+   * which made a run impossible to describe without first mutating a global.
+   */
+  private readonly store: ConfigStore;
+
+  constructor(store: ConfigStore) {
+    this.store = store;
+  }
+
+  /**
    * Run all pipelines for a trigger type (onFileMutation | onTurnEnd).
    * Returns the full run summary, including successes, skips and non-blocking
    * `warnOnly` failures.
@@ -163,7 +168,7 @@ export class PipelineRunner {
     cwd: string,
     options: RunOptions = {},
   ): Promise<PipelineRunResult> {
-    const config = getConfig();
+    const config = this.store.config();
     const configured = config.pipelines[trigger] ?? [];
     const changedFiles = options.changedFiles ?? options.focusPaths ?? [];
 
@@ -185,11 +190,11 @@ export class PipelineRunner {
 
     const results: PipelineStepResult[] = [...skipped];
     const warnings: PipelineWarning[] = [];
-    const verificationLog: Parameters<typeof recordVerifications>[0] = [];
-    const metrics: Parameters<typeof recordMetrics>[0] = { skippedSteps: skipped.length };
+    const verificationLog: Parameters<ConfigStore["recordVerifications"]>[0] = [];
+    const metrics: Parameters<ConfigStore["recordMetrics"]>[0] = { skippedSteps: skipped.length };
 
     if (steps.length === 0) {
-      recordMetrics(metrics);
+      this.store.recordMetrics(metrics);
       return { passed: true, failure: null, warnings, steps: results };
     }
 
@@ -218,7 +223,7 @@ export class PipelineRunner {
       const hit = cache.get(cacheKey);
       if (hit) {
         metrics.cacheHits = 1;
-        recordMetrics(metrics);
+        this.store.recordMetrics(metrics);
         return {
           ...hit,
           cached: true,
@@ -341,8 +346,8 @@ export class PipelineRunner {
     } finally {
       // One atomic persist per run instead of one synchronous disk write
       // per step.
-      recordMetrics(metrics);
-      recordVerifications(verificationLog);
+      this.store.recordMetrics(metrics);
+      this.store.recordVerifications(verificationLog);
     }
   }
 
@@ -398,7 +403,7 @@ export class PipelineRunner {
     baseCwd: string,
     signal?: AbortSignal,
   ): Promise<CommandOutcome> {
-    const config = getConfig();
+    const config = this.store.config();
     const maxBytes = effectiveMaxOutputBytes(config.verification?.maxOutputBytes);
     const graceMs = config.verification?.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
     const startedAt = Date.now();

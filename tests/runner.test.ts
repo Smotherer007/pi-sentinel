@@ -1,4 +1,4 @@
-import { test, describe, before, after } from "node:test";
+import { test, describe, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -6,10 +6,12 @@ import * as path from "node:path";
 
 import { PipelineRunner } from "../src/clients/pipeline-runner.ts";
 import { _resetCacheForTesting } from "../src/clients/cache.ts";
-import { defineConfig, _setConfigForTesting } from "../src/config.ts";
+import { ConfigStore, defineConfig } from "../src/config.ts";
 
 let dir: string;
 let home: string;
+/** One store per test: the active configuration is session state now. */
+let store: ConfigStore;
 
 before(() => {
   // Keep state writes out of the real home directory.
@@ -24,8 +26,15 @@ after(() => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+beforeEach(() => {
+  store = new ConfigStore();
+});
+
 describe("PipelineRunner.execute", () => {
-  const runner = new PipelineRunner();
+  let runner: PipelineRunner;
+  beforeEach(() => {
+    runner = new PipelineRunner(store);
+  });
 
   test("reports exit 0 for a successful command", async () => {
     const outcome = await runner.execute({ name: "ok", cmd: "exit 0", timeoutMs: 5000 }, dir);
@@ -63,7 +72,7 @@ describe("PipelineRunner.execute", () => {
 
 describe("PipelineRunner.runAll", () => {
   test("returns a failure for a critical step", async () => {
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         maxTraceLines: 5,
         pipelines: {
@@ -72,7 +81,7 @@ describe("PipelineRunner.runAll", () => {
         },
       }),
     );
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     assert.equal(run.passed, false);
     assert.equal(run.failure?.step, "crit");
     assert.ok(run.failure?.prunedTrace.includes("error: nope"));
@@ -80,7 +89,7 @@ describe("PipelineRunner.runAll", () => {
   });
 
   test("collects warnOnly failures without failing the run", async () => {
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         pipelines: {
           onFileMutation: [
@@ -90,7 +99,7 @@ describe("PipelineRunner.runAll", () => {
         },
       }),
     );
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     assert.equal(run.passed, true);
     assert.equal(run.failure, null);
     assert.equal(run.warnings.length, 1);
@@ -98,20 +107,23 @@ describe("PipelineRunner.runAll", () => {
   });
 
   test("reports passed for an empty pipeline", async () => {
-    _setConfigForTesting(
+    store.use(
       defineConfig({ pipelines: { onFileMutation: [], onTurnEnd: [] } }),
     );
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     assert.equal(run.passed, true);
     assert.deepEqual(run.steps, []);
   });
 });
 
 describe("PipelineRunner hardening", () => {
-  const runner = new PipelineRunner();
+  let runner: PipelineRunner;
+  beforeEach(() => {
+    runner = new PipelineRunner(store);
+  });
 
   test("classifies a failing step and exposes the structured result", async () => {
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         pipelines: {
           onFileMutation: [
@@ -126,7 +138,7 @@ describe("PipelineRunner hardening", () => {
       }),
     );
 
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     assert.equal(run.passed, false);
     const failure = run.failure!;
     assert.equal(failure.failureKind, "type-error");
@@ -139,7 +151,7 @@ describe("PipelineRunner hardening", () => {
   });
 
   test("a timeout is reported as a timeout, not as a code error", async () => {
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         verification: { killGraceMs: 100 },
         pipelines: {
@@ -149,7 +161,7 @@ describe("PipelineRunner hardening", () => {
       }),
     );
 
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     const failure = run.failure!;
     assert.equal(failure.timedOut, true);
     assert.equal(failure.failureKind, "timeout");
@@ -176,7 +188,7 @@ describe("PipelineRunner hardening", () => {
   });
 
   test("applies the priority of a step: warning never fails the run", async () => {
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         pipelines: {
           onFileMutation: [
@@ -187,14 +199,14 @@ describe("PipelineRunner hardening", () => {
       }),
     );
 
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     assert.equal(run.passed, true);
     assert.equal(run.warnings.length, 1);
     assert.equal(run.warnings[0].failureKind, "lint-error");
   });
 
   test("warnOnly is still the same thing as priority warning", async () => {
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         pipelines: {
           onFileMutation: [{ name: "lint", cmd: "exit 1", timeoutMs: 5000, warnOnly: true }],
@@ -202,12 +214,12 @@ describe("PipelineRunner hardening", () => {
         },
       }),
     );
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     assert.equal(run.passed, true);
   });
 
   test("critical steps block the run", async () => {
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         pipelines: {
           onFileMutation: [{ name: "crit", cmd: "exit 1", timeoutMs: 5000, priority: "critical" }],
@@ -215,13 +227,13 @@ describe("PipelineRunner hardening", () => {
         },
       }),
     );
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     assert.equal(run.passed, false);
     assert.equal(run.failure?.priority, "critical");
   });
 
   test("skips steps whose phase does not match the trigger", async () => {
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         pipelines: {
           onFileMutation: [{ name: "tests", cmd: "exit 1", timeoutMs: 5000, phase: "turn" }],
@@ -230,14 +242,14 @@ describe("PipelineRunner hardening", () => {
       }),
     );
 
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     assert.equal(run.passed, true, "a turn-phase step must not run on a mutation");
     assert.equal(run.steps.length, 1);
     assert.ok(run.steps[0].skipped?.includes("phase"));
   });
 
   test("skips steps that do not match the changed files", async () => {
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         pipelines: {
           onFileMutation: [
@@ -251,18 +263,18 @@ describe("PipelineRunner hardening", () => {
     const doc = path.join(dir, "notes.txt");
     fs.writeFileSync(doc, "hello");
 
-    const skipped = await new PipelineRunner().runAll("onFileMutation", dir, { focusPaths: [doc] });
+    const skipped = await new PipelineRunner(store).runAll("onFileMutation", dir, { focusPaths: [doc] });
     assert.equal(skipped.passed, true);
     assert.ok(skipped.steps[0].skipped?.includes("no matching files"));
 
     const tsFile = path.join(dir, "a.ts");
     fs.writeFileSync(tsFile, "export const a = 1;");
-    const ran = await new PipelineRunner().runAll("onFileMutation", dir, { focusPaths: [tsFile] });
+    const ran = await new PipelineRunner(store).runAll("onFileMutation", dir, { focusPaths: [tsFile] });
     assert.equal(ran.passed, false, "a matching file runs the step");
   });
 
   test("a step without file patterns always runs", async () => {
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         pipelines: {
           onFileMutation: [{ name: "always", cmd: "exit 1", timeoutMs: 5000 }],
@@ -270,7 +282,7 @@ describe("PipelineRunner hardening", () => {
         },
       }),
     );
-    const run = await new PipelineRunner().runAll("onFileMutation", dir, {
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir, {
       focusPaths: [path.join(dir, "whatever.txt")],
     });
     assert.equal(run.passed, false);
@@ -284,7 +296,7 @@ describe("PipelineRunner hardening", () => {
     const cmd =
       "node -e \"const fs=require('fs');const f='counter.txt';const n=fs.existsSync(f)?Number(fs.readFileSync(f,'utf8')):0;fs.writeFileSync(f,String(n+1));process.exit(n===0?124:0)\"";
 
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         pipelines: {
           onFileMutation: [
@@ -300,7 +312,7 @@ describe("PipelineRunner hardening", () => {
       }),
     );
 
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     assert.equal(run.passed, true, "the second attempt succeeded");
     assert.equal(run.steps[0].attempts, 2);
   });
@@ -311,7 +323,7 @@ describe("PipelineRunner hardening", () => {
     const cmd =
       "node -e \"const fs=require('fs');const f='counter2.txt';const n=fs.existsSync(f)?Number(fs.readFileSync(f,'utf8')):0;fs.writeFileSync(f,String(n+1));console.log('error TS2322: boom');process.exit(1)\"";
 
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         pipelines: {
           onFileMutation: [
@@ -327,14 +339,14 @@ describe("PipelineRunner hardening", () => {
       }),
     );
 
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     assert.equal(run.passed, false);
     assert.equal(run.steps[0].attempts, 1, "a type error is not retried");
     assert.equal(fs.readFileSync(counter, "utf-8"), "1");
   });
 
   test("bounds the output buffer and announces the truncation", async () => {
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         verification: { maxOutputBytes: 200 },
         pipelines: {
@@ -350,14 +362,14 @@ describe("PipelineRunner hardening", () => {
       }),
     );
 
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     const output = run.failure!.rawOutput;
     assert.ok(output.length < 2000, `output must stay bounded, got ${output.length}`);
     assert.ok(output.includes("output truncated"));
   });
 
   test("redacts credentials from the step environment", async () => {
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         pipelines: {
           onFileMutation: [
@@ -373,13 +385,13 @@ describe("PipelineRunner hardening", () => {
       }),
     );
 
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     assert.equal(run.failure!.rawOutput.includes("super-secret-value-1234"), false);
     assert.ok(run.failure!.rawOutput.includes("[redacted]"));
   });
 
   test("refuses a working directory outside the project", async () => {
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         pipelines: {
           onFileMutation: [{ name: "escape", cmd: "pwd", timeoutMs: 5000, cwd: "../.." }],
@@ -388,7 +400,7 @@ describe("PipelineRunner hardening", () => {
       }),
     );
 
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     assert.equal(run.passed, false);
     assert.equal(run.failure!.failureKind, "environment-error");
     assert.ok(run.failure!.rawOutput.includes("escapes the project root"));
@@ -397,7 +409,7 @@ describe("PipelineRunner hardening", () => {
   test("accepts a working directory inside the project", async () => {
     const sub = path.join(dir, "nested");
     fs.mkdirSync(sub, { recursive: true });
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         pipelines: {
           onFileMutation: [{ name: "inside", cmd: "exit 0", timeoutMs: 5000, cwd: "nested" }],
@@ -406,7 +418,7 @@ describe("PipelineRunner hardening", () => {
       }),
     );
 
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     assert.equal(run.passed, true);
   });
 });
@@ -417,7 +429,7 @@ describe("PipelineRunner cache integration", () => {
     const file = path.join(dir, "cached.ts");
     fs.writeFileSync(file, "export const a = 1;\n");
 
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         verification: { cache: { enabled: true, persist: false, ttlMs: 0, maxEntries: 10 } },
         pipelines: {
@@ -427,11 +439,11 @@ describe("PipelineRunner cache integration", () => {
       }),
     );
 
-    const first = await new PipelineRunner().runAll("onFileMutation", dir, { focusPaths: [file] });
+    const first = await new PipelineRunner(store).runAll("onFileMutation", dir, { focusPaths: [file] });
     assert.equal(first.passed, true);
     assert.equal(first.cached, undefined);
 
-    const second = await new PipelineRunner().runAll("onFileMutation", dir, { focusPaths: [file] });
+    const second = await new PipelineRunner(store).runAll("onFileMutation", dir, { focusPaths: [file] });
     assert.equal(second.passed, true);
     assert.equal(second.cached, true);
     assert.equal(second.steps[0].cached, true);
@@ -442,7 +454,7 @@ describe("PipelineRunner cache integration", () => {
     const file = path.join(dir, "skipped.ts");
     fs.writeFileSync(file, "export const a = 1;\n");
 
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         verification: { cache: { enabled: true, persist: false, ttlMs: 0, maxEntries: 10 } },
         pipelines: {
@@ -452,8 +464,8 @@ describe("PipelineRunner cache integration", () => {
       }),
     );
 
-    await new PipelineRunner().runAll("onFileMutation", dir, { focusPaths: [file] });
-    const forced = await new PipelineRunner().runAll("onFileMutation", dir, {
+    await new PipelineRunner(store).runAll("onFileMutation", dir, { focusPaths: [file] });
+    const forced = await new PipelineRunner(store).runAll("onFileMutation", dir, {
       focusPaths: [file],
       skipCache: true,
     });
@@ -465,7 +477,7 @@ describe("PipelineRunner cache integration", () => {
     const file = path.join(dir, "flaky.ts");
     fs.writeFileSync(file, "export const a = 1;\n");
 
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         verification: { cache: { enabled: true, persist: false, ttlMs: 0, maxEntries: 10 } },
         pipelines: {
@@ -475,8 +487,8 @@ describe("PipelineRunner cache integration", () => {
       }),
     );
 
-    await new PipelineRunner().runAll("onFileMutation", dir, { focusPaths: [file] });
-    const again = await new PipelineRunner().runAll("onFileMutation", dir, { focusPaths: [file] });
+    await new PipelineRunner(store).runAll("onFileMutation", dir, { focusPaths: [file] });
+    const again = await new PipelineRunner(store).runAll("onFileMutation", dir, { focusPaths: [file] });
     assert.equal(again.cached, undefined, "a non-deterministic step is never reused");
   });
 
@@ -485,7 +497,7 @@ describe("PipelineRunner cache integration", () => {
     const file = path.join(dir, "changing.ts");
     fs.writeFileSync(file, "v1\n");
 
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         verification: { cache: { enabled: true, persist: false, ttlMs: 0, maxEntries: 10 } },
         pipelines: {
@@ -495,16 +507,16 @@ describe("PipelineRunner cache integration", () => {
       }),
     );
 
-    await new PipelineRunner().runAll("onFileMutation", dir, { focusPaths: [file] });
+    await new PipelineRunner(store).runAll("onFileMutation", dir, { focusPaths: [file] });
     fs.writeFileSync(file, "v2\n");
-    const after = await new PipelineRunner().runAll("onFileMutation", dir, { focusPaths: [file] });
+    const after = await new PipelineRunner(store).runAll("onFileMutation", dir, { focusPaths: [file] });
     assert.equal(after.cached, undefined, "new content is a new question");
   });
 });
 
 describe("PipelineRunner — missing commands and per-step pruning budget", () => {
   test("a missing command is a failure the agent can classify, never a crash", async () => {
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         pipelines: {
           onFileMutation: [
@@ -515,7 +527,7 @@ describe("PipelineRunner — missing commands and per-step pruning budget", () =
       }),
     );
 
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
 
     assert.equal(run.passed, false);
     assert.equal(run.failure?.failureKind, "command-not-found");
@@ -523,7 +535,7 @@ describe("PipelineRunner — missing commands and per-step pruning budget", () =
   });
 
   test("a step's maxTraceLines overrides the global pruner budget", async () => {
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         maxTraceLines: 10,
         pipelines: {
@@ -540,7 +552,7 @@ describe("PipelineRunner — missing commands and per-step pruning budget", () =
       }),
     );
 
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     const trace = run.failure?.prunedTrace ?? "";
 
     assert.equal(run.passed, false);
@@ -556,7 +568,7 @@ describe("PipelineRunner config safety", () => {
     // a ~1 ms setTimeout, which reported every healthy check as a timeout — and
     // with autoRollback on that undid a perfectly good change.
     for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, undefined]) {
-      _setConfigForTesting(
+      store.use(
         defineConfig({
           pipelines: {
             onFileMutation: [{ name: "healthy", cmd: "exit 0", timeoutMs: timeoutMs as number }],
@@ -565,7 +577,7 @@ describe("PipelineRunner config safety", () => {
         }),
       );
 
-      const run = await new PipelineRunner().runAll("onFileMutation", dir);
+      const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
       assert.equal(run.passed, false, `timeoutMs ${String(timeoutMs)} must not pass`);
       assert.equal(run.failure?.timedOut, false, "it is a config error, not a timeout");
       assert.equal(run.failure?.failureKind, "environment-error");
@@ -575,7 +587,7 @@ describe("PipelineRunner config safety", () => {
 
   test("a negative output cap cannot grow the buffer without bound", async () => {
     const script = `let i=0; const w=()=>{ if(i++<4000){ process.stdout.write("0123456789"); setImmediate(w);} else process.exit(1);}; w();`;
-    _setConfigForTesting(
+    store.use(
       defineConfig({
         verification: { maxOutputBytes: -1 },
         pipelines: {
@@ -585,7 +597,7 @@ describe("PipelineRunner config safety", () => {
       }),
     );
 
-    const run = await new PipelineRunner().runAll("onFileMutation", dir);
+    const run = await new PipelineRunner(store).runAll("onFileMutation", dir);
     const output = run.failure?.rawOutput ?? "";
     assert.ok(output.length < 2_000_000, `output must stay bounded, got ${output.length}`);
   });

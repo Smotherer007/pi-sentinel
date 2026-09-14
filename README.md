@@ -914,19 +914,25 @@ src/formatting/
   feedback.ts          composed model-visible failure payload
 src/prompt/
   contract.ts          revision contract (P4)
-src/runtime.ts         the stores one session owns, as a value
+src/runtime.ts        the stores one session owns, as a value (incl. ConfigStore)
 ```
 
 ### Session state is a value, not a module global
 
-Sentinel's stores that carry *per-session* state — the turn's pre-state snapshots, the checkpoint
-being captured, the repeated-failure counters — used to be module-level singletons. That made their
-lifetime the process rather than the session, which is invisible while a process holds exactly one
-session and a latent bug as soon as it does not; it also meant the tools could not be given a store at
-all, so tests had to reset the globals between cases.
+Everything sentinel remembers about *a session* — the configuration in force and the runtime state it
+is scoped to, the turn's pre-state snapshots, the checkpoint being captured, the repeated-failure
+counters — used to be module-level. That made its lifetime the process rather than the session, which
+is invisible while a process holds exactly one session and a latent bug as soon as it does not: the
+state file was chosen by whichever `loadConfig()` had run last, so two sessions wrote their history
+into each other's project. It also meant the tools could not be given a store at all, and tests had to
+reset the globals between cases (`_resetForTesting`, `_setConfigForTesting`).
 
-They are now one value, `SentinelRuntime` (`src/runtime.ts`), created per extension instance and
-handed to the tools, which are factories over it (`createSentinelStatusTool(runtime)`).
+It is now one value, `SentinelRuntime` (`src/runtime.ts`), created per extension instance and handed
+to the tools, which are factories over it (`createSentinelStatusTool(runtime)`). `PipelineRunner`
+takes the `ConfigStore` instead of reading an active configuration from a global, and
+`rollbackTurn`/`rollbackMutation` take the snapshot store as an argument. The extension factory accepts
+an optional runtime, so a test can assert on what the extension recorded without reaching into a
+global — and an embedder can hand two extensions one session.
 
 Deliberately *not* in the runtime: the caches keyed by project path (`clients/cache.ts`,
 `clients/mindplace.ts`, `clients/git-client.ts`). They are pure functions of the working tree — a graph

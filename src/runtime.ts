@@ -1,13 +1,14 @@
 /**
  * SentinelRuntime — the stores a sentinel session owns, as one plain value.
  *
- * Three of sentinel's stores carry real per-session state: the turn's pre-state
- * snapshots, the checkpoint currently being captured for the turn, and the
- * failure-signature counters that notice a repair loop. Each was a module-level
- * singleton, which meant two sessions in one process shared them — a rollback
- * could restore a file the *other* session had captured, and the same failure
- * seen three times in one project made the next session report a loop. Tests
- * had to reset the globals between cases.
+ * All of sentinel's per-session state is in here: the configuration in force
+ * and the runtime state it is scoped to, the turn's pre-state snapshots, the
+ * checkpoint currently being captured for the turn, and the failure-signature
+ * counters that notice a repair loop. Each was a module-level singleton, which
+ * made their lifetime the process rather than the session — two sessions in one
+ * process shared them, wrote history into whichever state file the other had
+ * loaded last, and a rollback could restore a file the other session captured.
+ * Tests had to reset the globals between cases.
  *
  * They are now one value, created once per extension instance and handed to the
  * tools that need it. That is the point of modelling session state as data: it
@@ -24,12 +25,15 @@
  * (`_clearCache`, `_clearRepoRootCache`, `_resetCacheForTesting`).
  */
 
+import { ConfigStore } from "./config.ts";
 import { SnapshotStore } from "./clients/snapshot.ts";
 import { CheckpointStore } from "./clients/checkpoints.ts";
 import { FailureEscalationTracker } from "./clients/escalation.ts";
 
 /** The per-session stores. One runtime belongs to one extension instance. */
 export interface SentinelRuntime {
+  /** The session's configuration and its runtime state (history, metrics). */
+  readonly config: ConfigStore;
   /** In-memory pre-state capture for the current turn (P0/P1). */
   readonly snapshots: SnapshotStore;
   /** Durable turn checkpoints (P1). */
@@ -41,6 +45,7 @@ export interface SentinelRuntime {
 /** A runtime with every store empty — a fresh session, or a test case. */
 export function createRuntime(): SentinelRuntime {
   return {
+    config: new ConfigStore(),
     snapshots: new SnapshotStore(),
     checkpoints: new CheckpointStore(),
     escalations: new FailureEscalationTracker(),

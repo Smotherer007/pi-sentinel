@@ -63,7 +63,7 @@ describe("smoke", () => {
   });
 
   test("PipelineRunner constructs", () => {
-    const runner = new PipelineRunner();
+    const runner = new PipelineRunner(runtime.config);
     assert.ok(runner);
   });
 

@@ -15,7 +15,6 @@ import { PipelineRunner } from "../clients/pipeline-runner.ts";
 import { rollbackTurn } from "../clients/rollback.ts";
 import { recordVerified, stateHashOf } from "../clients/evidence.ts";
 import { buildFailureFeedback } from "../formatting/feedback.ts";
-import { getConfig, recordMetrics, recordRollback } from "../config.ts";
 import type { FailureKind, RollbackConflict } from "../types.ts";
 
 /** One stable details shape across every return path. */
@@ -80,8 +79,8 @@ function detailsFor(extra: Partial<VerifyDetails> = {}): VerifyDetails {
       ctx?: { cwd: string },
     ) {
       const cwd = ctx?.cwd ?? process.cwd();
-      const config = getConfig();
-      const runner = new PipelineRunner();
+      const config = runtime.config.config();
+      const runner = new PipelineRunner(runtime.config);
       const trigger = params.trigger === "turn" ? "onTurnEnd" : "onFileMutation";
 
       // The files this turn touched are what a failure is actually about, so
@@ -144,8 +143,8 @@ function detailsFor(extra: Partial<VerifyDetails> = {}): VerifyDetails {
         conflicts = rb.conflicts ?? [];
         restoreSkipped = rb.skipped ?? [];
         rollbackMsg = `\n${rb.message}`;
-        recordMetrics({ rollbacks: 1, partialRollbacks: rb.partial ? 1 : 0 });
-        recordRollback({
+        runtime.config.recordMetrics({ rollbacks: 1, partialRollbacks: rb.partial ? 1 : 0 });
+        runtime.config.recordRollback({
           at: new Date().toISOString(),
           branch: rb.branch ?? "unknown",
           head: rb.committedAt ?? "unknown",

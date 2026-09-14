@@ -16,9 +16,10 @@ import * as path from "node:path";
 import { execSync } from "node:child_process";
 
 import extensionFactory, { SENTINEL_MESSAGE_TYPE, SENTINEL_NOTICE_TYPE } from "../index.ts";
-import { projectDir, _resetForTesting, getConfig, getState } from "../src/config.ts";
+import { projectDir } from "../src/config.ts";
 import { verifiedEntry, allVerified } from "../src/clients/evidence.ts";
 import { createRuntime } from "../src/runtime.ts";
+import type { SentinelRuntime } from "../src/runtime.ts";
 import { createSentinelRewindTool } from "../src/tools/sentinel-rewind.ts";
 import { createSentinelStatusTool } from "../src/tools/sentinel-status.ts";
 import { _clearCache } from "../src/clients/mindplace.ts";
@@ -129,6 +130,8 @@ let home: string;
 let project: string;
 let fake: FakePi;
 let ctx: FakeCtx;
+/** The runtime the extension under test was handed, so assertions can read it. */
+let runtime: SentinelRuntime;
 
 /** Write a project config that the loader picks up by content hash. */
 function writeConfig(extra: Record<string, unknown> = {}): void {
@@ -222,7 +225,6 @@ after(() => {
 
 beforeEach(async () => {
   _clearCache();
-  _resetForTesting();
   // The project directory is re-created (and re-`git init`ed) per test, so a
   // memoised repository root from a previous test would be a stale answer.
   _clearRepoRootCache();
@@ -236,7 +238,8 @@ beforeEach(async () => {
   fs.rmSync(projectDir(project), { recursive: true, force: true });
 
   fake = createFakePi();
-  extensionFactory(fake.api);
+  runtime = createRuntime();
+  extensionFactory(fake.api, { runtime });
   ctx = makeCtx(project);
   checkpoints.clear(project);
 });
@@ -267,7 +270,7 @@ describe("extension registration", () => {
 
   test("ships with every feature enabled when no config exists", async () => {
     await emit(fake, "session_start", { type: "session_start" }, ctx);
-    const conf = getConfig();
+    const conf = runtime.config.config();
 
     assert.equal(conf.enabled, true);
     assert.equal(conf.autoRollback, true);
@@ -516,8 +519,8 @@ describe("P7 — change policy", () => {
     });
 
     const before = {
-      violations: getState().policyViolations.length,
-      metric: getState().metrics.policyViolations,
+      violations: runtime.config.state().policyViolations.length,
+      metric: runtime.config.state().metrics.policyViolations,
     };
     await runTurn(1, ".github/workflows/ci.yml", "name: ci\n");
 
@@ -526,9 +529,9 @@ describe("P7 — change policy", () => {
     assert.ok(body.includes("Change policy violation"));
     assert.ok(body.includes(".github/workflows/ci.yml"));
     assert.ok(ctx._notifications.some((n) => n.text.includes("Change policy violation")));
-    assert.equal(getState().policyViolations.length, before.violations + 1);
-    assert.equal(getState().metrics.policyViolations, before.metric + 1);
-    assert.deepEqual(getState().policyViolations[0].rules, ["allowWorkflowChanges"]);
+    assert.equal(runtime.config.state().policyViolations.length, before.violations + 1);
+    assert.equal(runtime.config.state().metrics.policyViolations, before.metric + 1);
+    assert.deepEqual(runtime.config.state().policyViolations[0].rules, ["allowWorkflowChanges"]);
   });
 
   test("stops the turn before verification runs", async () => {
@@ -573,11 +576,11 @@ describe("P7 — change policy", () => {
       pipelines: { onFileMutation: [], onTurnEnd: [{ name: "ok", cmd: "exit 0", timeoutMs: 5000 }] },
     });
 
-    const before = getState().policyViolations.length;
+    const before = runtime.config.state().policyViolations.length;
     await runTurn(1, "src/a.ts", "export const a = 1;\n");
 
     assert.equal(fake.sent.length, 0);
-    assert.equal(getState().policyViolations.length, before, "no violation is recorded");
+    assert.equal(runtime.config.state().policyViolations.length, before, "no violation is recorded");
   });
 
   test("a violation in one turn does not leak into the next", async () => {
@@ -587,14 +590,14 @@ describe("P7 — change policy", () => {
       pipelines: { onFileMutation: [], onTurnEnd: [] },
     });
 
-    const before = getState().policyViolations.length;
+    const before = runtime.config.state().policyViolations.length;
     await runTurn(1, ".github/workflows/ci.yml", "name: ci\n");
-    assert.equal(getState().policyViolations.length, before + 1);
+    assert.equal(runtime.config.state().policyViolations.length, before + 1);
 
     // Turn 2 touches only an ordinary file: it must be clean and must not
     // inherit or re-report turn 1's violation.
     await runTurn(2, "src/a.ts", "export const a = 1;\n");
-    assert.equal(getState().policyViolations.length, before + 1, "no violation is carried over");
+    assert.equal(runtime.config.state().policyViolations.length, before + 1, "no violation is carried over");
     assert.equal(fake.sent.length, 1, "only the violating turn produced a follow-up");
   });
 
@@ -605,7 +608,7 @@ describe("P7 — change policy", () => {
       pipelines: { onFileMutation: [], onTurnEnd: [] },
     });
 
-    const before = getState().metrics.blockedWrites;
+    const before = runtime.config.state().metrics.blockedWrites;
 
     await emit(fake, "turn_start", { type: "turn_start", turnIndex: 1 }, ctx);
     const decision = await emit(
@@ -631,7 +634,7 @@ describe("P7 — change policy", () => {
       false,
       "the cheapest rollback is the write that never happened",
     );
-    assert.equal(getState().metrics.blockedWrites, before + 1);
+    assert.equal(runtime.config.state().metrics.blockedWrites, before + 1);
     assert.ok(ctx._notifications.some((n) => n.text.includes("refused a write")));
   });
 
@@ -1012,7 +1015,7 @@ describe("environment failures are not code failures", () => {
 
     // State is persisted per project and outlives a single test, so every
     // counter is compared as a delta.
-    const before = getState().autoFixHistory.length;
+    const before = runtime.config.state().autoFixHistory.length;
     await runTurn(1, "src/a.ts", "export const a = 1;\n");
 
     assert.equal(
@@ -1022,7 +1025,7 @@ describe("environment failures are not code failures", () => {
     );
     assert.equal(fake.sent.length, 0, "the agent is not sent back to edit code");
     assert.equal(
-      getState().autoFixHistory.length,
+      runtime.config.state().autoFixHistory.length,
       before,
       "no repair attempt is charged for an environment failure",
     );
@@ -1041,12 +1044,12 @@ describe("environment failures are not code failures", () => {
       },
     });
 
-    const before = getState().metrics.rollbacks;
+    const before = runtime.config.state().metrics.rollbacks;
     await runTurn(1, "src/a.ts", "export const a = 1;\n");
 
     assert.equal(fs.existsSync(path.join(project, "src/a.ts")), true);
     assert.equal(
-      getState().metrics.rollbacks,
+      runtime.config.state().metrics.rollbacks,
       before,
       "a slow check is not a reason to undo work",
     );
@@ -1377,7 +1380,7 @@ describe("compaction does not launder stale evidence", () => {
     await runTurn(2, "src/a.ts", "export const a = 2;\n");
     await runTurn(3, "src/a.ts", "export const a = 3;\n");
     assert.ok(
-      getState().autoFixHistory.some((entry) => entry.outcome === "exhausted"),
+      runtime.config.state().autoFixHistory.some((entry) => entry.outcome === "exhausted"),
       "the bound still applies across the compaction",
     );
   });
@@ -1866,7 +1869,7 @@ describe("P6 — coalescing, conflicts, escalation and metrics", () => {
     });
 
     await mutate("src/a.ts", "a\n", "call-metrics");
-    const metrics = getState().metrics;
+    const metrics = runtime.config.state().metrics;
     assert.ok(metrics.checks >= 1, "a step ran");
     assert.ok(metrics.failures >= 1, "and it failed");
   });
@@ -1900,7 +1903,7 @@ describe("P6 — coalescing, conflicts, escalation and metrics", () => {
       ctx._notifications.some((n) => n.text.includes("Repeated verification failure")),
       "the second identical failure escalates",
     );
-    assert.ok(getState().escalations.length >= 1, "and is audited");
+    assert.ok(runtime.config.state().escalations.length >= 1, "and is audited");
   });
 
   test("a green run clears the escalation counters", async () => {

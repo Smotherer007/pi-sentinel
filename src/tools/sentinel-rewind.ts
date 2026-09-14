@@ -18,7 +18,6 @@ import { Type } from "typebox";
 
 import type { SentinelRuntime } from "../runtime.ts";
 import { describeRestore } from "../clients/snapshot.ts";
-import { recordRollback } from "../config.ts";
 import type { CheckpointSummary } from "../types.ts";
 
 /** One stable details shape, so every return path matches the same schema. */
@@ -142,7 +141,7 @@ export function createSentinelRewindTool(runtime: SentinelRuntime) {
         };
       }
 
-      recordRollback({
+      runtime.config.recordRollback({
         at: new Date().toISOString(),
         branch: "unknown",
         head: "checkpoint",

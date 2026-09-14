@@ -15,7 +15,6 @@ import { Type } from "typebox";
 
 import type { SentinelRuntime } from "../runtime.ts";
 import { rollbackToHead, rollbackTurn } from "../clients/rollback.ts";
-import { getConfig, recordRollback } from "../config.ts";
 
 export function createSentinelRollbackTool(runtime: SentinelRuntime) {
   return {
@@ -47,7 +46,7 @@ export function createSentinelRollbackTool(runtime: SentinelRuntime) {
       ctx?: { cwd: string },
     ) {
       const cwd = ctx?.cwd ?? process.cwd();
-      const conf = getConfig();
+      const conf = runtime.config.config();
       const mode = params.mode ?? "turn";
 
       if (mode === "head" && !conf.autoRollback && !params.force) {
@@ -77,7 +76,7 @@ export function createSentinelRollbackTool(runtime: SentinelRuntime) {
       const result = mode === "head" ? rollbackToHead(cwd) : rollbackTurn(cwd, runtime.snapshots);
 
       if (result.success) {
-        recordRollback({
+        runtime.config.recordRollback({
           at: new Date().toISOString(),
           branch: result.branch ?? "unknown",
           head: result.committedAt ?? "unknown",
