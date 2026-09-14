@@ -508,3 +508,117 @@ describe("ConfigStore", () => {
     }
   });
 });
+
+describe("config reload cost", () => {
+  /** Capture the warnings a load produces. */
+  async function warningsFor(store: ConfigStore, cwd: string): Promise<string[]> {
+    const seen: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => seen.push(args.map(String).join(" "));
+    try {
+      await store.load(cwd);
+    } finally {
+      console.warn = original;
+    }
+    return seen;
+  }
+
+  test("an unchanged file is not re-merged, re-validated or re-warned", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sentinel-reload-"));
+    try {
+      // A step with an unusable timeout: reported by name, every time it is
+      // validated. `load` runs on every hook — eight times in one turn — so
+      // before the memo this printed the same warning eight times per turn.
+      fs.writeFileSync(
+        path.join(dir, "sentinel.config.js"),
+        "export default { pipelines: { onFileMutation: [{ name: 'bad', cmd: 'exit 0', timeoutMs: 0 }] } };\n",
+        "utf-8",
+      );
+
+      const store = new ConfigStore();
+      const first = await warningsFor(store, dir);
+      const second = await warningsFor(store, dir);
+      const third = await warningsFor(store, dir);
+
+      assert.equal(first.length, 1, `expected one warning, got ${JSON.stringify(first)}`);
+      assert.ok(first[0].includes("timeoutMs"));
+      assert.deepEqual(second, [], "an unchanged file is not re-validated");
+      assert.deepEqual(third, []);
+      assert.equal(store.revisionCount(), 1, "one revision, imported once");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an edited file is picked up and counted as a new revision", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sentinel-reload-edit-"));
+    try {
+      const file = path.join(dir, "sentinel.config.js");
+      const store = new ConfigStore();
+
+      fs.writeFileSync(file, "export default { maxTraceLines: 4 };\n", "utf-8");
+      await store.load(dir);
+      assert.equal(store.config().maxTraceLines, 4);
+
+      fs.writeFileSync(file, "export default { maxTraceLines: 5 };\n", "utf-8");
+      await store.load(dir);
+      assert.equal(store.config().maxTraceLines, 5, "the edit takes effect");
+      assert.equal(store.revisionCount(), 2);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("dropping to the defaults does not make the memo lie", async () => {
+    // A project with a config, then one without: the store falls back to the
+    // defaults, so returning to the first project must import its file again
+    // rather than trust a stamp that still matches it.
+    const withConfig = fs.mkdtempSync(path.join(os.tmpdir(), "sentinel-reload-a-"));
+    const withoutConfig = fs.mkdtempSync(path.join(os.tmpdir(), "sentinel-reload-b-"));
+    try {
+      fs.writeFileSync(
+        path.join(withConfig, "sentinel.config.js"),
+        "export default { maxTraceLines: 7 };\n",
+        "utf-8",
+      );
+
+      const store = new ConfigStore();
+      await store.load(withConfig);
+      assert.equal(store.config().maxTraceLines, 7);
+
+      await store.load(withoutConfig);
+      assert.equal(store.config().maxTraceLines, DEFAULT_CONFIG.maxTraceLines);
+
+      await store.load(withConfig);
+      assert.equal(store.config().maxTraceLines, 7, "the project's own config comes back");
+    } finally {
+      fs.rmSync(withConfig, { recursive: true, force: true });
+      fs.rmSync(withoutConfig, { recursive: true, force: true });
+    }
+  });
+
+  test("many revisions are reported once, not silently held", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sentinel-reload-many-"));
+    try {
+      const file = path.join(dir, "sentinel.config.js");
+      const store = new ConfigStore();
+      const seen: string[] = [];
+      const original = console.warn;
+      console.warn = (...args: unknown[]) => seen.push(args.map(String).join(" "));
+      try {
+        for (let i = 0; i < 25; i += 1) {
+          fs.writeFileSync(file, `export default { maxTraceLines: ${i + 1} };\n`, "utf-8");
+          await store.load(dir);
+        }
+      } finally {
+        console.warn = original;
+      }
+
+      assert.equal(store.revisionCount(), 25);
+      const notices = seen.filter((line) => line.includes("configuration revisions loaded"));
+      assert.equal(notices.length, 1, "said once, when the set became worth mentioning");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -634,8 +634,20 @@ trustworthy:
 
 Create `sentinel.config.ts` in the project root (or `~/.sentinel.config.ts`). Resolution order:
 `<cwd>/sentinel.config.ts` → `<cwd>/sentinel.config.js` → `~/.sentinel.config.ts` → defaults.
-Every event reloads the file (cache-busted by content hash, so an edit is picked
-up without restarting pi and twice-in-one-tick edits cannot go unnoticed).
+Every event reloads the file (cache-busted by content hash, so an edit is picked up without
+restarting pi and twice-in-one-tick edits cannot go unnoticed). An *unchanged* file is not re-merged,
+re-validated or re-warned — `load` runs on every hook, eight times in one turn, and a config problem
+used to be reported that often.
+
+Two properties of that reload are worth knowing, because neither is free:
+
+- **The config may contain code.** The file is imported as an ES module, so it can compute values, read
+  the environment, or import a helper. That is deliberate, and it is the one thing that makes the next
+  point unavoidable.
+- **Node's module registry never evicts.** Each distinct revision leaves its module instance resident
+  for the life of the process, and there is no API to unload one. Sentinel therefore does the part it
+  can: unchanged content is never re-imported (the hash is checked before the import, not after), and
+  past 20 distinct revisions in one session it says so once rather than growing silently.
 
 ```ts
 import { defineConfig } from "@patimweb/pi-sentinel";

@@ -1,12 +1,15 @@
 /**
- * Configuration persistence and state for pi-sentinel.
+ * Configuration and runtime state for pi-sentinel, as one value per session.
  *
- * Loads `sentinel.config.ts`/`.js` from the project cwd, falling back to
- * `~/.sentinel.config.ts` in the home directory, then finally to defaults.
+ * `ConfigStore` loads `sentinel.config.ts`/`.js` from the project cwd, falling
+ * back to `~/.sentinel.config.ts` and then to the defaults, and persists the
+ * runtime state (rollback history, verification runs, metrics) to
+ * `~/.pi/sentinel-state/<project>.json` atomically and permission-safely. Both
+ * follow the store's scope, so two sessions never read each other's project.
  *
- * Also persists runtime state (rollback history, last verification runs) to
- * `~/.pi/sentinel-state/<project>.json` in an atomic, permission-safe manner.
- * State is scoped per project so histories of unrelated repos don't mix.
+ * Everything else here is a pure helper over `SentinelConfig` — normalisation,
+ * glob matching, step and file filtering, preflight checks — and takes the
+ * configuration it needs as an argument.
  */
 
 import * as fs from "node:fs";
@@ -210,6 +213,14 @@ export interface SentinelState {
   }>;
 }
 
+/**
+ * How many distinct config revisions a session tolerates before saying so.
+ *
+ * Not a limit — imports cannot be undone — but the point at which the resident
+ * set stops being incidental and becomes worth mentioning.
+ */
+const REVISION_NOTICE_AFTER = 20;
+
 /** All-zero metrics, so state files written by older versions still load. */
 export function emptyMetrics(): SentinelMetrics {
   return {
@@ -373,6 +384,27 @@ export class ConfigStore {
   private active: SentinelConfig = DEFAULT_CONFIG;
   private current: SentinelState = emptyState();
   private scope: string | null = null;
+  /**
+   * The file and content stamp this configuration was built from.
+   *
+   * `load` runs on *every* hook — eight times in a single turn — so without
+   * this the merge, the validation and every warning it reports would repeat
+   * for an unchanged file. Content, not mtime, because the reader is cached by
+   * URL and content is what decides whether a new module is needed at all.
+   */
+  private loadedFrom: string | null = null;
+  private loadedStamp: string | null = null;
+  /**
+   * Distinct configuration revisions imported in this session.
+   *
+   * Node's ESM registry never evicts, so each revision leaves its module
+   * instance (and whatever it imported) resident for the life of the process.
+   * That cannot be avoided — `import()` is the only way to honour the promise
+   * that a config file may contain code — so it is bounded instead: unchanged
+   * content is never re-imported, and the growth is counted and reported rather
+   * than silent.
+   */
+  private revisions = new Set<string>();
 
   /** The configuration in force for this session. */
   config(): SentinelConfig {
@@ -408,16 +440,25 @@ export class ConfigStore {
 
     for (const file of candidates) {
       if (!fs.existsSync(file)) continue;
+
+      // Cache-bust by *content*, not by mtime. Node's ESM loader caches by URL,
+      // and mtime has inconsistent resolution across filesystems (coarse on
+      // some CI containers and network mounts). Two edits inside one mtime tick
+      // would then silently keep the old config — the hash cannot collide that
+      // way, and an unchanged file is still served from the module cache.
+      let stamp: string;
       try {
-        // Cache-bust by *content*, not by mtime. Node's ESM loader caches by URL,
-        // and mtime has inconsistent resolution across filesystems (coarse on
-        // some CI containers and network mounts). Two edits inside one mtime tick
-        // would then silently keep the old config — the hash cannot collide that
-        // way, and an unchanged file is still served from the module cache.
-        const stamp = createHash("sha1")
-          .update(fs.readFileSync(file))
-          .digest("hex")
-          .slice(0, 16);
+        stamp = createHash("sha1").update(fs.readFileSync(file)).digest("hex").slice(0, 16);
+      } catch (err) {
+        console.warn(`[sentinel] Could not read config ${file}:`, err);
+        continue;
+      }
+
+      // Same file, same bytes, already imported and validated. Nothing to
+      // merge and nothing new to warn about, so none of it is repeated.
+      if (file === this.loadedFrom && stamp === this.loadedStamp) return this.active;
+
+      try {
         const url = pathToFileURL(file);
         url.searchParams.set("v", stamp);
         const mod = await import(url.href);
@@ -427,6 +468,9 @@ export class ConfigStore {
             deepMerge(DEFAULT_CONFIG, raw as Partial<SentinelConfig>),
             raw as SentinelConfigInput,
           );
+          this.loadedFrom = file;
+          this.loadedStamp = stamp;
+          this.countRevision(stamp);
           // Report dangerous values early and by name. They are *not* silently
           // repaired: the user should see exactly what is wrong and fix it.
           for (const problem of configProblems(this.active)) {
@@ -439,8 +483,30 @@ export class ConfigStore {
       }
     }
 
+    // No usable file. The memo must be dropped with it: the next load of a
+    // project that *does* have a config has to import it again rather than
+    // conclude from the stamp that the default already is that configuration.
     this.active = DEFAULT_CONFIG;
+    this.loadedFrom = null;
+    this.loadedStamp = null;
     return this.active;
+  }
+
+  /** How many distinct configuration revisions this session has imported. */
+  revisionCount(): number {
+    return this.revisions.size;
+  }
+
+  private countRevision(stamp: string): void {
+    if (this.revisions.has(stamp)) return;
+    this.revisions.add(stamp);
+    if (this.revisions.size === REVISION_NOTICE_AFTER) {
+      console.warn(
+        `[sentinel] ${this.revisions.size} configuration revisions loaded this session. ` +
+          "Node's module registry cannot unload them, so each one stays resident — " +
+          "restart pi if you have been editing sentinel.config.ts heavily.",
+      );
+    }
   }
 
   /** The runtime state of the project this session is scoped to. */
