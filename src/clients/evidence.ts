@@ -55,9 +55,17 @@ export function hashFile(absPath: string): string | null {
  * Hash of a *set* of files — the identity of the code state a verification
  * result refers to. Used to notice that a failure is about an unchanged state
  * (so re-prompting would repeat itself) versus a genuinely new revision.
+ *
+ * An empty set has no identity and returns `""` rather than the SHA-1 of the
+ * empty string (`da39a3ee5e6b`). That constant is a valid-looking hash, and the
+ * failure payload printed it as the state a red run was about — so a run that
+ * verified nothing appeared to be bound to something. Every caller that prints
+ * or compares a hash treats the empty string as "no state".
  */
 export function stateHashOf(absPaths: string[]): string {
-  const parts = [...new Set(absPaths)]
+  const unique = [...new Set(absPaths)];
+  if (unique.length === 0) return "";
+  const parts = unique
     .map((p) => path.resolve(p))
     .sort()
     .map((p) => `${p}:${hashFile(p) ?? "missing"}`);

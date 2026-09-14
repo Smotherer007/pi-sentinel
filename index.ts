@@ -290,6 +290,16 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
   // the effects a decision asks for; nothing decides on its own.
 
   let repair: RepairState = initialRepairState();
+  /**
+   * Whether a repair order is still outstanding — injected and not yet answered
+   * by a green run.
+   *
+   * This cannot be read off `repair`: `resetRepairBudget` empties
+   * `injectedPaths`, and `traceIsStale` answers "not stale" when there are none,
+   * so the old failure payload would keep looking current. The flag survives
+   * that reset on purpose.
+   */
+  let failureOutstanding = false;
   /** In-flight background verification (P5); one at a time. */
   let backgroundRun: Promise<void> | null = null;
   /**
@@ -426,6 +436,35 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     repair = initialRepairState();
     // A new user turn (or a repaired loop) is a fresh start for escalation.
     runtime.escalations.reset();
+  }
+
+  /**
+   * A green run answers the last repair order.
+   *
+   * Recording the pass is not enough: the failure payload sentinel injected is
+   * still the newest sentinel message, and `resetRepairBudget` (via the empty
+   * `injectedPaths`) makes the trace hygiene treat it as current. Emitting the
+   * resolution *as a sentinel trace* is what lets the `context` hook supersede
+   * it — an older trace is only marked superseded once a newer one exists.
+   */
+  function resolveOpenFailure(): void {
+    resetRepairBudget();
+    if (!failureOutstanding) return;
+    failureOutstanding = false;
+    try {
+      pi.sendMessage(
+        {
+          customType: SENTINEL_MESSAGE_TYPE,
+          content:
+            "[sentinel] Resolved: a re-run of the turn-end checks passed for the current state. The failure sentinel reported earlier is superseded — do not repair it, and do not treat its diagnostics as the current state.",
+          display: false,
+          details: { resolved: true },
+        },
+        { deliverAs: "nextTurn", triggerTurn: false },
+      );
+    } catch {
+      /* a resolution notice is never worth breaking a green run over */
+    }
   }
 
   /**
@@ -1115,6 +1154,9 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     }
 
     if (decision.action === "inject") {
+      // Outstanding until a later run passes. Deliberately not cleared by
+      // resetRepairBudget: that reset is what makes the payload look current.
+      failureOutstanding = true;
       pi.sendMessage(
         {
           customType: SENTINEL_MESSAGE_TYPE,
@@ -1171,6 +1213,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     sessionStartedAtMs = Date.now();
     await ensureConfig(ctx.cwd);
     resetRepairBudget();
+    failureOutstanding = false;
     const conf = runtime.config.config();
     if (conf.enabled) {
       const extras = [
@@ -1542,7 +1585,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     });
 
     if (outcome.passed) {
-      resetRepairBudget();
+      resolveOpenFailure();
     } else {
       handleRedTurnSafely({
         outcome,
@@ -1633,6 +1676,11 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
         // describes the tree is exactly the stale trace that sends repair
         // loops after code that has already moved on.
         const startHash = stateHashOf(args.focusPaths);
+        // The pipeline set this run executes was resolved when it started. A
+        // configuration change while it is in flight means the result describes
+        // a pipeline that no longer exists — and restoring files on it is how a
+        // mid-run config edit turns into a rollback that deletes the edit.
+        const startRevision = runtime.config.revisionCount();
         const outcome = await runVerification({
           trigger: "onTurnEnd",
           cwd: args.cwd,
@@ -1644,8 +1692,25 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
           allowRollback: false,
         });
 
+        if (runtime.config.revisionCount() !== startRevision) {
+          args.ctx.ui.notify(
+            "Sentinel: the verification configuration changed while a background check ran — the stale result was discarded.",
+            "warning",
+          );
+          return;
+        }
+
         if (outcome.passed) {
-          resetRepairBudget();
+          // A green background run used to vanish: only failures were recorded,
+          // so an old red turn stayed the newest history entry forever while the
+          // checks went green around it. Record the pass, and answer any
+          // outstanding repair order so it stops looking current.
+          resolveOpenFailure();
+          runtime.config.recordTurnOutcome({
+            at: new Date().toISOString(),
+            turnIndex: -1,
+            passed: true,
+          });
           return;
         }
 

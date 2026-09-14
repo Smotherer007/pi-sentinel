@@ -157,4 +157,11 @@ describe("stateHashOf", () => {
   test("is short enough to print in feedback", () => {
     assert.equal(stateHashOf([file]).length, 12);
   });
+
+  test("an empty path set has no state to identify", () => {
+    // The SHA-1 of the empty string is a valid-looking hash, and it used to be
+    // printed as the state a red run was about even when nothing changed.
+    assert.equal(stateHashOf([]), "");
+    assert.notEqual(stateHashOf([]), "da39a3ee5e6b");
+  });
 });

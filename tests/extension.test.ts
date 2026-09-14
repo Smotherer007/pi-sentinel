@@ -495,15 +495,18 @@ describe("recovery — bounded attempts", () => {
     // A green turn must clear the budget...
     fs.writeFileSync(path.join(project, "state.txt"), "green");
     await runTurn(2, "src/a.ts", "revision 2\n");
-    assert.equal(fake.sent.length, 1, "a green turn does not re-prompt");
+    // A green turn sends nothing that asks for a repair. The resolution notice
+    // that supersedes the old payload is not a re-prompt.
+    const rePrompts = () => fake.sent.filter((s) => s.message?.details?.resolved !== true).length;
+    assert.equal(rePrompts(), 1, "a green turn does not re-prompt");
 
     // ...so the next red cycle gets its own attempt again.
     fs.writeFileSync(path.join(project, "state.txt"), "red");
     await runTurn(3, "src/a.ts", "revision 3\n");
-    assert.equal(fake.sent.length, 2, "the reset budget allows a new attempt");
+    assert.equal(rePrompts(), 2, "the reset budget allows a new attempt");
 
     await runTurn(4, "src/a.ts", "revision 4\n");
-    assert.equal(fake.sent.length, 2, "the new budget is bounded again");
+    assert.equal(rePrompts(), 2, "the new budget is bounded again");
     assert.ok(
       ctx._notifications.some((n) => n.text.includes("recovery attempts exhausted")),
       "notifications: " + JSON.stringify(ctx._notifications.map((n) => n.text)),
@@ -1720,6 +1723,73 @@ describe("P5 — output budget and background checks", () => {
     );
     await waitFor(() => ctx._statuses.get("sentinel") === undefined, 20000);
     assert.ok(fake.sent.length >= 2, "both turns produced feedback");
+  });
+
+  test("a green background run is recorded and answers the last failure", async () => {
+    await configure({
+      autoRollback: false,
+      backgroundTurnEnd: true,
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [
+          {
+            name: "flaky",
+            // Red until the marker exists, so turn 1 fails and turn 2 passes.
+            cmd: "if [ -f pass.flag ]; then exit 0; else exit 1; fi",
+            timeoutMs: 20000,
+            cacheable: false,
+          },
+        ],
+      },
+    });
+
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+    await waitFor(() => fake.sent.length > 0);
+    assert.equal(
+      runtime.config.state().turnHistory[0].passed,
+      false,
+      "the failing background run is recorded",
+    );
+
+    // The next turn re-runs the same check against a state that now passes.
+    fs.writeFileSync(path.join(project, "pass.flag"), "");
+    await runTurn(2, "src/b.ts", "export const b = 2;\n");
+
+    await waitFor(() => fake.sent.some((s) => s.message?.details?.resolved === true), 20000);
+    assert.equal(
+      runtime.config.state().turnHistory[0].passed,
+      true,
+      "a green background run must be recorded, not only red ones",
+    );
+  });
+
+  test("a background result is discarded when the configuration changed mid-run", async () => {
+    await configure({
+      autoRollback: false,
+      backgroundTurnEnd: true,
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [{ name: "slow", cmd: "sleep 1; exit 1", timeoutMs: 20000, cacheable: false }],
+      },
+    });
+
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+    // The run is in flight. Replace the pipeline set so its result describes a
+    // configuration that no longer exists, then let a hook load it.
+    writeConfig({ backgroundTurnEnd: true, pipelines: { onFileMutation: [], onTurnEnd: [] } });
+    await emit(
+      fake,
+      "turn_end",
+      { type: "turn_end", turnIndex: 2, message: {}, toolResults: [] },
+      ctx,
+    );
+
+    await waitFor(
+      () => ctx._notifications.some((n) => n.text.includes("verification configuration changed")),
+      20000,
+    );
+    assert.equal(fake.sent.length, 0, "a stale result must not re-prompt the agent");
+    await waitFor(() => ctx._statuses.get("sentinel") === undefined, 20000);
   });
 
   test("backgroundTurnEnd: false makes the turn wait for the result", async () => {
