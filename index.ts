@@ -79,8 +79,7 @@ import {
   rollbackTurn,
   rollbackToHead,
 } from "./src/clients/rollback.ts";
-import { snapshots, describeRestore } from "./src/clients/snapshot.ts";
-import { checkpoints } from "./src/clients/checkpoints.ts";
+import { describeRestore } from "./src/clients/snapshot.ts";
 import {
   stateHashOf,
   recordVerified,
@@ -101,7 +100,7 @@ import { outOfBandChanges, captureBaseline } from "./src/clients/workspace.ts";
 import type { WorkspaceBaseline } from "./src/clients/workspace.ts";
 import { describeChange, expandWithDependents } from "./src/clients/mindplace.ts";
 import { VerificationQueue } from "./src/clients/queue.ts";
-import { escalations, shouldEscalate } from "./src/clients/escalation.ts";
+import { shouldEscalate } from "./src/clients/escalation.ts";
 import {
   autoFixOutcomeOf,
   decideRepair,
@@ -149,10 +148,11 @@ import type {
   VerificationOutcome,
 } from "./src/types.ts";
 
-import { SentinelVerifyTool } from "./src/tools/sentinel-verify.ts";
-import { SentinelRollbackTool } from "./src/tools/sentinel-rollback.ts";
-import { SentinelRewindTool } from "./src/tools/sentinel-rewind.ts";
-import { SentinelStatusTool } from "./src/tools/sentinel-status.ts";
+import { createRuntime } from "./src/runtime.ts";
+import { createSentinelVerifyTool } from "./src/tools/sentinel-verify.ts";
+import { createSentinelRollbackTool } from "./src/tools/sentinel-rollback.ts";
+import { createSentinelRewindTool } from "./src/tools/sentinel-rewind.ts";
+import { createSentinelStatusTool } from "./src/tools/sentinel-status.ts";
 
 // Re-exported so `import { defineConfig } from "@patimweb/pi-sentinel"` works
 // for the documented config manifest.
@@ -268,6 +268,10 @@ interface MutationRequest {
 }
 
 export default function (pi: ExtensionAPI) {
+  // Every store that belongs to *this* session. Created here rather than at
+  // module scope, so a second session in the same process gets its own turn
+  // snapshots, its own checkpoints and its own failure counters.
+  const runtime = createRuntime();
   // ── Repair-loop bookkeeping (P0 + P8) ───────────────────────────────────
   //
   // The loop's memory is one plain value in src/clients/repair.ts, so its stop
@@ -355,7 +359,7 @@ export default function (pi: ExtensionAPI) {
   function resetRepairBudget(): void {
     repair = initialRepairState();
     // A new user turn (or a repaired loop) is a fresh start for escalation.
-    escalations.reset();
+    runtime.escalations.reset();
   }
 
   /**
@@ -380,7 +384,7 @@ export default function (pi: ExtensionAPI) {
    * zero instead of being invented.
    */
   function policyChangesFor(cwd: string, paths: string[]): PolicyChange[] {
-    const pre = new Map(snapshots.turnSnapshots().map((snap) => [snap.path, snap]));
+    const pre = new Map(runtime.snapshots.turnSnapshots().map((snap) => [snap.path, snap]));
     const changes: PolicyChange[] = [];
     for (const raw of [...new Set(paths.map((p) => absPath(p, cwd)))]) {
       const snap = pre.get(raw);
@@ -484,7 +488,7 @@ export default function (pi: ExtensionAPI) {
 
     let rolledBack = false;
     if (policy.rollbackOnViolation) {
-      const rb = rollbackTurn(args.cwd);
+      const rb = rollbackTurn(args.cwd, runtime.snapshots);
       rolledBack = rb.success;
       if (rb.conflicts && rb.conflicts.length > 0) {
         args.ctx.ui.notify(
@@ -603,7 +607,7 @@ export default function (pi: ExtensionAPI) {
       // A green run means the repair loop converged: stop escalating. Runs that
       // executed nothing at all prove nothing, so they must not clear the
       // counters either (an empty mutation group fires after every edit).
-      if (ranAnyStep(run)) escalations.reset();
+      if (ranAnyStep(run)) runtime.escalations.reset();
       // Evidence only counts when something actually ran: an empty pipeline
       // group proves nothing, and claiming "verified" for it would be a lie.
       // Only the changed files are recorded — see the note on `changedPaths`.
@@ -642,9 +646,9 @@ export default function (pi: ExtensionAPI) {
       args.mutablePaths ??
         (args.toolCallIds && args.toolCallIds.length > 0
           ? args.toolCallIds.flatMap((id) =>
-              snapshots.callSnapshots(id).map((snap) => snap.path),
+              runtime.snapshots.callSnapshots(id).map((snap) => snap.path),
             )
-          : snapshots.turnPaths()),
+          : runtime.snapshots.turnPaths()),
     );
 
     // 0) Detect regressions first: a later revert must not erase the evidence
@@ -671,10 +675,10 @@ export default function (pi: ExtensionAPI) {
       const ids = args.toolCallIds ?? [];
       const rb =
         ids.length > 1
-          ? rollbackMutations(ids, args.cwd)
+          ? rollbackMutations(ids, args.cwd, runtime.snapshots)
           : ids.length === 1
-            ? rollbackMutation(ids[0], args.cwd)
-            : rollbackTurn(args.cwd);
+            ? rollbackMutation(ids[0], args.cwd, runtime.snapshots)
+            : rollbackTurn(args.cwd, runtime.snapshots);
       rolledBack = rb.success;
       conflicts = rb.conflicts ?? [];
       restoreSkipped = rb.skipped ?? [];
@@ -722,7 +726,7 @@ export default function (pi: ExtensionAPI) {
     //    still be exactly what the agent left (a later edit by the user, a
     //    formatter or another process is never overwritten).
     if (!rolledBack && !infrastructure && conf.trackVerifiedState && conf.revertOnRegression) {
-      const postHashes = args.postHashes ?? snapshots.turnPostHashes();
+      const postHashes = args.postHashes ?? runtime.snapshots.turnPostHashes();
       regressions = regressions.map((regression) => {
         if (!ownedPaths.has(regression.path)) return regression;
         if (!postHashes.has(regression.path)) return regression;
@@ -750,7 +754,7 @@ export default function (pi: ExtensionAPI) {
     // 3) Repeated-failure escalation: the state keeps changing but the error
     //    does not, which means the *approach* is wrong, not the last edit.
     const escalationSettings = conf.verification.failureEscalation;
-    const seen = escalations.record(failure.signature);
+    const seen = runtime.escalations.record(failure.signature);
     let escalation: { count: number; max: number } | undefined;
     if (escalationSettings.enabled && shouldEscalate(seen, escalationSettings.maxRepeatedFailures)) {
       escalation = { count: seen, max: escalationSettings.maxRepeatedFailures };
@@ -882,7 +886,7 @@ export default function (pi: ExtensionAPI) {
       // that changed after the checkpoint, which is exactly the set of
       // intermediate repair attempts this restore is meant to discard. Only
       // files in the checkpoint are touched, so unrelated work stays.
-      const report = checkpoints.restore(args.cwd, decision.restoreCheckpointId, { force: true });
+      const report = runtime.checkpoints.restore(args.cwd, decision.restoreCheckpointId, { force: true });
       if (report.attempted) {
         args.outcome.rolledBack = !report.partial;
         args.outcome.conflicts = report.conflicts;
@@ -972,10 +976,10 @@ export default function (pi: ExtensionAPI) {
 
   // ── Tools ──────────────────────────────────────────────────────────────
 
-  pi.registerTool(SentinelVerifyTool);
-  pi.registerTool(SentinelRollbackTool);
-  pi.registerTool(SentinelRewindTool);
-  pi.registerTool(SentinelStatusTool);
+  pi.registerTool(createSentinelVerifyTool(runtime));
+  pi.registerTool(createSentinelRollbackTool(runtime));
+  pi.registerTool(createSentinelRewindTool(runtime));
+  pi.registerTool(createSentinelStatusTool(runtime));
 
   // ── Hook: session_start ────────────────────────────────────────────────
 
@@ -1026,7 +1030,7 @@ export default function (pi: ExtensionAPI) {
   // ── Hook: turn_start (P1) ──────────────────────────────────────────────
 
   pi.on("turn_start", async (event, ctx) => {
-    snapshots.beginTurn();
+    runtime.snapshots.beginTurn();
     await ensureConfig(ctx.cwd);
     const conf = getConfig();
     if (!conf.enabled) return;
@@ -1051,7 +1055,7 @@ export default function (pi: ExtensionAPI) {
       entryId = undefined;
     }
 
-    checkpoints.begin({
+    runtime.checkpoints.begin({
       turnIndex: event.turnIndex,
       entryId,
       session: safeSessionFile(ctx),
@@ -1092,8 +1096,8 @@ export default function (pi: ExtensionAPI) {
       const abs = absPath(target, ctx.cwd);
       // Captured *before* the mutation runs, so a failure can be undone
       // precisely — including files the agent newly creates.
-      snapshots.captureCall(event.toolCallId, abs);
-      snapshots.captureTurn(abs);
+      runtime.snapshots.captureCall(event.toolCallId, abs);
+      runtime.snapshots.captureTurn(abs);
     }
 
     ctx.ui.setStatus("sentinel", "Mutation detected — verifying...");
@@ -1111,30 +1115,30 @@ export default function (pi: ExtensionAPI) {
 
     // A failed edit/write changed nothing — no need to verify.
     if (event.isError) {
-      snapshots.endCall(event.toolCallId);
+      runtime.snapshots.endCall(event.toolCallId);
       return;
     }
 
     const target = (event.input?.path ?? event.input?.filePath) as string | undefined;
     if (target && !targetInScope(target, ctx.cwd)) {
-      snapshots.endCall(event.toolCallId);
+      runtime.snapshots.endCall(event.toolCallId);
       return;
     }
     if (target && !shouldVerify(target, conf, ctx.cwd)) {
-      snapshots.endCall(event.toolCallId);
+      runtime.snapshots.endCall(event.toolCallId);
       return;
     }
 
     // Byte-identical rewrite: nothing changed, skip the pipeline entirely.
-    if (snapshots.isCallUnchanged(event.toolCallId)) {
-      snapshots.endCall(event.toolCallId);
+    if (runtime.snapshots.isCallUnchanged(event.toolCallId)) {
+      runtime.snapshots.endCall(event.toolCallId);
       return;
     }
 
     // Record what the agent's write left on disk. A later rollback compares
     // the file against this state, so an edit that happens in between (a
     // formatter, another process, the user) is never overwritten silently.
-    snapshots.capturePost(event.toolCallId);
+    runtime.snapshots.capturePost(event.toolCallId);
 
     // Two sets on purpose: `changedPaths` is what the agent wrote, and is the
     // only thing that may become evidence; `focusPaths` widens it with graph
@@ -1149,7 +1153,7 @@ export default function (pi: ExtensionAPI) {
       toolCallIds: [event.toolCallId],
     });
 
-    snapshots.endCall(event.toolCallId);
+    runtime.snapshots.endCall(event.toolCallId);
 
     if (outcome.passed) return;
 
@@ -1179,7 +1183,7 @@ export default function (pi: ExtensionAPI) {
     const conf = getConfig();
 
     // Everything below must read the turn scope *before* it is cleared.
-    const turnPaths = snapshots.turnPaths();
+    const turnPaths = runtime.snapshots.turnPaths();
 
     // P3 — changes that never went through edit/write (bash, formatters, git).
     let outOfBand: string[] = [];
@@ -1213,14 +1217,14 @@ export default function (pi: ExtensionAPI) {
           // still leave a rewind handle, otherwise the offending change can only
           // be undone with a destructive `mode: "head"` reset.
           try {
-            checkpoints.captureSnapshots(snapshots.turnSnapshots(), snapshots.turnPostHashes());
-            checkpoints.setLabel(describeChange(ctx.cwd, focusPaths));
-            checkpoints.flush(ctx.cwd, conf.checkpointRetention);
+            runtime.checkpoints.captureSnapshots(runtime.snapshots.turnSnapshots(), runtime.snapshots.turnPostHashes());
+            runtime.checkpoints.setLabel(describeChange(ctx.cwd, focusPaths));
+            runtime.checkpoints.flush(ctx.cwd, conf.checkpointRetention);
           } catch {
             /* a lost checkpoint must not change the policy decision */
           }
           handlePolicyViolation({ report, cwd: ctx.cwd, ctx, focusPaths });
-          snapshots.beginTurn();
+          runtime.snapshots.beginTurn();
           return;
         }
         // A clean turn reopens the policy stop, so a later identical violation
@@ -1238,9 +1242,9 @@ export default function (pi: ExtensionAPI) {
     let checkpointId: string | undefined;
     if (conf.enabled) {
       try {
-        checkpoints.captureSnapshots(snapshots.turnSnapshots(), snapshots.turnPostHashes());
-        checkpoints.setLabel(describeChange(ctx.cwd, focusPaths));
-        const summary = checkpoints.flush(ctx.cwd, conf.checkpointRetention);
+        runtime.checkpoints.captureSnapshots(runtime.snapshots.turnSnapshots(), runtime.snapshots.turnPostHashes());
+        runtime.checkpoints.setLabel(describeChange(ctx.cwd, focusPaths));
+        const summary = runtime.checkpoints.flush(ctx.cwd, conf.checkpointRetention);
         checkpointId = summary?.id;
       } catch {
         checkpointId = undefined;
@@ -1248,7 +1252,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (!conf.enabled) {
-      snapshots.beginTurn();
+      runtime.snapshots.beginTurn();
       return;
     }
 
@@ -1260,7 +1264,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (conf.pipelines.onTurnEnd.length === 0) {
-      snapshots.beginTurn();
+      runtime.snapshots.beginTurn();
       return;
     }
 
@@ -1275,9 +1279,9 @@ export default function (pi: ExtensionAPI) {
         // The in-memory scope is cleared right below; hand the background run
         // the agent's own files so its regression revert stays scoped.
         mutablePaths: turnPaths,
-        postHashes: snapshots.turnPostHashes(),
+        postHashes: runtime.snapshots.turnPostHashes(),
       });
-      snapshots.beginTurn();
+      runtime.snapshots.beginTurn();
       return;
     }
 
@@ -1290,12 +1294,12 @@ export default function (pi: ExtensionAPI) {
       // mutations plus whatever changed out of band.
       changedPaths: focusPaths,
       mutablePaths: turnPaths,
-      postHashes: snapshots.turnPostHashes(),
+      postHashes: runtime.snapshots.turnPostHashes(),
     });
 
     if (!outcome) {
       // Verification failed in an unexpected way — never crash the session.
-      snapshots.beginTurn();
+      runtime.snapshots.beginTurn();
       return;
     }
 
@@ -1319,7 +1323,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // The turn is over — drop its snapshot scope either way.
-    snapshots.beginTurn();
+    runtime.snapshots.beginTurn();
   });
 
   /**
@@ -1435,9 +1439,9 @@ export default function (pi: ExtensionAPI) {
           conf.autoRollback &&
           args.checkpointId &&
           !outcome.failure?.warnOnly &&
-          checkpoints.latest(args.cwd)?.id === args.checkpointId
+          runtime.checkpoints.latest(args.cwd)?.id === args.checkpointId
         ) {
-          const report = checkpoints.restore(args.cwd, args.checkpointId);
+          const report = runtime.checkpoints.restore(args.cwd, args.checkpointId);
           if (report.attempted) {
             outcome.rolledBack = !report.partial;
             recordRollback({
@@ -1632,8 +1636,8 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         case "rollback": {
-          const result = snapshots.hasTurnSnapshot()
-            ? rollbackTurn(ctx.cwd)
+          const result = runtime.snapshots.hasTurnSnapshot()
+            ? rollbackTurn(ctx.cwd, runtime.snapshots)
             : rollbackToHead(ctx.cwd);
           ctx.ui.setWidget("sentinel", [`[sentinel] ${result.message}`]);
           return;
@@ -1688,7 +1692,7 @@ export default function (pi: ExtensionAPI) {
       options?: { summarize?: boolean; customInstructions?: string },
     ): Promise<unknown>;
   }): Promise<void> {
-    const list = checkpoints.list(ctx.cwd, 10);
+    const list = runtime.checkpoints.list(ctx.cwd, 10);
     if (list.length === 0) {
       ctx.ui.setWidget("sentinel", [
         "[sentinel] No checkpoints yet — one is stored at the end of every turn that changed files.",
@@ -1720,7 +1724,7 @@ export default function (pi: ExtensionAPI) {
     const lines: string[] = [];
 
     if (action === "Code only" || action === "Code and conversation") {
-      const report = checkpoints.restore(ctx.cwd, checkpoint.id);
+      const report = runtime.checkpoints.restore(ctx.cwd, checkpoint.id);
       if (report.attempted) {
         recordRollback({
           at: new Date().toISOString(),
@@ -1771,7 +1775,7 @@ export default function (pi: ExtensionAPI) {
   function statusLines(cwd: string, conf: ReturnType<typeof getConfig>): string[] {
     const repo = GitClient.gitMeta(cwd);
     const state = getState();
-    const latest = checkpoints.latest(cwd);
+    const latest = runtime.checkpoints.latest(cwd);
 
     const lines = [
       "[sentinel] Status",
@@ -1783,7 +1787,7 @@ export default function (pi: ExtensionAPI) {
       `  debounce: ${conf.verification.debounceMs}ms | cache: ${conf.verification.cache.enabled} | escalation: ${conf.verification.failureEscalation.enabled}`,
       `  pipelines: mutation ${conf.pipelines.onFileMutation.length} | turn ${conf.pipelines.onTurnEnd.length}`,
       repo ? `  Git: ${repo.branch} @ ${repo.head}` : "  Git: not a repo",
-      `  turn snapshot: ${snapshots.hasTurnSnapshot() ? "captured (rollback available)" : "empty"}`,
+      `  turn snapshot: ${runtime.snapshots.hasTurnSnapshot() ? "captured (rollback available)" : "empty"}`,
       latest
         ? `  latest checkpoint: ${latest.id} — ${latest.label} (${latest.fileCount} file(s))`
         : "  latest checkpoint: none",

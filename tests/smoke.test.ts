@@ -1,13 +1,16 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 
-import { SentinelVerifyTool } from "../src/tools/sentinel-verify.ts";
-import { SentinelRollbackTool } from "../src/tools/sentinel-rollback.ts";
-import { SentinelRewindTool } from "../src/tools/sentinel-rewind.ts";
-import { SentinelStatusTool } from "../src/tools/sentinel-status.ts";
+import { createRuntime } from "../src/runtime.ts";
+import { createSentinelVerifyTool } from "../src/tools/sentinel-verify.ts";
+import { createSentinelRollbackTool } from "../src/tools/sentinel-rollback.ts";
+import { createSentinelRewindTool } from "../src/tools/sentinel-rewind.ts";
+import { createSentinelStatusTool } from "../src/tools/sentinel-status.ts";
 import { PipelineRunner } from "../src/clients/pipeline-runner.ts";
 import { GitClient } from "../src/clients/git-client.ts";
-import { CheckpointStore, checkpoints } from "../src/clients/checkpoints.ts";
+import { CheckpointStore } from "../src/clients/checkpoints.ts";
+import { SnapshotStore } from "../src/clients/snapshot.ts";
+import { FailureEscalationTracker } from "../src/clients/escalation.ts";
 import { stateHashOf, hashFile } from "../src/clients/evidence.ts";
 import { changedPaths } from "../src/clients/workspace.ts";
 import { applyOutputCap, preview } from "../src/clients/spill.ts";
@@ -17,18 +20,22 @@ import { impactOf, hasGraph } from "../src/clients/mindplace.ts";
 import { snapshotFile, restoreFileSnapshot } from "../src/clients/snapshot.ts";
 
 describe("smoke", () => {
+  const runtime = createRuntime();
+
   test("imports resolve", () => {
     assert.ok(PipelineRunner, "PipelineRunner should be importable");
     assert.ok(GitClient, "GitClient should be importable");
-    assert.equal(SentinelVerifyTool.name, "sentinel_verify");
-    assert.equal(SentinelRollbackTool.name, "sentinel_rollback");
-    assert.equal(SentinelRewindTool.name, "sentinel_rewind");
-    assert.equal(SentinelStatusTool.name, "sentinel_status");
+    assert.equal(createSentinelVerifyTool(runtime).name, "sentinel_verify");
+    assert.equal(createSentinelRollbackTool(runtime).name, "sentinel_rollback");
+    assert.equal(createSentinelRewindTool(runtime).name, "sentinel_rewind");
+    assert.equal(createSentinelStatusTool(runtime).name, "sentinel_status");
   });
 
   test("every capability module is importable", () => {
     assert.equal(typeof CheckpointStore, "function");
-    assert.ok(checkpoints, "shared checkpoint instance");
+    assert.equal(typeof SnapshotStore, "function");
+    assert.equal(typeof FailureEscalationTracker, "function");
+    assert.equal(runtime.checkpoints.isCapturing, false, "a fresh runtime captures nothing");
     assert.equal(typeof stateHashOf, "function");
     assert.equal(typeof hashFile, "function");
     assert.equal(typeof changedPaths, "function");
@@ -43,7 +50,13 @@ describe("smoke", () => {
   });
 
   test("every tool declares a description and schema", () => {
-    for (const tool of [SentinelVerifyTool, SentinelRollbackTool, SentinelRewindTool, SentinelStatusTool]) {
+    const tools = [
+      createSentinelVerifyTool(runtime),
+      createSentinelRollbackTool(runtime),
+      createSentinelRewindTool(runtime),
+      createSentinelStatusTool(runtime),
+    ];
+    for (const tool of tools) {
       assert.ok(tool.description.length > 20, `${tool.name} needs a usable description`);
       assert.ok(tool.parameters, `${tool.name} needs a parameter schema`);
     }

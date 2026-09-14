@@ -17,13 +17,25 @@ import { execSync } from "node:child_process";
 
 import extensionFactory, { SENTINEL_MESSAGE_TYPE, SENTINEL_NOTICE_TYPE } from "../index.ts";
 import { projectDir, _resetForTesting, getConfig, getState } from "../src/config.ts";
-import { checkpoints } from "../src/clients/checkpoints.ts";
 import { verifiedEntry, allVerified } from "../src/clients/evidence.ts";
-import { SentinelRewindTool } from "../src/tools/sentinel-rewind.ts";
-import { SentinelStatusTool } from "../src/tools/sentinel-status.ts";
+import { createRuntime } from "../src/runtime.ts";
+import { createSentinelRewindTool } from "../src/tools/sentinel-rewind.ts";
+import { createSentinelStatusTool } from "../src/tools/sentinel-status.ts";
 import { _clearCache } from "../src/clients/mindplace.ts";
 import { changedPaths } from "../src/clients/workspace.ts";
 import { _clearRepoRootCache } from "../src/clients/git-client.ts";
+
+/**
+ * The extension builds its own runtime per instance; the tools are functions of
+ * a runtime, so a test needs one too. These read *disk* state (checkpoints,
+ * the evidence ledger, git), which is the same for any instance — the in-memory
+ * turn snapshots are the extension's, and none of the assertions below depend
+ * on them.
+ */
+const testRuntime = createRuntime();
+const checkpoints = testRuntime.checkpoints;
+const SentinelRewindTool = createSentinelRewindTool(testRuntime);
+const SentinelStatusTool = createSentinelStatusTool(testRuntime);
 
 type Handler = (event: any, ctx: any) => any;
 
@@ -1719,6 +1731,86 @@ describe("disabled / status", () => {
     assert.ok(text.includes("checkpointRetention"));
     assert.ok(text.includes("Recent checkpoints"));
     assert.ok(text.includes("code graph (mindplace): absent"));
+  });
+});
+
+describe("session state belongs to one session", () => {
+  /**
+   * Drive one full failing turn on an arbitrary extension instance.
+   *
+   * `runTurn` is bound to the module-level fake; this proves a point that needs
+   * two instances in one process, so it drives its own.
+   */
+  async function failingTurnOn(
+    target: FakePi,
+    targetCtx: FakeCtx,
+    turnIndex: number,
+  ): Promise<void> {
+    const rel = "src/a.ts";
+    const callId = `other-${turnIndex}`;
+    await emit(target, "turn_start", { type: "turn_start", turnIndex }, targetCtx);
+    await emit(
+      target,
+      "tool_call",
+      { type: "tool_call", toolName: "edit", toolCallId: callId, input: { path: rel } },
+      targetCtx,
+    );
+    fs.mkdirSync(path.dirname(path.join(project, rel)), { recursive: true });
+    fs.writeFileSync(path.join(project, rel), `revision ${turnIndex}\n`);
+    await emit(
+      target,
+      "tool_result",
+      {
+        type: "tool_result",
+        toolName: "edit",
+        toolCallId: callId,
+        input: { path: rel },
+        content: [{ type: "text", text: "updated" }],
+        isError: false,
+      },
+      targetCtx,
+    );
+    await emit(
+      target,
+      "turn_end",
+      { type: "turn_end", turnIndex, message: {}, toolResults: [] },
+      targetCtx,
+    );
+  }
+
+  test("a second instance in the same process starts with clean counters", async () => {
+    // An invariant, not a fixed bug: the counters are now structurally private
+    // to the instance instead of relying on the `session_start` hook to clear a
+    // module-level tracker. See tests/runtime.test.ts for the direct property.
+    const failing = {
+      autoFix: false,
+      autoRollback: false,
+      verification: { failureEscalation: { enabled: true, maxRepeatedFailures: 2 } },
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [{ name: "tests", cmd: "exit 1", timeoutMs: 10000 }],
+      },
+    };
+
+    await configure(failing);
+    await runTurn(1, "src/a.ts", "one\n");
+    await runTurn(2, "src/a.ts", "two\n");
+    assert.ok(
+      ctx._notifications.some((n) => n.text.includes("Repeated verification failure")),
+      "the second identical failure escalates in its own session",
+    );
+
+    const other = createFakePi();
+    extensionFactory(other.api);
+    const otherCtx = makeCtx(project);
+    await emit(other, "session_start", { type: "session_start" }, otherCtx);
+    await failingTurnOn(other, otherCtx, 1);
+
+    assert.equal(
+      otherCtx._notifications.some((n) => n.text.includes("Repeated verification failure")),
+      false,
+      "a failure seen once in this instance is not a loop",
+    );
   });
 });
 

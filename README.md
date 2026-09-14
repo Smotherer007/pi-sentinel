@@ -874,6 +874,7 @@ Test coverage by module:
 | `tests/feedback.test.ts` | composed failure payload, regression + impact sections, budget cap |
 | `tests/contract.test.ts` | revision contract content and switches |
 | `tests/repair.test.ts` | the repair loop's stop conditions and the background slot, as pure data |
+| `tests/runtime.test.ts` | the session stores are values that share no state |
 | `tests/smoke.test.ts` | imports, tool schemas, graceful non-repo behaviour |
 
 The extension suite drives the real factory against a fake `ExtensionAPI`, so the paths that only
@@ -913,7 +914,25 @@ src/formatting/
   feedback.ts          composed model-visible failure payload
 src/prompt/
   contract.ts          revision contract (P4)
+src/runtime.ts         the stores one session owns, as a value
 ```
+
+### Session state is a value, not a module global
+
+Sentinel's stores that carry *per-session* state — the turn's pre-state snapshots, the checkpoint
+being captured, the repeated-failure counters — used to be module-level singletons. That made their
+lifetime the process rather than the session, which is invisible while a process holds exactly one
+session and a latent bug as soon as it does not; it also meant the tools could not be given a store at
+all, so tests had to reset the globals between cases.
+
+They are now one value, `SentinelRuntime` (`src/runtime.ts`), created per extension instance and
+handed to the tools, which are factories over it (`createSentinelStatusTool(runtime)`).
+
+Deliberately *not* in the runtime: the caches keyed by project path (`clients/cache.ts`,
+`clients/mindplace.ts`, `clients/git-client.ts`). They are pure functions of the working tree — a graph
+parsed at a given mtime, a repository root for a directory, a verification result keyed by the content
+hashes of its inputs — so a hit is correct by construction for the path that produced it, and sharing
+them across sessions is desirable rather than dangerous.
 
 ### The repair loop is data, not a closure
 

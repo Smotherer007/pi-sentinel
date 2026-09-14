@@ -15,8 +15,8 @@
  */
 
 import { GitClient } from "./git-client.ts";
-import { snapshots, describeRestore, emptyRestoreReport } from "./snapshot.ts";
-import type { RestoreReport } from "./snapshot.ts";
+import { describeRestore, emptyRestoreReport } from "./snapshot.ts";
+import type { RestoreReport, SnapshotStore } from "./snapshot.ts";
 import type { RollbackResult } from "../types.ts";
 
 function gitMeta(cwd: string): { branch?: string; committedAt?: string } {
@@ -61,16 +61,25 @@ function fromReport(report: RestoreReport, method: string, cwd: string): Rollbac
   };
 }
 
-/** Undo a single mutation (identified by its tool call id). */
-export function rollbackMutation(toolCallId: string, cwd: string): RollbackResult {
-  const report = snapshots.rollbackCall(toolCallId);
+/**
+ * Undo a single mutation (identified by its tool call id).
+ *
+ * The store is passed in rather than imported: which turn's pre-state may be
+ * restored is a property of the session, not of the module graph.
+ */
+export function rollbackMutation(
+  toolCallId: string,
+  cwd: string,
+  store: SnapshotStore,
+): RollbackResult {
+  const report = store.rollbackCall(toolCallId);
   if (!report.attempted) return noSnapshot(cwd, "mutation");
   return fromReport(report, "snapshot:mutation", cwd);
 }
 
 /** Undo every file the agent touched during the current turn. */
-export function rollbackTurn(cwd: string): RollbackResult {
-  const report = snapshots.rollbackTurn();
+export function rollbackTurn(cwd: string, store: SnapshotStore): RollbackResult {
+  const report = store.rollbackTurn();
   if (!report.attempted) return noSnapshot(cwd, "turn");
   return fromReport(report, "snapshot:turn", cwd);
 }
@@ -79,12 +88,16 @@ export function rollbackTurn(cwd: string): RollbackResult {
  * Undo several mutations at once (a coalesced verification batch).
  * Each call restores exactly the files that call touched.
  */
-export function rollbackMutations(toolCallIds: string[], cwd: string): RollbackResult {
+export function rollbackMutations(
+  toolCallIds: string[],
+  cwd: string,
+  store: SnapshotStore,
+): RollbackResult {
   const merged: RestoreReport = emptyRestoreReport();
   let attempted = false;
 
   for (const toolCallId of toolCallIds) {
-    const report = snapshots.rollbackCall(toolCallId);
+    const report = store.rollbackCall(toolCallId);
     if (!report.attempted) continue;
     attempted = true;
     merged.restored.push(...report.restored);

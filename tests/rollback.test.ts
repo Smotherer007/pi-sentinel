@@ -5,9 +5,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { rollbackMutation, rollbackMutations, rollbackTurn } from "../src/clients/rollback.ts";
-import { snapshots } from "../src/clients/snapshot.ts";
+import { SnapshotStore } from "../src/clients/snapshot.ts";
 
 let dir: string;
+/** A fresh store per test: session state is a value now, not a global. */
+let snapshots: SnapshotStore;
 
 before(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "sentinel-rollback-"));
@@ -20,12 +22,12 @@ after(() => {
 beforeEach(() => {
   // Each test starts from a clean turn scope. `dir` is intentionally not wiped:
   // most tests overwrite the files they check.
-  snapshots.beginTurn();
+  snapshots = new SnapshotStore();
 });
 
 describe("automatic rollback without a snapshot", () => {
   test("a turn restore is an explicit no-op, never a repo-wide git reset", () => {
-    const result = rollbackTurn(dir);
+    const result = rollbackTurn(dir, snapshots);
     assert.equal(result.success, false);
     assert.equal(result.method, "none");
     assert.equal(result.command, "", "no destructive git command is ever run");
@@ -33,14 +35,14 @@ describe("automatic rollback without a snapshot", () => {
   });
 
   test("an unknown mutation is a no-op too", () => {
-    const result = rollbackMutation("never-seen", dir);
+    const result = rollbackMutation("never-seen", dir, snapshots);
     assert.equal(result.success, false);
     assert.equal(result.method, "none");
     assert.equal(result.command, "");
   });
 
   test("a batch with no captured mutations is a no-op", () => {
-    const result = rollbackMutations(["a", "b"], dir);
+    const result = rollbackMutations(["a", "b"], dir, snapshots);
     assert.equal(result.success, false);
     assert.equal(result.method, "none");
     assert.equal(result.command, "");
@@ -57,7 +59,7 @@ describe("turn rollback correctness", () => {
     snapshots.captureTurn(file);
     fs.writeFileSync(file, "agent version\n");
 
-    const result = rollbackTurn(dir);
+    const result = rollbackTurn(dir, snapshots);
     assert.equal(result.success, true);
     assert.equal(result.method, "snapshot:turn");
     assert.equal(fs.readFileSync(file, "utf-8"), "user version\n");
@@ -70,7 +72,7 @@ describe("turn rollback correctness", () => {
     snapshots.captureTurn(file);
     fs.rmSync(file);
 
-    const result = rollbackTurn(dir);
+    const result = rollbackTurn(dir, snapshots);
     assert.equal(result.success, true);
     assert.equal(fs.readFileSync(file, "utf-8"), "content\n");
   });
@@ -80,7 +82,7 @@ describe("turn rollback correctness", () => {
     snapshots.captureTurn(file);
     fs.writeFileSync(file, "new\n");
 
-    const result = rollbackTurn(dir);
+    const result = rollbackTurn(dir, snapshots);
     assert.equal(result.success, true);
     assert.equal(fs.existsSync(file), false);
   });
@@ -95,7 +97,7 @@ describe("turn rollback correctness", () => {
     fs.writeFileSync(touched, "after\n");
     fs.writeFileSync(untouched, "someone else's newer work\n");
 
-    rollbackTurn(dir);
+    rollbackTurn(dir, snapshots);
 
     assert.equal(fs.readFileSync(touched, "utf-8"), "before\n");
     assert.equal(

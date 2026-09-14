@@ -389,6 +389,3 @@ function summarise(manifest: Manifest): CheckpointSummary {
     files: manifest.files.map((f) => f.path),
   };
 }
-
-/** Shared process-wide store, mirroring the module-level config design. */
-export const checkpoints = new CheckpointStore();

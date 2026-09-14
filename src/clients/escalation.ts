@@ -52,9 +52,6 @@ export class FailureEscalationTracker {
   }
 }
 
-/** Shared process-wide tracker, mirroring the module-level config design. */
-export const escalations = new FailureEscalationTracker();
-
 /**
  * Whether a count has reached the escalation threshold.
  * A threshold of 0 or less disables escalation entirely.

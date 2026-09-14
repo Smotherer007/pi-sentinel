@@ -419,9 +419,6 @@ export class SnapshotStore {
   }
 }
 
-/** Shared process-wide store, mirroring the module-level config design. */
-export const snapshots = new SnapshotStore();
-
 /** Human-readable one-line summary of a restore report. */
 export function describeRestore(report: RestoreReport): string {
   const parts: string[] = [];
