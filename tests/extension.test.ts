@@ -1041,10 +1041,15 @@ describe("P3 — out-of-band changes", () => {
     fs.writeFileSync(path.join(project, "src/wip.ts"), "export const wip = 1;\n");
     await waitFor(() => changedPaths(project).some((c) => c.path.endsWith("wip.ts")));
 
+    // Only this turn's notifications count: the log is shared across the whole
+    // file, so an assertion over all of it can be satisfied — or broken — by
+    // another test's leftovers, which is how this reported a failure under load
+    // that never reproduced in isolation.
+    const from = ctx._notifications.length;
     await runTurn(1, null, "");
 
     assert.equal(
-      ctx._notifications.some((n) => n.text.includes("changed outside edit/write")),
+      ctx._notifications.slice(from).some((n) => n.text.includes("changed outside edit/write")),
       false,
       "the working tree is not the turn's diff",
     );
@@ -1065,23 +1070,32 @@ describe("P3 — out-of-band changes", () => {
     // so nothing about the change inside it is verified. Silently dropping it
     // would leave the user believing a watchful guard saw everything, which is
     // the half of this boundary that is sentinel's to fix.
-    await runTurn(1, null, "", () => {
-      const nested = path.join(project, "nested");
-      fs.mkdirSync(nested, { recursive: true });
-      fs.writeFileSync(path.join(nested, "inner.ts"), "export const inner = 1;\n");
-      execSync("git init -q", { cwd: nested });
-    });
+    const from = ctx._notifications.length;
+    const nested = path.join(project, "nested");
+    try {
+      await runTurn(1, null, "", () => {
+        fs.mkdirSync(nested, { recursive: true });
+        fs.writeFileSync(path.join(nested, "inner.ts"), "export const inner = 1;\n");
+        execSync("git init -q", { cwd: nested });
+      });
 
-    const notice = ctx._notifications.find((n) => n.text.includes("no pipeline filter covers them"));
-    assert.ok(notice, "the path is named rather than dropped in silence");
-    assert.match(notice.text, /nested/);
-    assert.match(notice.text, /not verified/);
-    // And it is not claimed as verified either: the other notice must not fire.
-    assert.equal(
-      ctx._notifications.some((n) => n.text.includes("verifying them too")),
-      false,
-      "nothing is claimed to be under verification that is not",
-    );
+      const notices = ctx._notifications.slice(from);
+      const notice = notices.find((n) => n.text.includes("no pipeline filter covers them"));
+      assert.ok(notice, "the path is named rather than dropped in silence");
+      assert.match(notice.text, /nested/);
+      assert.match(notice.text, /not verified/);
+      // And it is not claimed as verified either: the other notice must not fire.
+      assert.equal(
+        notices.some((n) => n.text.includes("verifying them too")),
+        false,
+        "nothing is claimed to be under verification that is not",
+      );
+    } finally {
+      // This test needs a nested repository in the *shared* project directory,
+      // and leaving one behind changes what every later test sees as dirty. It
+      // cleaned up after itself — or it became somebody else's flake.
+      fs.rmSync(nested, { recursive: true, force: true });
+    }
   });
 
   test("stays quiet when everything went through the hooks", async () => {
@@ -1091,11 +1105,12 @@ describe("P3 — out-of-band changes", () => {
     });
 
     execSync("git init -q", { cwd: project });
+    const from = ctx._notifications.length;
     await runTurn(1, "src/a.ts", "export const a = 1;\n");
     execSync("git add -A", { cwd: project });
 
     assert.equal(
-      ctx._notifications.some((n) => n.text.includes("changed outside edit/write")),
+      ctx._notifications.slice(from).some((n) => n.text.includes("changed outside edit/write")),
       false,
     );
   });
