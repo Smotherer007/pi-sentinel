@@ -238,12 +238,20 @@ correctness by 14.7 percentage points in a 900-trajectory study (correctness aft
 after 2: 67.3 %), and *stale verification traces* were the primary cause (arXiv 2607.24604). Sentinel
 therefore binds evidence to the code state that produced it.
 
-**Verified-state ledger.** Every file that passes is hashed, with a restorable copy:
+**Verified-state ledger.** Every file that *changed and passed* is hashed, with a restorable copy:
 
 ```
 ~/.pi/sentinel-state/<project>-<hash>/verified.json
 ~/.pi/sentinel-state/<project>-<hash>/verified-blobs/<pathhash>-<contenthash>.blob
 ```
+
+"Changed" is load-bearing there. The mutation path widens the edited file with its code-graph
+dependents so that errors *about them* are promoted out of the raw output, and that widened set is the
+**diagnostic focus** — it is not evidence. A neighbour that happened to be recompiled alongside an
+edit says nothing about what sentinel verified, so it never reaches the ledger, never defines the code
+state a repair loop is about, and never drives the step `files` filter. One array used to answer all
+four of those questions at once, which is how "verified green right now" ended up being claimed for
+files nobody had touched.
 
 When a later check fails on a file that was green at a different hash, sentinel says so instead of
 repeating an error the agent already failed to fix:
@@ -761,7 +769,7 @@ export default defineConfig({
 | `revisionContract` | boolean | `true` | Inject the bounded-repair rules into the system prompt (P4). |
 | `backgroundTurnEnd` | boolean | `true` | Run `onTurnEnd` without blocking the turn, re-wake on failure (P5). |
 | `maxOutputTokens` | number | `2500` | Token budget for model-visible verification output; `0` = off. |
-| `impactAwareFocus` | boolean | `true` | Extend the verification focus with code-graph dependents. |
+| `impactAwareFocus` | boolean | `true` | Extend the verification *focus* with code-graph dependents. The focus widens diagnostics only — evidence, the state hash and the `files` filter stay on what actually changed. |
 | `maxTraceLines` | number | `12` | Critical error lines kept by the pruner. |
 | `verification.debounceMs` | number | `0` | Coalesce mutations that land within this window (P6). |
 | `verification.maxOutputBytes` | number | `262144` | Cap on one step's combined stdout+stderr before truncation. |

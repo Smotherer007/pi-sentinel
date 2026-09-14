@@ -300,6 +300,7 @@ function request(overrides: Partial<BackgroundRequest> = {}): BackgroundRequest 
     cwd: "/p",
     ctx: { ui: {} as never },
     focusPaths: ["/p/a.ts"],
+    changedPaths: ["/p/a.ts"],
     ...overrides,
   };
 }
@@ -351,11 +352,20 @@ describe("the background slot", () => {
 
   test("the union of both scopes is what gets verified", () => {
     const merged = mergeBackgroundRequests(
-      request({ focusPaths: ["/p/a.ts", "/p/shared.ts"], mutablePaths: ["/p/a.ts"] }),
-      request({ focusPaths: ["/p/b.ts", "/p/shared.ts"], mutablePaths: ["/p/b.ts"] }),
+      request({
+        focusPaths: ["/p/a.ts", "/p/shared.ts"],
+        changedPaths: ["/p/a.ts"],
+        mutablePaths: ["/p/a.ts"],
+      }),
+      request({
+        focusPaths: ["/p/b.ts", "/p/shared.ts"],
+        changedPaths: ["/p/b.ts"],
+        mutablePaths: ["/p/b.ts"],
+      }),
     );
 
     assert.deepEqual(merged.focusPaths, ["/p/a.ts", "/p/shared.ts", "/p/b.ts"]);
+    assert.deepEqual(merged.changedPaths, ["/p/a.ts", "/p/b.ts"]);
     assert.deepEqual(merged.mutablePaths, ["/p/a.ts", "/p/b.ts"]);
   });
 });

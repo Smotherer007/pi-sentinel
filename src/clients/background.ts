@@ -25,7 +25,10 @@ import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 export interface BackgroundRequest {
   cwd: string;
   ctx: { ui: ExtensionUIContext };
+  /** Files the run is about, widened by graph dependents (diagnostic focus). */
   focusPaths: string[];
+  /** Files the turn actually changed — what evidence and the state hash bind to. */
+  changedPaths: string[];
   /**
    * Pre-state checkpoint of the turn. A background run may only roll back
    * while this is still the newest checkpoint.
@@ -82,6 +85,7 @@ export function mergeBackgroundRequests(
     cwd: next.cwd,
     ctx: next.ctx,
     focusPaths: [...new Set([...waiting.focusPaths, ...next.focusPaths])],
+    changedPaths: [...new Set([...waiting.changedPaths, ...next.changedPaths])],
     checkpointId: next.checkpointId,
     mutablePaths: [...new Set([...(waiting.mutablePaths ?? []), ...(next.mutablePaths ?? [])])],
     postHashes,

@@ -18,7 +18,7 @@ import { execSync } from "node:child_process";
 import extensionFactory, { SENTINEL_MESSAGE_TYPE, SENTINEL_NOTICE_TYPE } from "../index.ts";
 import { projectDir, _resetForTesting, getConfig, getState } from "../src/config.ts";
 import { checkpoints } from "../src/clients/checkpoints.ts";
-import { verifiedEntry } from "../src/clients/evidence.ts";
+import { verifiedEntry, allVerified } from "../src/clients/evidence.ts";
 import { SentinelRewindTool } from "../src/tools/sentinel-rewind.ts";
 import { SentinelStatusTool } from "../src/tools/sentinel-status.ts";
 import { _clearCache } from "../src/clients/mindplace.ts";
@@ -1532,6 +1532,36 @@ describe("rollback behaviour", () => {
 });
 
 describe("mindplace impact section", () => {
+  /** A two-file graph: `dependent` calls into src/a.ts. */
+  function writeGraph(dependent: string): void {
+    const dependentId = dependent.replace(/[^a-z0-9]/gi, "_");
+    fs.mkdirSync(path.join(project, "graph-out"), { recursive: true });
+    fs.writeFileSync(
+      path.join(project, "graph-out", "graph.json"),
+      JSON.stringify({
+        nodes: [
+          { id: "a", label: "a", type: "file", sourceFile: "src/a.ts" },
+          { id: "parseA", label: "parseA", type: "function", sourceFile: "src/a.ts" },
+          {
+            id: "b",
+            label: dependent,
+            type: "file",
+            sourceFile: dependent,
+          },
+          {
+            id: dependentId,
+            label: "useA",
+            type: "function",
+            sourceFile: dependent,
+          },
+        ],
+        edges: [{ source: dependentId, target: "parseA", relation: "calls" }],
+      }),
+      "utf-8",
+    );
+    _clearCache();
+  }
+
   test("names graph dependents in the failure payload", async () => {
     await configure({
       autoRollback: false,
@@ -1539,21 +1569,7 @@ describe("mindplace impact section", () => {
       pipelines: { onFileMutation: [], onTurnEnd: [{ name: "check", cmd: "exit 1", timeoutMs: 5000 }] },
     });
 
-    fs.mkdirSync(path.join(project, "graph-out"), { recursive: true });
-    fs.writeFileSync(
-      path.join(project, "graph-out", "graph.json"),
-      JSON.stringify({
-        nodes: [
-          { id: "a", label: "a.ts", type: "file", sourceFile: "src/a.ts" },
-          { id: "parseA", label: "parseA", type: "function", sourceFile: "src/a.ts" },
-          { id: "b", label: "b.ts", type: "file", sourceFile: "src/b.ts" },
-          { id: "useA", label: "useA", type: "function", sourceFile: "src/b.ts" },
-        ],
-        edges: [{ source: "useA", target: "parseA", relation: "calls" }],
-      }),
-      "utf-8",
-    );
-    _clearCache();
+    writeGraph("src/b.ts");
 
     await runTurn(1, "src/a.ts", "export const a = 1;\n");
     const body = fake.sent[0].message.content as string;
@@ -1573,6 +1589,98 @@ describe("mindplace impact section", () => {
     await runTurn(1, "src/a.ts", "export const a = 1;\n");
     const body = fake.sent[0].message.content as string;
     assert.equal(body.includes("Impact (code graph):"), false);
+  });
+});
+
+/**
+ * The diagnostic focus and the evidence scope are different sets.
+ *
+ * The mutation path widens the mutated file with its graph dependents so their
+ * errors are promoted out of the raw output. That widened set used to be handed
+ * to four different questions at once, of which only the first wants it.
+ */
+describe("diagnostics expand, evidence does not", () => {
+  /** A two-file graph: `dependent` calls into src/a.ts, and both exist on disk. */
+  function writeDependentGraph(dependent: string): void {
+    fs.mkdirSync(path.join(project, "graph-out"), { recursive: true });
+    fs.writeFileSync(
+      path.join(project, "graph-out", "graph.json"),
+      JSON.stringify({
+        nodes: [
+          { id: "a", label: "a", type: "file", sourceFile: "src/a.ts" },
+          { id: "parseA", label: "parseA", type: "function", sourceFile: "src/a.ts" },
+          { id: "b", label: dependent, type: "file", sourceFile: dependent },
+          { id: "useA", label: "useA", type: "function", sourceFile: dependent },
+        ],
+        edges: [{ source: "useA", target: "parseA", relation: "calls" }],
+      }),
+      "utf-8",
+    );
+    // The dependent must exist: `recordVerified` only records files it can
+    // hash, so a phantom path would make the ledger assertion below vacuous.
+    fs.mkdirSync(path.dirname(path.join(project, dependent)), { recursive: true });
+    fs.writeFileSync(path.join(project, dependent), "export const b = 2;\n", "utf-8");
+    _clearCache();
+  }
+
+  test("a dependency that was merely recompiled is not recorded as verified", async () => {
+    await configure({
+      autoRollback: false,
+      include: ["**/*.ts"],
+      pipelines: {
+        onFileMutation: [{ name: "check", cmd: "exit 0", timeoutMs: 5000 }],
+        onTurnEnd: [],
+      },
+    });
+    writeDependentGraph("src/b.ts");
+
+    await mutate("src/a.ts", "export const a = 1;\n");
+
+    // Before the split, the expanded focus set reached the ledger and the
+    // dependent was claimed as "verified green right now" from then on.
+    assert.deepEqual(
+      allVerified(project).map((entry) => path.relative(project, entry.path)),
+      ["src/a.ts"],
+    );
+    assert.equal(verifiedEntry(project, path.join(project, "src/b.ts")), null);
+  });
+
+  test("the step filter matches the file that changed, not its dependents", async () => {
+    await configure({
+      autoRollback: false,
+      include: [],
+      pipelines: {
+        // A step for another language: it must not run because a `.py`
+        // neighbour happens to import the edited `.ts` file.
+        onFileMutation: [{ name: "python-only", cmd: "exit 1", files: ["**/*.py"], timeoutMs: 5000 }],
+        onTurnEnd: [],
+      },
+    });
+    writeDependentGraph("src/b.py");
+
+    const result = await mutate("src/a.ts", "export const a = 1;\n");
+    assert.equal(result, undefined, "the .py step does not apply to a .ts edit");
+  });
+
+  test("a mutation failure names the dependents of what changed", async () => {
+    await configure({
+      autoRollback: false,
+      include: ["**/*.ts"],
+      pipelines: {
+        onFileMutation: [{ name: "check", cmd: "exit 1", timeoutMs: 5000 }],
+        onTurnEnd: [],
+      },
+    });
+    writeDependentGraph("src/b.ts");
+
+    const result = await mutate("src/a.ts", "export const a = 1;\n");
+    const text = (result.content as Array<{ text: string }>).map((b) => b.text).join("\n");
+
+    // The impact section is about the edited file's blast radius. Fed with the
+    // expanded set it filtered its own dependents out as "self" and reported
+    // every entry with "→ none".
+    assert.ok(text.includes("Impact (code graph):"), text);
+    assert.ok(text.includes("→ src/b.ts"), `the dependent is named as one:\n${text}`);
   });
 });
 

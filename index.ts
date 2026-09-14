@@ -260,7 +260,10 @@ interface VerificationState {
 interface MutationRequest {
   cwd: string;
   ctx: { ui: ExtensionUIContext };
+  /** What the run is about, widened by graph dependents (diagnostic focus). */
   focusPaths: string[];
+  /** What the agent actually wrote — the only thing evidence may bind to. */
+  changedPaths: string[];
   toolCallIds: string[];
 }
 
@@ -295,12 +298,14 @@ export default function (pi: ExtensionAPI) {
     async (_key, requests) => {
       const first = requests[0];
       const focusPaths = [...new Set(requests.flatMap((request) => request.focusPaths))];
+      const changedPaths = [...new Set(requests.flatMap((request) => request.changedPaths))];
       const outcome = await runVerificationSafely({
         trigger: "onFileMutation",
         cwd: first.cwd,
         ctx: first.ctx,
         // One run, the union of every request in the batch.
         focusPaths,
+        changedPaths,
         toolCallIds: [...new Set(requests.flatMap((request) => request.toolCallIds))],
       });
       if (outcome) return outcome;
@@ -309,7 +314,7 @@ export default function (pi: ExtensionAPI) {
       return {
         passed: true,
         stateHash: "",
-        focusPaths,
+        changedPaths,
         warnings: [],
         rolledBack: false,
         regressions: [],
@@ -555,7 +560,19 @@ export default function (pi: ExtensionAPI) {
     trigger: "onFileMutation" | "onTurnEnd";
     cwd: string;
     ctx: { ui: ExtensionUIContext };
+    /**
+     * Files the run is about, widened by graph dependents. This is the
+     * *diagnostic* focus: the pruner promotes errors about these files, and the
+     * failure payload names their blast radius.
+     */
     focusPaths: string[];
+    /**
+     * Files this turn actually changed. Evidence, the state hash and regression
+     * detection bind to these, never to the widened focus set — a dependent that
+     * was merely recompiled is not something sentinel verified, and must not be
+     * claimed as green.
+     */
+    changedPaths: string[];
     /** Mutations this verification belongs to (a coalesced batch holds several). */
     toolCallIds?: string[];
     /**
@@ -576,10 +593,10 @@ export default function (pi: ExtensionAPI) {
     const runner = new PipelineRunner();
     const run = await runner.runAll(args.trigger, args.cwd, {
       focusPaths: args.focusPaths,
-      changedFiles: args.focusPaths,
+      changedFiles: args.changedPaths,
       skipCache: args.skipCache,
     });
-    const stateHash = stateHashOf(args.focusPaths);
+    const stateHash = stateHashOf(args.changedPaths);
 
     if (run.passed) {
       args.ctx.ui.setStatus("sentinel", undefined);
@@ -589,11 +606,12 @@ export default function (pi: ExtensionAPI) {
       if (ranAnyStep(run)) escalations.reset();
       // Evidence only counts when something actually ran: an empty pipeline
       // group proves nothing, and claiming "verified" for it would be a lie.
-      if (conf.trackVerifiedState && args.focusPaths.length > 0 && ranAnyStep(run)) {
+      // Only the changed files are recorded — see the note on `changedPaths`.
+      if (conf.trackVerifiedState && args.changedPaths.length > 0 && ranAnyStep(run)) {
         try {
           recordVerified(
             args.cwd,
-            args.focusPaths,
+            args.changedPaths,
             `${args.trigger}:${run.steps.filter((s) => !s.skipped).map((s) => s.name).join("+") || "none"}`,
           );
         } catch {
@@ -604,7 +622,7 @@ export default function (pi: ExtensionAPI) {
       return {
         passed: true,
         stateHash,
-        focusPaths: args.focusPaths,
+        changedPaths: args.changedPaths,
         warnings: run.warnings,
         rolledBack: false,
         regressions: [],
@@ -630,10 +648,11 @@ export default function (pi: ExtensionAPI) {
     );
 
     // 0) Detect regressions first: a later revert must not erase the evidence
-    //    that the file *was* green before this revision.
+    //    that the file *was* green before this revision. Judged only over what
+    //    changed — `ownedPaths` would filter the rest out anyway.
     let regressions =
       conf.trackVerifiedState
-        ? detectRegressionsSafe(args.cwd, args.focusPaths).filter((r) =>
+        ? detectRegressionsSafe(args.cwd, args.changedPaths).filter((r) =>
             ownedPaths.has(r.path),
           )
         : [];
@@ -749,7 +768,7 @@ export default function (pi: ExtensionAPI) {
     return {
       passed: false,
       stateHash,
-      focusPaths: args.focusPaths,
+      changedPaths: args.changedPaths,
       failure,
       warnings: run.warnings,
       rolledBack,
@@ -772,7 +791,6 @@ export default function (pi: ExtensionAPI) {
   /** Render the model-visible failure payload for one red verification run. */
   function renderFailure(
     outcome: VerificationOutcome,
-    focusPaths: string[],
     cwd: string,
     attempt?: { attempt: number; max: number; stopped?: boolean },
     stateHashOverride?: string,
@@ -789,7 +807,9 @@ export default function (pi: ExtensionAPI) {
       rawOutput: failure.rawOutput,
       warnOnly: failure.warnOnly,
       rolledBack: outcome.rolledBack,
-      focusPaths,
+      // The changed files, so the impact section names the dependents of what
+      // was actually edited instead of filtering them out as its own scope.
+      focusPaths: outcome.changedPaths,
       stateHash: stateHashOverride ?? outcome.stateHash,
       regressions: outcome.regressions,
       attempt,
@@ -816,7 +836,6 @@ export default function (pi: ExtensionAPI) {
    */
   function handleRedTurn(args: {
     outcome: VerificationOutcome;
-    focusPaths: string[];
     cwd: string;
     ctx: { ui: ExtensionUIContext };
     /** Pre-state checkpoint of this turn, used by rollbackAfterExhaustion. */
@@ -836,7 +855,7 @@ export default function (pi: ExtensionAPI) {
     // The state the stop condition is judged against. A turn that changed
     // nothing still refers to the files of the previous attempt, so both are
     // hashed over the same path set.
-    const deltaPaths = deltaPathsOf(repair, args.focusPaths);
+    const deltaPaths = deltaPathsOf(repair, args.outcome.changedPaths);
     const stateHash = stateHashOf([...deltaPaths]);
 
     const decision = decideRepair(repair, {
@@ -895,7 +914,6 @@ export default function (pi: ExtensionAPI) {
 
     const text = renderFailure(
       args.outcome,
-      args.focusPaths,
       args.cwd,
       decision.attempt,
       stateHash,
@@ -1118,11 +1136,16 @@ export default function (pi: ExtensionAPI) {
     // formatter, another process, the user) is never overwritten silently.
     snapshots.capturePost(event.toolCallId);
 
-    const focusPaths = focusFor(ctx.cwd, target ? [absPath(target, ctx.cwd)] : []);
+    // Two sets on purpose: `changedPaths` is what the agent wrote, and is the
+    // only thing that may become evidence; `focusPaths` widens it with graph
+    // dependents so their diagnostics are promoted out of the raw output.
+    const changedPaths = target ? [absPath(target, ctx.cwd)] : [];
+    const focusPaths = focusFor(ctx.cwd, changedPaths);
     const outcome = await mutationQueue.enqueue(ctx.cwd, {
       cwd: ctx.cwd,
       ctx,
       focusPaths,
+      changedPaths,
       toolCallIds: [event.toolCallId],
     });
 
@@ -1136,7 +1159,7 @@ export default function (pi: ExtensionAPI) {
     // best-effort: a broken ledger must not turn into a hook exception.
     let failureText: string;
     try {
-      failureText = renderFailure(outcome, outcome.focusPaths, ctx.cwd);
+      failureText = renderFailure(outcome, ctx.cwd);
     } catch {
       failureText = `[sentinel] Verification failed at step "${outcome.failure?.step ?? "unknown"}" (exit ${outcome.failure?.exitCode ?? -1}). The failure could not be formatted; inspect the output manually.`;
     }
@@ -1247,6 +1270,7 @@ export default function (pi: ExtensionAPI) {
         cwd: ctx.cwd,
         ctx,
         focusPaths,
+        changedPaths: focusPaths,
         checkpointId,
         // The in-memory scope is cleared right below; hand the background run
         // the agent's own files so its regression revert stays scoped.
@@ -1262,6 +1286,9 @@ export default function (pi: ExtensionAPI) {
       cwd: ctx.cwd,
       ctx,
       focusPaths,
+      // Nothing widens the turn-end set, so both are the same files: the
+      // mutations plus whatever changed out of band.
+      changedPaths: focusPaths,
       mutablePaths: turnPaths,
       postHashes: snapshots.turnPostHashes(),
     });
@@ -1284,7 +1311,6 @@ export default function (pi: ExtensionAPI) {
     } else {
       handleRedTurnSafely({
         outcome,
-        focusPaths,
         cwd: ctx.cwd,
         ctx,
         checkpointId,
@@ -1305,6 +1331,7 @@ export default function (pi: ExtensionAPI) {
     cwd: string;
     ctx: { ui: ExtensionUIContext };
     focusPaths: string[];
+    changedPaths: string[];
     toolCallIds?: string[];
     mutablePaths?: string[];
     postHashes?: Map<string, string | null>;
@@ -1326,7 +1353,6 @@ export default function (pi: ExtensionAPI) {
   /** Feedback delivery is best-effort: it must not break the turn either. */
   function handleRedTurnSafely(args: {
     outcome: VerificationOutcome;
-    focusPaths: string[];
     cwd: string;
     ctx: { ui: ExtensionUIContext };
     checkpointId?: string;
@@ -1377,6 +1403,7 @@ export default function (pi: ExtensionAPI) {
           cwd: args.cwd,
           ctx: args.ctx,
           focusPaths: args.focusPaths,
+          changedPaths: args.changedPaths,
           mutablePaths: args.mutablePaths,
           postHashes: args.postHashes,
           allowRollback: false,
@@ -1429,7 +1456,6 @@ export default function (pi: ExtensionAPI) {
 
         handleRedTurnSafely({
           outcome,
-          focusPaths: args.focusPaths,
           cwd: args.cwd,
           ctx: args.ctx,
           checkpointId: args.checkpointId,

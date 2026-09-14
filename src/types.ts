@@ -389,16 +389,22 @@ export type AutoFixAction = "inject" | "stop-unchanged" | "exhausted" | "none";
  * working tree.
  *
  * Produced by the runner (`onFileMutation` and `onTurnEnd` both), consumed by
- * the failure feedback and by the repair state machine. The two file sets it
- * carries are deliberately distinct: `focusPaths` is what the run was about,
- * `regressions`/`conflicts`/`restoreSkipped` describe what happened to them.
+ * the failure feedback and by the repair state machine.
  */
 export interface VerificationOutcome {
   passed: boolean;
   /** Identity of the code state the outcome refers to. */
   stateHash: string;
-  /** The files the run actually covered (a coalesced batch covers several). */
-  focusPaths: string[];
+  /**
+   * The files this turn actually changed (a coalesced batch covers several).
+   *
+   * Deliberately *not* the run's diagnostic focus, which is this set widened by
+   * the code graph's dependents. Only a file that changed may become evidence,
+   * may define the code state a repair loop is about, or may be judged a
+   * regression — a neighbour that was merely recompiled alongside it is none of
+   * those things.
+   */
+  changedPaths: string[];
   /** First critical failure, when the run failed. */
   failure?: VerificationResult;
   warnings: PipelineRunResult["warnings"];

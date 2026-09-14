@@ -82,8 +82,13 @@ export interface RunOptions {
   /** File paths just mutated — diagnostics about them are promoted. */
   focusPaths?: string[];
   /**
-   * Files the step filter matches against. Defaults to `focusPaths`; turn-end
-   * runs pass the wider set (mutations + out-of-band changes).
+   * Files that actually changed, for the step `files` filter.
+   *
+   * Distinct from `focusPaths`, which is widened by graph dependents so their
+   * diagnostics are promoted. A step that declares it only cares about `.ts`
+   * files cares about what was edited, not about which neighbours were
+   * recompiled. Defaults to `focusPaths`; turn-end runs pass the wider set
+   * (mutations + out-of-band changes).
    */
   changedFiles?: string[];
   /** Bypass the verification cache for this run (explicit re-check). */
@@ -203,8 +208,11 @@ export class PipelineRunner {
       maxEntries: cacheSettings?.maxEntries ?? 50,
       persist: cacheSettings?.persist ?? false,
     });
+    // The key covers the *focus* set, not just the changed files: graph
+    // dependents are part of what this check answered about, so their content
+    // must be able to invalidate a reused result.
     const cacheKey = cacheable
-      ? createCacheKey({ trigger, cwd, focusPaths: changedFiles, steps })
+      ? createCacheKey({ trigger, cwd, focusPaths: options.focusPaths ?? changedFiles, steps })
       : "";
     if (cacheable) {
       const hit = cache.get(cacheKey);
