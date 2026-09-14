@@ -1751,6 +1751,45 @@ describe("P5 — output budget and background checks", () => {
     assert.ok(fake.sent.length >= 1, "the folded run produced fresh feedback");
   });
 
+  test("a retired session does not start another background check", async () => {
+    await configure({
+      autoRollback: false,
+      backgroundTurnEnd: true,
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [
+          {
+            // Each execution leaves a mark, so "did a run start?" is answered by
+            // counting lines rather than by reading a payload.
+            name: "slow",
+            cmd: "sleep 0.3; echo run >> ran.log; exit 1",
+            timeoutMs: 20000,
+            cacheable: false,
+          },
+        ],
+      },
+    });
+
+    // Turn 1 starts the slow check; turn 2 is folded into the run that will
+    // cover it. Then the session is replaced, which retires this instance's ctx
+    // while the first run is still in flight.
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+    await runTurn(2, "src/b.ts", "export const b = 2;\n");
+    await emit(fake, "session_shutdown", { type: "session_shutdown" }, ctx);
+
+    // The drain cannot report anything — every branch of the run returns early
+    // on a retired ctx — so it must not start the folded run either. Without the
+    // guard this was an endless `npm test` per turn, for a result nobody could
+    // be told and a failure that had already been fixed.
+    await waitFor(() => ctx._statuses.get("sentinel") === undefined, 20000);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+
+    const log = path.join(project, "ran.log");
+    const runs = fs.existsSync(log) ? fs.readFileSync(log, "utf-8").trim().split("\n").length : 0;
+    assert.equal(runs, 1, "the folded run must not start in a retired session");
+    assert.equal(fake.sent.length, 0, "a retired session reports nothing");
+  });
+
   test("a green background run is recorded and answers the last failure", async () => {
     await configure({
       autoRollback: false,

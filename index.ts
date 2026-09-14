@@ -1939,6 +1939,18 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
    * reports instead.
    */
   function startBackgroundChecks(args: BackgroundRequest): void {
+    // A retired session can never receive the result, so the run must not start.
+    //
+    // Every branch that would report or resolve an outcome returns early once
+    // `ctxRetired` is set, which means a retired instance would execute a whole
+    // `npm test` — the slowest step there is — for an answer nobody can be told:
+    // no turn outcome, no `resolveOpenFailure()`, no notification. The drain at
+    // the end of a previous run reaches this function with the dead session's
+    // ctx, so the checks ran forever while the failure they were about had long
+    // been fixed. Nothing is lost by dropping the request: the session that owns
+    // the tree now verifies its own turns.
+    if (ctxRetired) return;
+
     if (backgroundRun) {
       // Never drop the turn. Skipping it would let unverified code reach the
       // user with no trace at all — the silent version of exactly the failure
