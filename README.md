@@ -42,13 +42,14 @@ runs.
 **A verdict is only true of the tree it read.** So a red payload that outlived its own state is not
 re-delivered as current: it is kept — the diagnostics are the reader's, not sentinel's to throw away
 — marked `[sentinel] STALE:` with the files that moved, delivered without waking the agent, and
-recorded as `superseded` in the auto-fix history. The same rule applies at the moment the model reads
-it, and there it is a *replacement* rather than a prefix: a payload carries its own state hash and
-file list, and a delivery that has been overtaken by an edit hands the model the one-line stale
-notice instead of the body — the session keeps the full payload for the person reading it. Nothing
-reaches the model as an instruction about a state that no longer exists, and nothing is hidden from
-the human. (pi has no API to retract a message it has already queued, so this hook is the earliest
-point sentinel can still decide what the model sees.)
+recorded as `superseded` in the auto-fix history. At the moment the model reads it there are three
+cases, and they get three answers: a trace a later **green run has answered** is replaced by the
+superseded notice (nothing in it is worth acting on), a trace the **freshness gate discarded** is
+replaced by "stale, re-run to confirm", and a trace whose files moved **because the repair moved
+them** keeps its diagnostics with the caveat in front — it is still the failure being worked on, and
+hiding it there once cost a user the error text mid-repair. The session always keeps the full payload
+for the person reading it, whatever the model is shown. (pi has no API to retract a message it has
+already queued, so this hook is the earliest point sentinel can still decide what the model sees.)
 
 ## Contents
 
