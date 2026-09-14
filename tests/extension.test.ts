@@ -1738,7 +1738,17 @@ describe("P5 — output budget and background checks", () => {
       20000,
     );
     await waitFor(() => ctx._statuses.get("sentinel") === undefined, 20000);
-    assert.ok(fake.sent.length >= 2, "both turns produced feedback");
+
+    // The first run's verdict was produced while turn 2 was writing `src/b.ts`.
+    // That verdict describes a tree that no longer exists, so it is announced as
+    // superseded rather than re-prompted — and the folded run, which covers both
+    // turns, is the one that reaches the agent. The guarantee under test is that
+    // no turn goes unverified, not that every run gets its own feedback.
+    assert.ok(
+      ctx._notifications.some((n) => n.text.includes("stale result was discarded")),
+      "the superseded run is named rather than acted on",
+    );
+    assert.ok(fake.sent.length >= 1, "the folded run produced fresh feedback");
   });
 
   test("a green background run is recorded and answers the last failure", async () => {

@@ -17,6 +17,7 @@ import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
+import { learnMutationTool } from "./clients/mutation.ts";
 import type {
   AutoFixOutcome,
   BashGuardConfig,
@@ -225,6 +226,15 @@ export interface SentinelState {
     rules: string[];
     files: string[];
   }>;
+  /**
+   * Tool names caught writing a file that nobody declared as a mutation.
+   *
+   * Written once a call is *observed* to have changed a file (see
+   * `clients/mutation.ts`), so the next call of that tool is snapshotted before
+   * it runs instead of after. Persisted per project, so a later session in the
+   * same repository classifies the tool from disk and pays nothing for it.
+   */
+  learnedMutationTools: string[];
 }
 
 /**
@@ -267,6 +277,7 @@ function emptyState(): SentinelState {
     turnHistory: [],
     escalations: [],
     policyViolations: [],
+    learnedMutationTools: [],
   };
 }
 
@@ -609,6 +620,11 @@ export class ConfigStore {
             turnHistory: Array.isArray(raw.turnHistory) ? raw.turnHistory : [],
             escalations: Array.isArray(raw.escalations) ? raw.escalations : [],
             policyViolations: Array.isArray(raw.policyViolations) ? raw.policyViolations : [],
+            // Older state files have no learned tools at all, and a hand-edited
+            // one may hold anything: keep the strings, drop the rest.
+            learnedMutationTools: Array.isArray(raw.learnedMutationTools)
+              ? raw.learnedMutationTools.filter((name: unknown): name is string => typeof name === "string")
+              : [],
           };
           return;
         }
@@ -673,6 +689,22 @@ export class ConfigStore {
     this.current.policyViolations.unshift(entry);
     if (this.current.policyViolations.length > 20) this.current.policyViolations.length = 20;
     this.persist();
+  }
+
+  /**
+   * Remember that a tool writes files, after observing it do so.
+   *
+   * The point is the *next* call: a learned name is classified before the tool
+   * runs, so its pre-state is captured up front and a failed turn can undo it.
+   * Returns true when the name was new, which is what the caller reports.
+   */
+  learnMutationTool(toolName: string): boolean {
+    const learned = this.current.learnedMutationTools;
+    const next = learnMutationTool(learned, toolName);
+    if (next.length === learned.length) return false;
+    this.current.learnedMutationTools = next;
+    this.persist();
+    return true;
   }
 
   /** P6: record the outcome of a turn, for the compact history block. */

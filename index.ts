@@ -109,6 +109,11 @@ import type { BashRisk } from "./src/clients/bash-guard.ts";
 import type { WorkspaceBaseline } from "./src/clients/workspace.ts";
 import { describeChange, expandWithDependents, graphStatus } from "./src/clients/mindplace.ts";
 import { VerificationQueue } from "./src/clients/queue.ts";
+import { classifyMutation } from "./src/clients/mutation.ts";
+import { adoptBus, publishRollback, publishVerified, subscribeTouched } from "./src/clients/bus.ts";
+import type { EventBusLike } from "./src/clients/bus.ts";
+import { describeMoved, fingerprintInputs, movedInputs } from "./src/clients/freshness.ts";
+import type { InputPatterns, RunInputs } from "./src/clients/freshness.ts";
 import { shouldEscalate } from "./src/clients/escalation.ts";
 import {
   autoFixOutcomeOf,
@@ -366,6 +371,40 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
   let sessionStartedAtMs = Date.now();
 
   /**
+   * Tool calls the mutation seam could not classify but that named a path.
+   *
+   * Their pre-state was captured speculatively (`clients/mutation.ts`, tier 3);
+   * `tool_result` decides from the file itself whether the call wrote, and
+   * therefore whether the tool joins the learned set.
+   */
+  const observedCalls = new Set<string>();
+
+  /**
+   * Files another extension reported writing this turn, as absolute paths.
+   *
+   * Attribution and coverage, never a pre-state: by the time such an event
+   * arrives the file is already written, so these widen what gets verified (and
+   * they are the only signal at all in a project without git) but they cannot
+   * be restored by a rollback.
+   */
+  let externallyTouched: string[] = [];
+  let externalTouchedNoticeShown = false;
+
+  /** pi's shared inter-extension bus, when this host publishes one. */
+  let sessionBus: EventBusLike | null = null;
+
+  /**
+   * The patterns a run's inputs are bound by, in the shape `freshness.ts` wants.
+   *
+   * The same `include`/`exclude` that already decides whether a file is worth
+   * verifying: a file the project's checks may read is a file whose change can
+   * invalidate their verdict.
+   */
+  function inputPatterns(conf: SentinelConfig): InputPatterns {
+    return { include: conf.include, exclude: conf.exclude };
+  }
+
+  /**
    * Mutation verifications are batched: with a debounce window, edits that
    * land together (parallel tool calls in one assistant message) produce a
    * single run instead of one run per edit. With the default window of `0`
@@ -376,6 +415,14 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
       const first = requests[0];
       const focusPaths = [...new Set(requests.flatMap((request) => request.focusPaths))];
       const changedPaths = [...new Set(requests.flatMap((request) => request.changedPaths))];
+      // Bind the run to the inputs it can read, so a concurrent writer — a
+      // formatter, another agent, the user — invalidates the verdict instead of
+      // being reported as a failure the agent has to chase.
+      const inputs = fingerprintInputs(
+        first.cwd,
+        focusPaths,
+        inputPatterns(runtime.config.config()),
+      );
       const outcome = await runVerificationSafely({
         trigger: "onFileMutation",
         cwd: first.cwd,
@@ -384,6 +431,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
         focusPaths,
         changedPaths,
         toolCallIds: [...new Set(requests.flatMap((request) => request.toolCallIds))],
+        inputs,
       });
       if (outcome) return outcome;
       // The runner threw: do not invent a failure. The mutation stands and the
@@ -848,6 +896,13 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     allowRollback?: boolean;
     /** Bypass the verification cache (explicit runs). */
     skipCache?: boolean;
+    /**
+     * The inputs this verdict is bound to (see `clients/freshness.ts`).
+     *
+     * Taken by the caller *before* the run starts, because that is the only
+     * moment the "before" state exists. Omitted for runs with nothing to bind.
+     */
+    inputs?: RunInputs;
   }): Promise<VerificationOutcome> {
     const conf = runtime.config.config();
     const runner = new PipelineRunner(runtime.config);
@@ -894,6 +949,30 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     const failure = run.failure!;
     args.ctx.ui.setStatus("sentinel", undefined);
 
+    // Was the verdict still about the tree when it was produced?
+    //
+    // Asked here — after the check, *before* sentinel touches anything — because
+    // sentinel's own regression revert changes the very files the verdict is
+    // bound to. Asked any later, its own restore looks like the tree moving, and
+    // the runs that legitimately revert would all be discarded as stale.
+    const staleInputs = args.inputs
+      ? movedInputs(args.inputs, args.cwd, inputPatterns(conf))
+      : [];
+    if (staleInputs.length > 0) {
+      return {
+        passed: false,
+        stateHash,
+        changedPaths: args.changedPaths,
+        failure,
+        warnings: run.warnings,
+        rolledBack: false,
+        regressions: [],
+        conflicts: [],
+        restoreSkipped: [],
+        staleInputs,
+      };
+    }
+    
     // Files the agent itself wrote this turn — the only ones whose regression
     // sentinel may attribute (and revert). Out-of-band diffs are still verified,
     // but sentinel cannot tell a user's pre-turn edit from an agent's bash edit,
@@ -939,6 +1018,16 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
       conflicts = rb.conflicts ?? [];
       restoreSkipped = rb.skipped ?? [];
       runtime.config.recordMetrics({ rollbacks: 1, partialRollbacks: rb.partial ? 1 : 0 });
+      // Tell the other extensions in this session: a formatter that watches the
+      // bus should not keep asserting a state sentinel has just restored.
+      publishRollback(sessionBus, {
+        at: new Date().toISOString(),
+        reason: failure.step,
+        method: rb.method,
+        ok: rb.success,
+        partial: rb.partial === true,
+        conflicts: (rb.conflicts ?? []).length,
+      });
       // The rollback *was* attempted, so it belongs in the history even when
       // it came back partial — that is exactly the case a user must know about.
       runtime.config.recordRollback({
@@ -1242,12 +1331,53 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
 
   // ── Hook: session_start ────────────────────────────────────────────────
 
+  /**
+   * Listen for writes made by another extension in this session.
+   *
+   * pi-lens publishes `pilens:files:touched` for its autofix and formatter runs,
+   * which change files outside any tool call sentinel sees. Subscribing buys two
+   * things and deliberately not a third: the paths join this turn's verification
+   * scope (so a formatted file is still checked, and checked even when there is
+   * no git repository to diff against), and the change is *attributed* —
+   * `revertOnRegression` must not silently undo another extension's formatting
+   * as if it were the agent's mistake. What it cannot buy is a pre-state; the
+   * write has already happened, so nothing here is rollback-able.
+   *
+   * Registered once per session with the session's ctx. A subscriber that
+   * outlives that ctx throws into `subscribeTouched`, which swallows it — the
+   * bus must never be able to take a turn down.
+   */
+  function observeExternalWrites(ctx: { cwd: string; ui: { notify(text: string, level?: string): void } }): void {
+    subscribeTouched(sessionBus, (paths, reason) => {
+      const added: string[] = [];
+      for (const path of paths) {
+        const abs = isAbsolute(path) ? path : resolve(ctx.cwd, path);
+        if (externallyTouched.includes(abs)) continue;
+        externallyTouched.push(abs);
+        added.push(abs);
+      }
+      if (added.length === 0 || externalTouchedNoticeShown) return;
+      externalTouchedNoticeShown = true;
+      const shown = added.slice(0, 5).map((p) => relative(ctx.cwd, p));
+      const more = added.length > shown.length ? ` (+${added.length - shown.length} more)` : "";
+      ctx.ui.notify(
+        `Sentinel: another extension wrote ${added.length} file(s)${reason ? ` (${reason})` : ""} — ${shown.join(", ")}${more}. They are verified with this turn's checks, but sentinel holds no pre-state for them, so a rollback cannot restore them.`,
+        "info",
+      );
+    });
+  }
+
   pi.on("session_start", async (_event, ctx) => {
     warnedStaleGraphAt = null;
     sessionStartedAtMs = Date.now();
     await ensureConfig(ctx.cwd);
     resetRepairBudget();
     failureOutstanding = false;
+    // The bus belongs to the host, not to a turn: adopt it once per session and
+    // listen for the whole session, so a write made mid-turn is seen in time to
+    // join that turn's verification.
+    sessionBus = adoptBus(pi);
+    observeExternalWrites(ctx);
     const conf = runtime.config.config();
     if (conf.enabled) {
       const extras = [
@@ -1306,6 +1436,11 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
 
   pi.on("turn_start", async (event, ctx) => {
     runtime.snapshots.beginTurn();
+    // Per-turn, like the snapshot scope: last turn's speculative observations
+    // and last turn's foreign writes must not leak into this one.
+    observedCalls.clear();
+    externallyTouched = [];
+    externalTouchedNoticeShown = false;
     await ensureConfig(ctx.cwd);
     const conf = runtime.config.config();
     if (!conf.enabled) return;
@@ -1376,12 +1511,36 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
       return;
     }
 
-    const isMutation =
-      isToolCallEventType("edit", event) || isToolCallEventType("write", event);
-    if (!isMutation) return;
+    // ── Mutation seam (P1/P2) ────────────────────────────────────────────
+    // Which calls write is decided by `clients/mutation.ts`, not by comparing
+    // two tool names: a project whose editor tool is called `replace`, `insert`
+    // or `apply_patch` writes files too, and a write nobody snapshotted is a
+    // write nobody can undo.
+    const hint = classifyMutation(
+      event.toolName,
+      event.input,
+      runtime.config.state().learnedMutationTools,
+    );
+    if (!hint) return;
 
-    const input = event.input as Record<string, unknown>;
-    const target = (input.path ?? input.filePath ?? input.file) as string | undefined;
+    // Tier 3: the call names a path but carries no content, so it may or may not
+    // write. Capture the pre-state speculatively — it is one file read — and let
+    // `tool_result` drop it again if nothing changed.
+    if (hint.kind === "unknown") {
+      let armed = false;
+      for (const path of hint.paths) {
+        if (!targetInScope(path, ctx.cwd)) continue;
+        runtime.snapshots.captureCall(event.toolCallId, absPath(path, ctx.cwd));
+        armed = true;
+      }
+      // Only a call with something actually captured is worth asking about at
+      // `tool_result`. A call naming only out-of-scope paths is not sentinel's
+      // to observe, and must not be learned as a writer on the strength of it.
+      if (armed) observedCalls.add(event.toolCallId);
+      return;
+    }
+
+    const target = hint.paths[0];
     if (target && !targetInScope(target, ctx.cwd)) return;
 
     // ── Pre-write gate ───────────────────────────────────────────────────
@@ -1426,29 +1585,55 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
       return;
     }
 
-    const isMutation = event.toolName === "edit" || event.toolName === "write";
-    if (!isMutation) return;
+    // A call the observation arm speculated about: whether it wrote is decided
+    // here, from the file, because nobody declared it.
+    const observed = observedCalls.has(event.toolCallId);
+    if (observed) observedCalls.delete(event.toolCallId);
 
-    // A failed edit/write changed nothing — no need to verify.
+    const hint = classifyMutation(
+      event.toolName,
+      event.input,
+      runtime.config.state().learnedMutationTools,
+    );
+    if (!observed && (!hint || hint.kind === "unknown")) return;
+
+    // A failed mutation changed nothing — no need to verify.
     if (event.isError) {
       runtime.snapshots.endCall(event.toolCallId);
       return;
     }
 
-    const target = (event.input?.path ?? event.input?.filePath) as string | undefined;
-    if (target && !targetInScope(target, ctx.cwd)) {
+    const target = hint?.paths[0];
+    if (!observed && target && !targetInScope(target, ctx.cwd)) {
       runtime.snapshots.endCall(event.toolCallId);
       return;
     }
-    if (target && !shouldVerify(target, conf, ctx.cwd)) {
+    if (!observed && target && !shouldVerify(target, conf, ctx.cwd)) {
       runtime.snapshots.endCall(event.toolCallId);
       return;
     }
 
-    // Byte-identical rewrite: nothing changed, skip the pipeline entirely.
+    // Byte-identical rewrite: nothing changed, skip the pipeline entirely — and
+    // for a speculative observation that is also the answer to "did it write?",
+    // so the capture is dropped and the tool stays unlearned.
     if (runtime.snapshots.isCallUnchanged(event.toolCallId)) {
       runtime.snapshots.endCall(event.toolCallId);
       return;
+    }
+
+    // The unclassified call did write. Learn the name so the *next* call is
+    // classified before it runs, and lift the speculative pre-state to the turn
+    // scope so rolling back this turn covers it as well. The turn snapshot
+    // cannot be taken now: the file on disk is already the new one, and this
+    // call's snapshot *is* the pre-state.
+    if (observed) {
+      if (runtime.config.learnMutationTool(event.toolName)) {
+        ctx.ui.notify(
+          `Sentinel observed "${event.toolName}" writing files — it will be snapshotted before it runs from now on.`,
+          "info",
+        );
+      }
+      runtime.snapshots.promoteCall(event.toolCallId);
     }
 
     // Record what the agent's write left on disk. A later rollback compares
@@ -1459,7 +1644,11 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     // Two sets on purpose: `changedPaths` is what the agent wrote, and is the
     // only thing that may become evidence; `focusPaths` widens it with graph
     // dependents so their diagnostics are promoted out of the raw output.
-    const changedPaths = target ? [absPath(target, ctx.cwd)] : [];
+    const changedPaths = observed
+      ? runtime.snapshots.callSnapshots(event.toolCallId).map((snap) => snap.path)
+      : target
+        ? [absPath(target, ctx.cwd)]
+        : [];
     const focusPaths = focusFor(ctx.cwd, changedPaths);
     const outcome = await mutationQueue.enqueue(ctx.cwd, {
       cwd: ctx.cwd,
@@ -1471,7 +1660,27 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
 
     runtime.snapshots.endCall(event.toolCallId);
 
-    if (outcome.passed) return;
+    if (outcome.passed) {
+      publishVerified(sessionBus, {
+        at: new Date().toISOString(),
+        trigger: "onFileMutation",
+        passed: true,
+        paths: changedPaths,
+      });
+      return;
+    }
+
+    // A verdict whose inputs moved while it ran describes a tree that no longer
+    // exists. The tool result stands unannotated rather than being rewritten to
+    // assert a failure the agent cannot reproduce.
+    const stale = outcome.staleInputs ?? [];
+    if (stale.length > 0) {
+      ctx.ui.notify(
+        `Sentinel: check "${outcome.failure?.step ?? "unknown"}" failed, but ${stale.length} input file(s) changed while it ran (${describeMoved(stale, ctx.cwd)}) — the stale result was discarded and cost no repair attempt.`,
+        "warning",
+      );
+      return;
+    }
 
     // Prepend the pruned error while keeping the original result blocks. The
     // run may have covered more files than this hook did (coalesced batch), so
@@ -1520,7 +1729,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
       }
     }
 
-    const focusPaths = [...new Set([...turnPaths, ...outOfBand])];
+    const focusPaths = [...new Set([...turnPaths, ...externallyTouched, ...outOfBand])];
 
     // Change policy — evaluated before anything is verified or persisted. A
     // violation is a hard stop for the turn, and it is the one check whose
@@ -1605,6 +1814,11 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
       return;
     }
 
+    // Bind the run to its inputs before it starts — see `clients/freshness.ts`
+    // for why the turn's own files are not enough to decide whether a slow
+    // check's verdict still describes the tree.
+    const runInputs = fingerprintInputs(ctx.cwd, focusPaths, inputPatterns(conf));
+
     const outcome = await runVerificationSafely({
       trigger: "onTurnEnd",
       cwd: ctx.cwd,
@@ -1615,6 +1829,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
       changedPaths: focusPaths,
       mutablePaths: turnPaths,
       postHashes: runtime.snapshots.turnPostHashes(),
+      inputs: runInputs,
     });
 
     if (!outcome) {
@@ -1623,15 +1838,35 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
       return;
     }
 
-    runtime.config.recordTurnOutcome({
-      at: new Date().toISOString(),
-      turnIndex: turnIndexOf(event),
-      passed: outcome.passed,
-      step: outcome.failure?.step,
-    });
+    // A red verdict whose inputs moved while the run held them is not a verdict:
+    // it describes a tree that no longer exists. Acting on it spends one of the
+    // bounded repair attempts on code that already changed and tells the agent
+    // to fix something it cannot reproduce. The run decided this itself, before
+    // its own restores ran — see `runVerification`.
+    const moved = outcome.staleInputs ?? [];
+
+    if (moved.length === 0) {
+      runtime.config.recordTurnOutcome({
+        at: new Date().toISOString(),
+        turnIndex: turnIndexOf(event),
+        passed: outcome.passed,
+        step: outcome.failure?.step,
+      });
+    }
 
     if (outcome.passed) {
       resolveOpenFailure();
+      publishVerified(sessionBus, {
+        at: new Date().toISOString(),
+        trigger: "onTurnEnd",
+        passed: true,
+        paths: focusPaths,
+      });
+    } else if (moved.length > 0) {
+      ctx.ui.notify(
+        `Sentinel: check "${outcome.failure?.step ?? "unknown"}" failed, but ${moved.length} input file(s) changed while it ran (${describeMoved(moved, ctx.cwd)}) — the stale result was discarded and cost no repair attempt.`,
+        "warning",
+      );
     } else {
       handleRedTurnSafely({
         outcome,
@@ -1661,6 +1896,8 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     postHashes?: Map<string, string | null>;
     allowRollback?: boolean;
     skipCache?: boolean;
+    /** Inputs the verdict is bound to; see `clients/freshness.ts`. */
+    inputs?: RunInputs;
   }): Promise<VerificationOutcome | null> {
     try {
       return await runVerification(args);
@@ -1726,11 +1963,11 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
         // `npm test` is still running — and acting on a failure that no longer
         // describes the tree is exactly the stale trace that sends repair
         // loops after code that has already moved on.
-        const startHash = stateHashOf(args.focusPaths);
-        // The pipeline set this run executes was resolved when it started. A
-        // configuration change while it is in flight means the result describes
-        // a pipeline that no longer exists — and restoring files on it is how a
-        // mid-run config edit turns into a rollback that deletes the edit.
+        //
+        // The binding is the run's *input set*, not the turn's change set: a
+        // whole-project step reads files no turn touched, and those are the
+        // ones that invalidate its verdict without moving the old hash.
+        const inputs = fingerprintInputs(args.cwd, args.focusPaths, inputPatterns(conf));
         const startRevision = runtime.config.revisionCount();
         const outcome = await runVerification({
           trigger: "onTurnEnd",
@@ -1741,6 +1978,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
           mutablePaths: args.mutablePaths,
           postHashes: args.postHashes,
           allowRollback: false,
+          inputs,
         });
 
         // The conversation this run belongs to may have ended while it ran: the
@@ -1774,10 +2012,13 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
         }
 
         // The code moved while the check ran: report the stale result to the
-        // human, but never re-prompt the agent or restore files on it.
-        if (stateHashOf(args.focusPaths) !== startHash) {
+        // human, but never re-prompt the agent or restore files on it — and
+        // never spend a repair attempt on a state that no longer exists. The
+        // run itself decided this, before any of its own restores ran.
+        const moved = outcome.staleInputs ?? [];
+        if (moved.length > 0) {
           args.ctx.ui.notify(
-            `Sentinel: background check "${outcome.failure?.step ?? "unknown"}" failed, but the code changed while it ran — the stale result was discarded.`,
+            `Sentinel: background check "${outcome.failure?.step ?? "unknown"}" failed, but ${moved.length} of its input file(s) changed while it ran (${describeMoved(moved, args.cwd)}) — the stale result was discarded and cost no repair attempt.`,
             "warning",
           );
           return;

@@ -443,6 +443,15 @@ export interface VerificationOutcome {
   /** Identity of the code state the outcome refers to. */
   stateHash: string;
   /**
+   * Files bound to the run whose content moved while it was running.
+   *
+   * Non-empty means the verdict describes a tree that no longer exists: the
+   * callers must not re-prompt the agent with it, and the run must not have
+   * spent a repair attempt. Decided *before* sentinel's own restore, so its own
+   * revert is never mistaken for the tree moving.
+   */
+  staleInputs?: string[];
+  /**
    * The files this turn actually changed (a coalesced batch covers several).
    *
    * Deliberately *not* the run's diagnostic focus, which is this set widened by

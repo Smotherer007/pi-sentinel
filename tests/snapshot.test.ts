@@ -88,6 +88,49 @@ describe("SnapshotStore.rollbackTurn", () => {
   });
 });
 
+describe("SnapshotStore.promoteCall", () => {
+  test("a speculative call snapshot becomes the turn's pre-state", () => {
+    const store = new SnapshotStore();
+    const file = path.join(dir, "promote.txt");
+    fs.writeFileSync(file, "before");
+
+    // The shape the seam's third tier produces: capture is taken for a call
+    // nobody had classified, then the call turns out to have written.
+    store.captureCall("call-x", file);
+    fs.writeFileSync(file, "after");
+    assert.equal(store.hasTurnSnapshot(), false, "nothing was captured for the turn yet");
+
+    store.promoteCall("call-x");
+    assert.equal(store.hasTurnSnapshot(), true);
+
+    const report = store.rollbackTurn();
+    assert.deepEqual(report.restored, [file]);
+    assert.equal(fs.readFileSync(file, "utf-8"), "before");
+  });
+
+  test("first touch still wins, so a promotion cannot widen a turn", () => {
+    const store = new SnapshotStore();
+    const file = path.join(dir, "promote-order.txt");
+    fs.writeFileSync(file, "turn start");
+    store.captureTurn(file);
+
+    fs.writeFileSync(file, "agent edit");
+    store.captureCall("call-y", file);
+    fs.writeFileSync(file, "foreign tool edit");
+    store.promoteCall("call-y");
+
+    const report = store.rollbackTurn();
+    assert.deepEqual(report.restored, [file]);
+    assert.equal(fs.readFileSync(file, "utf-8"), "turn start");
+  });
+
+  test("promoting an unknown call is a no-op", () => {
+    const store = new SnapshotStore();
+    assert.doesNotThrow(() => store.promoteCall("never-seen"));
+    assert.equal(store.hasTurnSnapshot(), false);
+  });
+});
+
 describe("SnapshotStore.isCallUnchanged", () => {
   test("detects byte-identical rewrites", () => {
     const store = new SnapshotStore();

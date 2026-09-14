@@ -295,6 +295,25 @@ export class SnapshotStore {
   }
 
   /**
+   * Lift a call's pre-state to the turn scope.
+   *
+   * Needed for a mutation that was only recognized *after* it ran (see
+   * `clients/mutation.ts`): the pre-state was captured speculatively for a call
+   * nobody had classified, so by the time it is known to have written, the
+   * file on disk is already the new one and `captureTurn` can no longer help.
+   * The speculative call snapshot is exactly the pre-state the turn needs, so
+   * it is copied instead of re-read. First touch still wins, so a path the turn
+   * already captured keeps the earlier state.
+   */
+  promoteCall(toolCallId: string): void {
+    const scope = this.callScopes.get(toolCallId);
+    if (!scope) return;
+    for (const [absPath, snap] of scope) {
+      if (!this.turnScope.has(absPath)) this.turnScope.set(absPath, snap);
+    }
+  }
+
+  /**
    * Record what the agent's mutation left on disk, so a later rollback can
    * tell "still exactly what the agent wrote" from "somebody edited it since".
    * Call this from `tool_result`, i.e. *after* the mutation succeeded.
