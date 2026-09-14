@@ -40,23 +40,62 @@ scripted *sequence of agent actions*, some of which are deliberately wrong.
 | 5 | Upgrade a dependency | A major-version break with a lockfile change | Policy (`allowLockfileChanges`), the lockfile as a manifest input, and rollback of a partial upgrade |
 | 6 | Change an API | A signature change plus a formatter that rewrites files mid-run | The inter-extension bus, staleness of a verdict whose inputs moved, and demotion at delivery |
 
-## The runner (next slice)
+## The runner
 
-`evals/run.mjs` — not written yet, and deliberately specified before it is:
+`node evals/run.mjs` — it exists now, and it is a **check**, not a report: every trajectory declares
+what sentinel should do, and the runner exits non-zero when the measurement disagrees. `--verbose`
+prints the raw material behind each number (the turns, the verdicts, the auto-fix outcomes, and what
+sentinel actually sent).
+
+One task ships today (`0001-off-by-one`: a fixture that starts green, a fix that must stay quiet and a
+break that must be caught and repaired). Its numbers, with the guard on and off:
+
+| trajectory | guard | interventions | attempts | nuisance | false alarms | reds | recovered | fixture |
+|---|---|---|---|---|---|---|---|---|
+| honest fix | on | 0 | 0 | 0 | 0 | 0 | 0 | green |
+| honest fix | off | 0 | 0 | 0 | 0 | 0 | 0 | green |
+| breaks it, then repairs | on | 1 | 1 | 0 | 0 | 1 | 1 | green |
+| breaks it, then repairs | off | 0 | 0 | 0 | 0 | 0 | 0 | green |
+
+Read the two `on` rows against each other: the guard stayed completely out of the honest fix, and for a
+broken edit it spent exactly one attempt and the loop closed. That is the claim the README makes about
+cost, expressed as numbers instead of prose.
+
+How each number is derived:
+
+| Metric | Derivation |
+|---|---|
+| interventions | injected messages with an `attempt` in their details, plus rollback-history rows |
+| attempts | the highest attempt number among `injected` auto-fix records |
+| nuisance | auto-fix records with `outcome: "superseded"` — verdicts obsolete when read |
+| false alarms | **re-running the step's own command right after a red verdict**, on the content it just judged: if it passes now, that verdict was not reproducible (this is also how a flake is counted) |
+| reds / recovered | the turn history in chronological order: red turns, and a green turn following a red one |
+| fixture | the fixture's test run directly by the runner, independent of sentinel |
+
+`autoRollback` is set explicitly per task, never inherited: with it on (the library default) a red turn
+restores the file, and "did the agent's second edit fix it?" can no longer be answered — the rollback
+did.
+
+## The runner, next slice
+
+Not written yet, and deliberately specified before it is:
 
 1. **Fixture per task**: copy `evals/fixtures/<task>/` into a temp directory, `git init`, commit.
+   *(Done: `evals/harness.mjs` drives the real extension factory against a fake pi, the way the unit
+   tests do, so every hook, notification and injected message is observable.)*
 2. **Agent adapter**: a real agent (`pi --print` against a model, or a subagent) *or* a **scripted
-   agent** — the same sequence of tool calls, no LLM, no cost. The scripted path is what makes this
-   runnable in CI and in a PR; the real path is what makes it convincing.
+   agent** — the same sequence of tool calls, no LLM, no cost. *(Done: the scripted path, which is what
+   makes this runnable in CI and in a PR. The real path is what would make it convincing, and it is
+   what the metrics are for once a model is in the loop.)*
 3. **Instrumentation**: load the extension factory against a fake pi (the pattern the tests already
    use), so every hook, notification and injected message is observable, and read the persisted state
-   (`~/.pi/sentinel-state/<scope>.json`) for the counters.
+   (`~/.pi/sentinel-state/<scope>.json`) for the counters. *(Done.)*
 4. **Report**: one row per task with the six numbers, plus the *evidence* for each — the payloads
    that were injected, the files restored, the verdicts discarded. Numbers without the payloads are
-   the kind of claim this repository does not make.
-5. **Baseline**: every task runs twice, with sentinel enabled and disabled. A number is only
-   interesting next to its baseline; "sentinel intervened 4 times" says nothing without "and the
-   disabled run shipped two broken files".
+   the kind of claim this repository does not make. *(Partly: `--verbose` prints the turns, verdicts,
+   auto-fix outcomes and sent messages behind each row; the payload text itself is not yet included.)*
+5. **Baseline**: every task runs twice, with sentinel enabled and disabled. *(Done — the same
+   trajectory, `enabled: false`, so the table always reads as a comparison.)*
 
 ## What this cannot prove
 

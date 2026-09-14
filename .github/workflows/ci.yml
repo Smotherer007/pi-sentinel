@@ -37,6 +37,11 @@ jobs:
           node --test --test-name-pattern="a green run clears a stall" tests/extension.test.ts > /tmp/flake-4.log 2>&1 &
           wait
           ! grep -q "^not ok" /tmp/flake-*.log
+      # The eval is a check, not a report: each trajectory declares what sentinel
+      # should do and the runner fails when the measurement disagrees. Registered
+      # here so the numbers in `evals/README.md` cannot rot into prose.
+      - name: Behavioural evals
+        run: node evals/run.mjs
 
   release:
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next'
