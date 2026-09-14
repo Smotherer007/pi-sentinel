@@ -314,9 +314,10 @@ export function buildDoctorReport(facts: DoctorFacts, now = Date.now()): DoctorR
       ),
     );
   }
-  if (storage.cacheEntries === 0) {
-    warnings.push(warn("verification cache is empty", "no run has been reused yet"));
-  }
+  // An empty verification cache is deliberately *not* reported: a fresh session
+  // always starts with one, so the check would fire every time and teach the
+  // reader to ignore the warning block — which is what makes a doctor useless.
+  // `/sentinel status` still reports the cache for anyone who asks.
 
   // ── Safety: what a bad turn would cost ────────────────────────────────
   safety.push(
