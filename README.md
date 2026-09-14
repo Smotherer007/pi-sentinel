@@ -26,6 +26,9 @@ on without writing a config file first:
 | Shell commands are governed | OS sandbox (seatbelt/landlock) | permission rules per command | **classified; refused when unrecoverable, snapshotted when destructive** |
 | **A `bash` deletion can be undone** | sandbox-wide snapshot | not covered | **pre-state captured before the command runs** |
 | Stale verification traces | bounded retries, delta check | — | **superseded, and marked stale once their files change** |
+| A verdict whose inputs moved while it ran | — | — | **demoted (`[sentinel] STALE:`), never re-prompted, and recorded as `superseded`** |
+| A tool that writes but is not `edit`/`write` | — | — | **snapshotted by argument shape, or learned from one observed write (`learnMutationTools`)** |
+| Other extensions writing in the same session | — | — | **`pilens:files:touched` is consumed (attributed, verified); `sentinel:verified` / `sentinel:rollback` are published** |
 | Verified-state memory | hook recipe | — | **content-hash ledger + regression revert** |
 | Environment failure ≠ code failure | sandbox reports it | — | **timeout / missing tool / env error never rolls back** |
 | Survives context compaction | — | `PreCompact` hook | **`session_compact` restates the invariants; budget carries over** |
@@ -35,6 +38,13 @@ on without writing a config file first:
 
 It is **not** a sandbox, and the section [The boundary](#the-boundary) says exactly where that line
 runs.
+
+**A verdict is only true of the tree it read.** So a red payload that outlived its own state is not
+re-delivered as current: it is kept — the diagnostics are the reader's, not sentinel's to throw away
+— marked `[sentinel] STALE:` with the files that moved, delivered without waking the agent, and
+recorded as `superseded` in the auto-fix history. The same rule applies at the moment the model
+reads it: a payload carries its own state hash and file list, so a delivery that has been overtaken
+is demoted again rather than presented as an instruction.
 
 ## Contents
 
