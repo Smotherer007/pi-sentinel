@@ -1875,13 +1875,23 @@ describe("P5 — output budget and background checks", () => {
       pipelines: { onFileMutation: [], onTurnEnd: [{ name: "tests", cmd: "exit 1", timeoutMs: 5000 }] },
     });
 
+    // A file the turn never touches, present before the run. It is part of the
+    // verdict's *input scope* (the run could have read it) without being part of
+    // the turn's changed set — which is the distinction this test is about.
+    fs.mkdirSync(path.join(project, "src"), { recursive: true });
+    fs.writeFileSync(path.join(project, "src/other.ts"), "export const other = 1;\n");
+
     await runTurn(1, "src/a.ts", "export const a = 1;\n");
     const injected = fake.sent[0]?.message;
     assert.ok(injected, "the red turn was re-prompted");
-    assert.deepEqual(
-      injected.details?.paths,
-      [path.join(project, "src/a.ts")],
-      "the payload carries the files its state hash covers",
+    const bound: string[] = injected.details?.paths ?? [];
+    assert.ok(
+      bound.includes(path.join(project, "src/a.ts")),
+      "the payload carries the file the turn wrote",
+    );
+    assert.ok(
+      bound.includes(path.join(project, "src/other.ts")),
+      "and the inputs it could have read — a verdict is invalidated by those too",
     );
 
     const asContext = (message: any) =>
@@ -1892,15 +1902,25 @@ describe("P5 — output budget and background checks", () => {
         ctx,
       );
 
-    // The code still matches the payload: nothing to demote.
+    // The tree still matches the payload: nothing to demote.
     const fresh = await asContext(injected);
     assert.equal(fresh?.changed, undefined);
     assert.equal(String(fresh?.messages?.[0]?.content).includes("STALE"), false);
 
-    // The agent fixed the file after the payload was composed. The verdict is
-    // now about a tree that no longer exists — and the delivery must not hand the
-    // model an instruction it cannot act on. This is what the repair cycle's own
-    // state cannot answer once the cycle is over or the session moved on.
+    // An input the turn never touched changed after the payload was composed —
+    // a formatter, another agent, the user. The verdict may now be wrong for
+    // reasons the payload cannot see, so delivery must not present it as an
+    // instruction. This is the case that reached a real session as a naked
+    // "Repair attempt 1/3" after the code it complained about was fixed.
+    fs.writeFileSync(path.join(project, "src/other.ts"), "export const other = 2;\n");
+    const afterInput = await asContext(injected);
+    assert.equal(
+      String(afterInput?.messages?.[0]?.content),
+      STALE_TRACE_NOTICE,
+      "a change to any bound input demotes the verdict",
+    );
+
+    // And the same when the file the turn wrote is the one that moved.
     fs.writeFileSync(path.join(project, "src/a.ts"), "export const a = 2;\n");
     const delivered = await asContext(injected);
     const content = String(delivered?.messages?.[0]?.content);

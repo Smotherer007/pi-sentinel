@@ -456,7 +456,18 @@ export interface VerificationOutcome {
   /** Identity of the code state the outcome refers to. */
   stateHash: string;
   /**
-   * Files bound to the run whose content moved while it was running.
+   * The inputs this verdict was bound to, as a content hash.
+   *
+   * Deliberately wider than `changedPaths`: the *run* is invalidated by a change
+   * to any file it could read, and the delivery check must use the same rule or
+   * it is stricter than the run it is guarding. A message that passes the run's
+   * own gate and then sits in a queue while an unrelated file changes would
+   * otherwise arrive as a current instruction — which is exactly how a late
+   * verdict kept reaching the agent after the code it described was fixed.
+   */
+  binding?: { stateHash: string; paths: string[] };
+  /**
+   * True when the working tree moved while the run held it.
    *
    * Non-empty means the verdict describes a tree that no longer exists: the
    * callers must not re-prompt the agent with it, and the run must not have

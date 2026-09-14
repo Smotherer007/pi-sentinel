@@ -937,6 +937,15 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     });
     const stateHash = stateHashOf(args.changedPaths);
 
+    // One binding for the whole run, taken here and handed to every caller that
+    // may later deliver this verdict: `changedPaths` answers "what did this turn
+    // write", which is the wrong question for a message that has to sit in a
+    // queue. The inputs answer "what could this verdict be about".
+    const binding = args.inputs
+      ? { stateHash: stateHashOf([...args.inputs.scope]), paths: [...args.inputs.scope] }
+      : undefined;
+
+
     if (run.passed) {
       args.ctx.ui.setStatus("sentinel", undefined);
       // A green run means the repair loop converged: stop escalating. Runs that
@@ -967,6 +976,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
         regressions: [],
         conflicts: [],
         restoreSkipped: [],
+        binding,
       };
     }
 
@@ -994,6 +1004,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
         conflicts: [],
         restoreSkipped: [],
         staleInputs,
+        binding,
       };
     }
     
@@ -1149,6 +1160,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
       conflicts,
       restoreSkipped,
       escalation,
+      binding,
     };
   }
 
@@ -1311,13 +1323,13 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
           display: true,
           details: {
             step: failure.step,
-            stateHash,
-            // The paths this verdict is about, carried with it so a later
-            // delivery can tell whether it still describes the tree. Without
-            // them the delivery check can only ask the *current* repair cycle,
-            // which by then may be a different cycle — or none at all, in which
-            // case an obsolete "fix this" reads as current.
-            paths: [...args.outcome.changedPaths],
+            stateHash: args.outcome.binding?.stateHash ?? stateHash,
+            // The paths this verdict is bound to, carried with it so a later
+            // delivery can tell whether it still describes the tree. These are
+            // the run's *inputs*, not this turn's writes: a verdict is invalidated
+            // by a change to any file it could have read, and a message that
+            // outlives an unrelated edit must not arrive as an instruction.
+            paths: [...(args.outcome.binding?.paths ?? args.outcome.changedPaths)],
             attempt: decision.attempt?.attempt,
             max: decision.attempt?.max,
           },
@@ -2094,8 +2106,8 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
           details: {
             stale: true,
             step: args.outcome.failure?.step,
-            stateHash: args.outcome.stateHash,
-            paths: [...args.outcome.changedPaths],
+            stateHash: args.outcome.binding?.stateHash ?? args.outcome.stateHash,
+            paths: [...(args.outcome.binding?.paths ?? args.outcome.changedPaths)],
           },
         },
         { deliverAs: "followUp", triggerTurn: false },
