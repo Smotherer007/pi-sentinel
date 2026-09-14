@@ -111,6 +111,22 @@ export default defineConfig({
     rollbackOnViolation: false,
   },
 
+  // ── P9: shell governance ──────────────────────────────────────────────
+  // Every other guarantee here is keyed to edit/write; bash walks past all of
+  // them. `block` refuses what could never be undone (network piped into a
+  // shell, forced push, publish) and captures the pre-state of what a
+  // destructive command would remove, so it becomes as undoable as an edit.
+  // Not a sandbox — see the README section "The boundary".
+  bash: {
+    enabled: true,
+    mode: "block",
+    snapshotBeforeDestructive: true,
+    maxProtectedFiles: 500,
+    // Prefixes that are always permitted. Empty here: this repo's release
+    // happens in CI, so nothing local needs to publish or force-push.
+    allow: [],
+  },
+
   // ── mindplace synergy ─────────────────────────────────────────────────
   impactAwareFocus: true,
 

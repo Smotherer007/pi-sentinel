@@ -104,14 +104,14 @@ describe("buildFailureFeedback", () => {
     _clearCache();
 
     const { text } = buildFailureFeedback(input());
-    assert.ok(text.includes("Impact (code graph):"));
+    assert.ok(text.includes("Impact (code graph"));
     assert.ok(text.includes("src/runner.ts"), "dependents are named");
     assert.ok(text.includes("parseConfig"), "symbols are named");
   });
 
   test("omits the impact section without a graph", () => {
     const { text } = buildFailureFeedback(input());
-    assert.equal(text.includes("Impact (code graph):"), false);
+    assert.equal(text.includes("Impact (code graph"), false);
   });
 
   test("shows the bounded-repair accounting (P0)", () => {

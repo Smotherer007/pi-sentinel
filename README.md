@@ -19,6 +19,8 @@ mechanisms Codex CLI and Claude Code rely on:
 | Rollback precision | git stash | skips bash edits, subagents, symlinks | **snapshots incl. newly created files**, unrelated work untouched |
 | Detects bash/formatter/git edits | sandbox-wide | documented blind spot | **`git status --porcelain` scan against a per-turn baseline (P3)** |
 | Refuses a bad write before it happens | approval modes | `PreToolUse` → `deny` | **`tool_call` → `block` for protected paths and repair scope (P8)** |
+| Shell commands are governed | OS sandbox (seatbelt/landlock) | permission rules per command | **classified, refused when unrecoverable, and snapshotted when destructive (P9)** |
+| A `bash` deletion can be undone | sandbox-wide snapshot | not covered | **pre-state captured before the command runs (P9)** |
 | Survives context compaction | — | `PreCompact` hook | **`session_compact` restates the invariants, budget carries over (P8)** |
 | Environment failure ≠ code failure | sandbox reports it | — | **timeout / missing tool / env error never rolls back (P6)** |
 | Stale verification traces | bounded retries, delta check | — | **superseded traces before every LLM call (P2)** |
@@ -147,7 +149,7 @@ What that buys you: unrelated uncommitted work is never touched, a repair loop c
 a spent budget cannot leave a half-finished edit behind, and a change that would rewrite CI or a
 lockfile is stopped before it is ever verified.
 
-## The nine mechanisms
+## The ten mechanisms
 
 ### P0 — close the loop: the agent is re-prompted, not just reported to
 
@@ -492,6 +494,51 @@ green *at their current content*, and explicitly disowns any check result recall
 The repair budget deliberately carries across the compaction. A loop that could buy itself fresh
 attempts by triggering one would not be bounded at all.
 
+### P9 — the shell is governed too
+
+Everything above is keyed to `edit` and `write`. `bash` is not, and that was the
+largest hole in the guarantee: an `rm -rf src`, a `git reset --hard`, a `sed -i` across the repo were
+invisible to the snapshot store, so there was nothing to roll back afterwards. Out-of-band detection
+(P3) noticed them at the *end* of the turn, which is too late to restore anything.
+
+Every `bash` command now goes through the same `tool_call` gate as a write, and lands in one of three
+places:
+
+**Refused.** Nothing sentinel can do would make the command undoable, so the only honest answer is
+no: network content piped into an interpreter (`curl … | sh`), a forced push, `npm publish`,
+`gh release create`, `sudo`. The agent gets a reason it can act on, and nothing ran.
+
+**Protected, then allowed.** The command removes or overwrites files sentinel guards. Their
+pre-state is captured into the turn scope *before* the command runs, so `sentinel_rollback` and
+`/sentinel rewind` can undo a shell deletion exactly as they undo an edit — including restoring files
+the command removed entirely. This is the part no other harness does.
+
+**Noted.** An ordinary `git push`, a `docker system prune`: the human is told, the command runs.
+Refusing these by default would make the guard the problem.
+
+The scope is deliberately the same one sentinel verifies. A path the config excludes is not
+sentinel's to protect, so `rm -rf node_modules` costs nothing and is allowed; `rm -rf src` is
+captured first. What it guards, it guards; what it ignores, it ignores.
+
+When the blast radius cannot be captured — a glob only the shell can expand, more files than
+`maxProtectedFiles`, a command that names no path at all — the command is refused in `block` mode
+rather than run with a partial safety net. Allowing it would break the guarantee silently, which is
+worse than breaking it loudly.
+
+#### The boundary
+
+**This is a guard against the agent's mistakes, not a security boundary.** Shell is a programming
+language: `$(echo cm0K | base64 -d) -rf .` defeats any classifier, and pi's own documentation is
+explicit that "a partial in-process sandbox would be easy to misunderstand as a security boundary".
+Sentinel does not contradict that. It catches the destructive command an agent writes when it is
+confused — which is the case that actually happens — and it says so rather than implying more.
+Commands whose intent cannot be read (command substitution feeding an interpreter, `eval`, a decoder
+piped to a shell) are refused *because* they cannot be read, not because they were judged malicious.
+
+Real isolation has to come from the operating system. Run pi in a container, or route its tools into
+[Gondolin](https://github.com/earendil-works/gondolin). P9 is what you want *in addition* to that,
+not instead of it.
+
 ## Tools
 
 | Tool | Description |
@@ -606,7 +653,11 @@ trustworthy:
    never trigger a rollback, never revert a regression and never spend a repair
    attempt — sentinel already tells the agent "do not rewrite working code for
    this", and doing the opposite would make that advice a lie.
-8. **A turn is never silently left unverified.** When background checks are
+8. **A destructive shell command is captured before it runs, or refused.**
+   `bash` gets the same treatment as a write: what it would destroy is
+   snapshotted first, and when the blast radius cannot be determined the
+   command does not run. This is a guard, not a sandbox — see "The boundary".
+9. **A turn is never silently left unverified.** When background checks are
    still running at the end of the next turn, that turn is folded into the next
    run instead of being skipped. Unverified code reaching the user with no trace
    at all is the silent form of the failure this guard exists to prevent.
@@ -629,6 +680,10 @@ trustworthy:
 | A repair attempt edits files the cycle was not about | Names them under `REPAIR SCOPE EXCEEDED`, or refuses the write with `scopeGuard: "block"`. | Fix the cause inside the original scope, or stop and report. |
 | The conversation is compacted | Restates the contract and the currently-green files, disowns summarized check results, carries the repair budget over. | Re-run any check whose result you only remember from the summary. |
 | A write targets a protected path | Refuses the tool call before anything is written (`policy.blockBeforeWrite`). | Solve the task without that path, or relax the policy deliberately. |
+| A shell command would destroy files | Captures their pre-state first, then lets it run; `sentinel_rollback` can undo it. | Nothing — this is the case that used to be unrecoverable. |
+| A shell command's blast radius is unknowable | Refuses it and says why (a glob, too many files, no named path). | Name the exact paths, or run it yourself. |
+| A shell command cannot be undone at all | Refuses it (`curl \| sh`, forced push, publish, `sudo`). | Do it another way, or run it yourself outside the agent. |
+| The code graph predates the session | Says so once and names `mindplace_build`; failure payloads label how old the blast radius is. | Rebuild the graph, or accept degraded impact analysis knowingly. |
 
 ## Configuration
 
@@ -770,6 +825,11 @@ export default defineConfig({
 | `policy.allowWorkflowChanges` | boolean | `true` | Allow `.github/workflows/**` to be modified. |
 | `policy.sensitivePaths` | string[] | `[]` | Project-relative globs that may never be modified. |
 | `policy.blockBeforeWrite` | boolean | `true` | Refuse a write to a protected path instead of undoing it afterwards (P8). |
+| `bash.enabled` | boolean | `true` | Inspect `bash` commands at all (P9). |
+| `bash.mode` | `"off" \| "report" \| "block"` | `"block"` | Refuse unsafe commands, only name them, or do neither. |
+| `bash.snapshotBeforeDestructive` | boolean | `true` | Capture the pre-state of files a destructive command would touch. |
+| `bash.maxProtectedFiles` | number | `500` | Cap on files captured for one command; beyond it the command is not undoable. |
+| `bash.allow` | string[] | `[]` | Command prefixes that are always permitted. |
 | `policy.rollbackOnViolation` | boolean | `false` | Restore the turn's files when the policy is violated. |
 | `autoFix` | boolean | `true` | Legacy alias of `recovery.enabled`, kept in sync. |
 | `maxAutoRetries` | number | `3` | Legacy alias of `recovery.maxAttempts`, kept in sync. |
@@ -829,7 +889,9 @@ export default defineConfig({
 | `message_start` | every message | Reset the repair budget **only for `role: "user"`** — sentinel's own continuations keep counting (P0). |
 | `turn_start` | turn starts | Begin a fresh snapshot and checkpoint scope; fingerprint the already-dirty working tree as the out-of-band baseline (P3). |
 | `tool_call` | before `edit` / `write` | Refuse the write when it targets a protected path or leaves the repair scope (P8); otherwise snapshot the target file and set the status indicator. |
+| `tool_call` | before `bash` | Classify the command; refuse what cannot be undone, capture the pre-state of what it would destroy, note the rest (P9). |
 | `tool_result` | after `edit` / `write` | Run `onFileMutation`, record evidence, optionally restore, inject `isError`. |
+| `tool_result` | after `bash` | Record what the command left on disk, so a later rollback can tell it from a later edit (P9). |
 | `turn_end` | after a turn | Flush the checkpoint (P1), scan for out-of-band changes (P3), run `onTurnEnd` (sync or background, P5), re-prompt on failure (P0). |
 | `session_compact` | after a compaction | Restate the contract and the currently-green files; disown summarized check results; carry the repair budget over (P8). |
 | `context` | before each LLM call | Supersede older sentinel traces, and mark the newest one stale once the files it describes have changed (P2). |
@@ -848,9 +910,29 @@ Together the graph supplies what sentinel is missing: **what depends on the thin
 | `graph.json` mtime vs. source mtimes | Honesty check — a stale or absent graph is reported instead of inventing an impact claim. |
 
 ```
-Impact (code graph):
+Impact (code graph built 2026-09-14 07:14:22):
   • src/config.ts [parseConfig, deepMerge] → src/index.ts, src/tools/sentinel-status.ts
 ```
+
+The build time is part of the section, and it is not decoration. A blast radius taken from a graph
+that predates the code is evidence about an older revision — the same mistake as a stale verification
+trace, one layer down — so the payload says how old it is, and adds an explicit warning when the
+graph is out of date.
+
+Staleness is also reported to the human, once per session, when the graph was built **before the
+session started**:
+
+```
+Sentinel: the code graph is older than the code (built 2026-08-25 11:42:07).
+Impact analysis and the verification focus are working from an earlier revision —
+run mindplace_build to restore them.
+```
+
+The trigger is deliberately "older than the session", not "older than the newest file". Editing a
+single file makes the graph technically stale, so warning on that would fire after every turn and
+tell the agent only what it just did. A graph from three weeks ago is the case where dependents are
+genuinely missing — and because the graph feeds `focusFor`, that degrades *verification*, not just
+the impact section.
 
 Implementation note: the adapter (`src/clients/mindplace.ts`) reads `graph-out/graph.json` directly
 instead of importing `pi-mindplace`. That keeps sentinel free of a tree-sitter dependency, of the

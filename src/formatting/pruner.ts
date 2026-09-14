@@ -118,6 +118,13 @@ export function formatError(failure: {
   regressions?: Regression[];
   /** Mindplace synergy: blast radius of the files involved. */
   impact?: GraphImpact[];
+  /**
+   * Freshness of the graph the impact came from. A blast radius derived from a
+   * graph that predates the current code is evidence about an older revision —
+   * the same mistake as a stale verification trace, one layer down — so it is
+   * labelled rather than presented as current.
+   */
+  graph?: { builtAt?: string; stale?: boolean };
   /** Identity of the code state this result refers to. */
   stateHash?: string;
   /** P0: bounded-retry accounting for this attempt. */
@@ -235,11 +242,21 @@ export function formatError(failure: {
   // Mindplace synergy: what else this change can break.
   const impact = failure.impact ?? [];
   if (impact.length > 0) {
-    lines.push("Impact (code graph):");
+    const builtAt = failure.graph?.builtAt
+      ? ` built ${failure.graph.builtAt.replace("T", " ").slice(0, 19)}`
+      : "";
+    lines.push(`Impact (code graph${builtAt}):`);
     for (const i of impact.slice(0, 4)) {
       const deps = i.dependents.length > 0 ? i.dependents.join(", ") : "none";
       const symbols = i.symbols.length > 0 ? ` [${i.symbols.slice(0, 4).join(", ")}]` : "";
       lines.push(`  • ${i.file}${symbols} → ${deps}`);
+    }
+    if (failure.graph?.stale) {
+      lines.push(
+        "  The graph is older than the code: files have changed since it was built, so this",
+        "  blast radius may miss dependents or name ones that no longer exist. Rebuild it",
+        "  (`mindplace_build`) before relying on it.",
+      );
     }
   }
 

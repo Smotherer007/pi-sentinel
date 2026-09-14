@@ -22,7 +22,7 @@ import { projectDir } from "../config.ts";
 import { formatError } from "./pruner.ts";
 import { applyOutputCap } from "../clients/spill.ts";
 import { detectRegressions, stateHashOf } from "../clients/evidence.ts";
-import { impactOfAll } from "../clients/mindplace.ts";
+import { impactOfAll, graphStatus } from "../clients/mindplace.ts";
 import type { FailureKind, Regression, RollbackConflict, SpillResult } from "../types.ts";
 
 export interface FailureFeedbackInput {
@@ -88,6 +88,9 @@ export function buildFailureFeedback(input: FailureFeedbackInput): SpillResult {
 
   const impact =
     input.includeImpact === false ? [] : impactOfAll(input.cwd, input.focusPaths);
+  // Only asked when there is something to label; `graphStatus` stats source
+  // files to decide, and a payload with no impact section has no use for it.
+  const graph = impact.length > 0 ? graphStatus(input.cwd) : null;
 
   const text = formatError({
     step: input.step,
@@ -99,6 +102,7 @@ export function buildFailureFeedback(input: FailureFeedbackInput): SpillResult {
     rolledBack: input.rolledBack,
     regressions,
     impact,
+    graph: graph ? { builtAt: graph.builtAt, stale: graph.stale } : undefined,
     // The payload always carries the identity of the state it describes, even
     // when a caller forgot to compute it.
     stateHash: input.stateHash ?? stateHashOf(input.focusPaths),

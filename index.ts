@@ -99,8 +99,15 @@ import {
 } from "./src/clients/policy.ts";
 import type { PolicyChange } from "./src/clients/policy.ts";
 import { outOfBandChanges, captureBaseline } from "./src/clients/workspace.ts";
+import {
+  classifyCommand,
+  planProtection,
+  riskHeadline,
+  worstSeverity,
+} from "./src/clients/bash-guard.ts";
+import type { BashRisk } from "./src/clients/bash-guard.ts";
 import type { WorkspaceBaseline } from "./src/clients/workspace.ts";
-import { describeChange, expandWithDependents } from "./src/clients/mindplace.ts";
+import { describeChange, expandWithDependents, graphStatus } from "./src/clients/mindplace.ts";
 import { VerificationQueue } from "./src/clients/queue.ts";
 import { shouldEscalate } from "./src/clients/escalation.ts";
 import {
@@ -129,6 +136,7 @@ import {
   shouldVerify,
   projectDir,
   policyOf,
+  bashGuardOf,
   recoveryOf,
 } from "./src/config.ts";
 import type {
@@ -293,6 +301,25 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
   let background: BackgroundSlot = EMPTY_BACKGROUND_SLOT;
   /** Working-tree fingerprint when the current turn started (P3 baseline). */
   let turnBaseline: WorkspaceBaseline | null = null;
+  /**
+   * Build time of the code graph the last staleness warning was about.
+   *
+   * Sentinel *knew* the graph was out of date and only ever said so in
+   * `/sentinel status`, so `impactAwareFocus` degraded silently: the focus set
+   * kept being expanded with dependents taken from a map of an older revision.
+   * The warning is worth making once per graph, not once per turn.
+   */
+  let warnedStaleGraphAt: string | null = null;
+  /**
+   * When this session began.
+   *
+   * Staleness alone is the wrong trigger: editing one file makes the graph
+   * technically older than the code, so reporting that would fire after every
+   * turn and say only what the agent just did. What is worth a word is a graph
+   * that predates the work entirely — built before this session started, which
+   * is the case where dependents are genuinely missing.
+   */
+  let sessionStartedAtMs = Date.now();
 
   /**
    * Mutation verifications are batched: with a debounce window, edits that
@@ -356,6 +383,43 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     } catch {
       return {};
     }
+  }
+
+  /**
+   * Tell the human when impact analysis has quietly stopped being accurate.
+   *
+   * A stale graph is not an error — most dependents it lists are still real —
+   * but it is evidence about an older revision, and sentinel has been treating
+   * it as current. Reported once per graph build, so a session that ignores it
+   * is not nagged every turn.
+   */
+  function reportGraphFreshness(cwd: string, ctx: { ui: ExtensionUIContext }, changed: number): void {
+    if (changed === 0) return;
+    const conf = runtime.config.config();
+    if (!conf.impactAwareFocus) return;
+
+    let graph;
+    try {
+      graph = graphStatus(cwd);
+    } catch {
+      return;
+    }
+    if (!graph.present || !graph.stale) return;
+    // A graph built during this session is as current as it is going to get;
+    // the agent's own edits are what made it "stale" and it knows about those.
+    if (!graph.builtAt) return;
+    if (Date.parse(graph.builtAt) >= sessionStartedAtMs) return;
+
+    const builtAt = graph.builtAt;
+    if (warnedStaleGraphAt === builtAt) return;
+    warnedStaleGraphAt = builtAt;
+
+    ctx.ui.notify(
+      `Sentinel: the code graph is older than the code (built ${builtAt.replace("T", " ").slice(0, 19)}). ` +
+        "Impact analysis and the verification focus are working from an earlier revision — " +
+        "run mindplace_build to restore them.",
+      "warning",
+    );
   }
 
   function resetRepairBudget(): void {
@@ -460,6 +524,123 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
           "elsewhere, stop and report that instead of editing further — widening the " +
           "change set is how a repair loop turns one failure into several.",
       };
+    }
+
+    return null;
+  }
+
+  /**
+   * Decide what happens to a shell command, and make what it destroys undoable.
+   *
+   * Three outcomes, in the order they are considered:
+   *
+   *   1. **Refuse.** Nothing sentinel can do makes the command undoable — it
+   *      pipes the network into an interpreter, force-pushes, publishes, or
+   *      escalates privileges. The only honest answer is no.
+   *   2. **Protect, then allow.** The command removes or overwrites files that
+   *      sentinel guards. Their pre-state is captured into the turn scope
+   *      first, so `sentinel_rollback` and `/sentinel rewind` can undo it just
+   *      like an `edit`. If the blast radius cannot be captured — a glob the
+   *      shell would expand, more files than the cap — the command becomes a
+   *      refusal, because allowing it would break the guarantee silently.
+   *   3. **Note.** An ordinary push or a docker prune: worth telling the human,
+   *      not worth stopping.
+   *
+   * Returns a refusal reason, or null when the command may run.
+   */
+  function guardBashCommand(
+    command: string,
+    toolCallId: string,
+    cwd: string,
+    conf: SentinelConfig,
+    ctx: { ui: ExtensionUIContext },
+  ): { reason: string; summary: string } | null {
+    const guard = bashGuardOf(conf);
+    if (!guard.enabled || guard.mode === "off") return null;
+
+    const trimmed = command.trim();
+    if (guard.allow.some((prefix) => trimmed.startsWith(prefix))) return null;
+
+    const risks = classifyCommand(command);
+    const severity = worstSeverity(risks);
+    if (severity === null) return null;
+
+    const describe = (subset: BashRisk[]) =>
+      [...new Set(subset.map((r) => `${riskHeadline(r.kind)} (${r.evidence.trim()})`))].join("; ");
+
+    // ── 1. nothing can make this undoable ────────────────────────────────
+    const refusals = risks.filter((r) => r.severity === "refuse");
+    if (refusals.length > 0) {
+      if (guard.mode === "report") {
+        ctx.ui.notify(`Sentinel: risky command allowed in report mode — ${describe(refusals)}`, "warning");
+        return null;
+      }
+      return {
+        summary: describe(refusals),
+        reason:
+          `[sentinel] This command was refused: it ${describe(refusals)}.\n` +
+          "Nothing ran, so nothing changed. Sentinel refuses commands whose effects it " +
+          "cannot undo — this is not a judgement about your intent, it is that there " +
+          "would be no way back.\n" +
+          "Do the task another way, or ask the user to run this command themselves.",
+      };
+    }
+
+    // ── 2. destructive, but capturable ───────────────────────────────────
+    const destructive = risks.filter((r) => r.severity === "protect");
+    if (destructive.length === 0) {
+      ctx.ui.notify(`Sentinel: ${describe(risks)}`, "info");
+      return null;
+    }
+
+    if (!guard.snapshotBeforeDestructive) return null;
+
+    const named = [...new Set(destructive.flatMap((r) => r.paths))];
+    const plan = planProtection(cwd, named, {
+      maxFiles: guard.maxProtectedFiles,
+      // Exactly the predicate the mutation hooks use, so the two can never
+      // disagree about what is sentinel's to protect.
+      shouldProtect: (abs) => !isSentinelArtifact(cwd, abs) && shouldVerify(abs, conf, cwd),
+    });
+
+    // A command that names no resolvable path is the dangerous case: `rm -rf $TARGET`,
+    // `git reset --hard`, `sed -i ... *.ts`. Sentinel cannot say what it would
+    // destroy, so it cannot promise to restore it.
+    const blind = plan.unresolved.length > 0 || plan.overflowed || named.length === 0;
+
+    if (blind && guard.mode === "block") {
+      const why = plan.overflowed
+        ? `more than ${guard.maxProtectedFiles} files would be affected`
+        : plan.unresolved.length > 0
+          ? `the paths ${plan.unresolved.join(", ")} can only be resolved by the shell itself`
+          : "it names no path sentinel can capture in advance";
+      return {
+        summary: `${describe(destructive)} — blast radius not capturable`,
+        reason:
+          `[sentinel] This command was refused: it ${describe(destructive)}, and ${why}.\n` +
+          "Nothing ran. Sentinel only allows a destructive command when it has first " +
+          "captured what the command would destroy, so that it stays undoable.\n" +
+          "Name the exact paths instead of a pattern, narrow the command, or ask the " +
+          "user to run it themselves.",
+      };
+    }
+
+    if (plan.files.length > 0) {
+      for (const file of plan.files) {
+        runtime.snapshots.captureCall(toolCallId, file);
+        runtime.snapshots.captureTurn(file);
+      }
+      runtime.config.recordMetrics({ protectedFiles: plan.files.length });
+      ctx.ui.notify(
+        `Sentinel captured ${plan.files.length} file(s) before a command that ${describe(destructive)}.`,
+        "info",
+      );
+    } else if (blind) {
+      // report mode, or nothing of ours is at stake.
+      ctx.ui.notify(
+        `Sentinel: running a command that ${describe(destructive)} without a safety net.`,
+        "warning",
+      );
     }
 
     return null;
@@ -986,6 +1167,8 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
   // ── Hook: session_start ────────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
+    warnedStaleGraphAt = null;
+    sessionStartedAtMs = Date.now();
     await ensureConfig(ctx.cwd);
     resetRepairBudget();
     const conf = runtime.config.config();
@@ -1071,6 +1254,38 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     const conf = runtime.config.config();
     if (!conf.enabled) return;
 
+    // ── bash (P9) ────────────────────────────────────────────────────────
+    // Every other guarantee in this file is keyed to edit/write. A shell
+    // command walks past all of them, so it is inspected here: refused when
+    // its damage could never be undone, and otherwise made undoable by
+    // capturing the pre-state of what it is about to destroy.
+    if (isToolCallEventType("bash", event)) {
+      const command = (event.input as { command?: unknown })?.command;
+      if (typeof command !== "string" || command.trim() === "") return;
+      let refusal: { reason: string; summary: string } | null = null;
+      try {
+        refusal = guardBashCommand(command, event.toolCallId, ctx.cwd, conf, ctx);
+      } catch {
+        // A guard that throws must not take the session down, and must not
+        // silently turn into permission either: say so and let the turn stop.
+        ctx.ui.notify(
+          "Sentinel could not inspect a shell command; it was refused rather than run unchecked.",
+          "error",
+        );
+        return {
+          block: true,
+          reason:
+            "[sentinel] The shell guard failed while inspecting this command, so it was not run. Report this; do not work around it.",
+        };
+      }
+      if (refusal) {
+        ctx.ui.notify(`Sentinel refused a command: ${refusal.summary}`, "error");
+        runtime.config.recordMetrics({ blockedCommands: 1 });
+        return { block: true, reason: refusal.reason };
+      }
+      return;
+    }
+
     const isMutation =
       isToolCallEventType("edit", event) || isToolCallEventType("write", event);
     if (!isMutation) return;
@@ -1111,6 +1326,15 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     await ensureConfig(ctx.cwd);
     const conf = runtime.config.config();
     if (!conf.enabled) return;
+
+    // A guarded bash command captured its own pre-state in `tool_call`; record
+    // what it left on disk so a later rollback can tell "still what the command
+    // produced" from "somebody wrote it since", exactly as for an edit.
+    if (event.toolName === "bash") {
+      runtime.snapshots.capturePost(event.toolCallId);
+      runtime.snapshots.endCall(event.toolCallId);
+      return;
+    }
 
     const isMutation = event.toolName === "edit" || event.toolName === "write";
     if (!isMutation) return;
@@ -1264,6 +1488,10 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
         "info",
       );
     }
+
+    // The graph feeds `focusFor`, so an out-of-date one degrades verification
+    // itself, not just the impact section. Say so instead of letting it rot.
+    reportGraphFreshness(ctx.cwd, ctx, focusPaths.length);
 
     if (conf.pipelines.onTurnEnd.length === 0) {
       runtime.snapshots.beginTurn();
@@ -1784,6 +2012,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
       `  enabled: ${conf.enabled} | autoRollback: ${conf.autoRollback}`,
       `  recovery: ${conf.recovery.enabled} (max ${conf.recovery.maxAttempts} attempts, rollback-after-exhaustion ${conf.recovery.rollbackAfterExhaustion}, scope guard ${conf.recovery.scopeGuard})`,
       `  policy: ${conf.policy.enabled} (max ${conf.policy.maxChangedFiles || "unlimited"} file(s), ${conf.policy.maxAddedLines || "unlimited"} added line(s), block-before-write ${conf.policy.blockBeforeWrite})`,
+      `  shell guard: ${conf.bash.enabled ? conf.bash.mode : "off"} (snapshot ${conf.bash.snapshotBeforeDestructive}, max ${conf.bash.maxProtectedFiles} protected file(s))`,
       `  evidence: ${conf.trackVerifiedState} (revert ${conf.revertOnRegression}) | out-of-band: ${conf.detectOutOfBand}`,
       `  background checks: ${conf.backgroundTurnEnd} | output budget: ${conf.maxOutputTokens} tokens`,
       `  debounce: ${conf.verification.debounceMs}ms | cache: ${conf.verification.cache.enabled} | escalation: ${conf.verification.failureEscalation.enabled}`,

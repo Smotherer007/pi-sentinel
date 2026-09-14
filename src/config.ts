@@ -19,6 +19,8 @@ import { pathToFileURL } from "node:url";
 
 import type {
   AutoFixOutcome,
+  BashGuardConfig,
+  BashGuardMode,
   PipelineStep,
   PolicyConfig,
   RecoveryConfig,
@@ -77,6 +79,18 @@ export const DEFAULT_CONFIG: SentinelConfig = {
     // than undoing it afterwards.
     blockBeforeWrite: true,
     rollbackOnViolation: false,
+  },
+
+  // P9 — shell governance. On by default in `block` mode, because the things
+  // it refuses (piping the network into a shell, a forced push, publishing, a
+  // destructive command whose damage cannot be captured) are never what a user
+  // silently wanted, while everything ordinary passes through untouched.
+  bash: {
+    enabled: true,
+    mode: "block",
+    snapshotBeforeDestructive: true,
+    maxProtectedFiles: 500,
+    allow: [],
   },
 
   // P1 — keep enough checkpoints to undo a working session, not the repo.
@@ -238,6 +252,8 @@ export function emptyMetrics(): SentinelMetrics {
     partialRollbacks: 0,
     policyViolations: 0,
     blockedWrites: 0,
+    blockedCommands: 0,
+    protectedFiles: 0,
   };
 }
 
@@ -322,12 +338,33 @@ function normaliseConfig(
   };
   merged.autoFix = merged.recovery.enabled;
   merged.maxAutoRetries = merged.recovery.maxAttempts;
+  merged.bash = bashGuardOf(merged);
   return merged;
 }
 
 /** An unknown scope-guard spelling falls back to the documented default. */
 function normaliseScopeGuard(value: unknown): ScopeGuard {
   return value === "off" || value === "block" || value === "report" ? value : "report";
+}
+
+/** An unknown bash-guard spelling falls back to the documented default. */
+function normaliseBashMode(value: unknown): BashGuardMode {
+  return value === "off" || value === "report" || value === "block" ? value : "block";
+}
+
+/** Settings the shell guard needs, with safe defaults for older callers. */
+export function bashGuardOf(config: SentinelConfig): BashGuardConfig {
+  const raw = config.bash ?? DEFAULT_CONFIG.bash;
+  return {
+    enabled: raw.enabled !== false,
+    mode: normaliseBashMode(raw.mode),
+    snapshotBeforeDestructive: raw.snapshotBeforeDestructive !== false,
+    maxProtectedFiles:
+      Number.isFinite(raw.maxProtectedFiles) && raw.maxProtectedFiles > 0
+        ? Math.floor(raw.maxProtectedFiles)
+        : DEFAULT_CONFIG.bash.maxProtectedFiles,
+    allow: Array.isArray(raw.allow) ? raw.allow : [],
+  };
 }
 
 /** Settings a change policy needs, with safe defaults for out-of-date callers. */

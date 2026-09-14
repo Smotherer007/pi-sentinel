@@ -122,6 +122,50 @@ export interface RecoveryConfig {
   scopeGuard: ScopeGuard;
 }
 
+/**
+ * How strictly shell commands are governed.
+ *
+ *   - `off`:    `bash` is not inspected at all (pre-3.x behaviour).
+ *   - `report`: risky commands are named to the human, then run.
+ *   - `block`:  a command sentinel cannot make undoable is refused.
+ */
+export type BashGuardMode = "off" | "report" | "block";
+
+/**
+ * Governance for the `bash` tool.
+ *
+ * Every other guarantee sentinel makes is keyed to `edit` and `write`: the
+ * snapshot store, the checkpoints, the verified-state ledger. `bash` walks past
+ * all of it, so an `rm -rf src` or a `git reset --hard` is invisible and
+ * unrecoverable. This block closes that, in the only way that is honest: by
+ * capturing the pre-state of what a command would destroy *before* it runs, and
+ * refusing the ones whose damage cannot be captured at all.
+ *
+ * It is not a sandbox and must not be sold as one — shell is a programming
+ * language and a determined command can always hide its intent. It catches the
+ * destructive command an agent writes when it is confused, which is the case
+ * that actually happens. Real isolation comes from a container or a micro-VM.
+ */
+export interface BashGuardConfig {
+  /** Master switch for shell governance. */
+  enabled: boolean;
+  /** What happens when a command is judged unsafe. */
+  mode: BashGuardMode;
+  /** Capture the pre-state of files a destructive command would touch. */
+  snapshotBeforeDestructive: boolean;
+  /**
+   * Upper bound on files captured for one command. A blast radius beyond this
+   * cannot be made undoable, so in `block` mode the command is refused rather
+   * than run with a partial safety net.
+   */
+  maxProtectedFiles: number;
+  /**
+   * Command prefixes that are always allowed, checked against the raw command
+   * line. The escape hatch for a project whose normal work looks destructive.
+   */
+  allow: string[];
+}
+
 /** Kind of sensitive file a change policy reacts to. */
 export type SensitiveKind = "package" | "lockfile" | "workflow" | "custom";
 
@@ -242,6 +286,9 @@ export interface SentinelConfig {
 
   /** Optional diff/change policy for a turn (disabled by default). */
   policy: PolicyConfig;
+
+  /** Governance for the `bash` tool (P9). */
+  bash: BashGuardConfig;
 
   // ── P1: durable checkpoints ─────────────────────────────────────────────
   /** How many turn checkpoints to keep on disk. */
@@ -477,6 +524,10 @@ export interface SentinelMetrics {
   policyViolations: number;
   /** Writes refused before they happened (policy or repair scope). */
   blockedWrites: number;
+  /** Shell commands refused before they ran. */
+  blockedCommands: number;
+  /** Files whose pre-state was captured ahead of a destructive command. */
+  protectedFiles: number;
 }
 
 // ── P1: durable checkpoints ───────────────────────────────────────────────

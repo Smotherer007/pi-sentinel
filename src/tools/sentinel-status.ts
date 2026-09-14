@@ -66,6 +66,7 @@ export function createSentinelStatusTool(runtime: SentinelRuntime) {
         `  autoRollback: ${conf.autoRollback}`,
         `  recovery: ${conf.recovery.enabled} | maxAttempts: ${conf.recovery.maxAttempts} | rollbackAfterExhaustion: ${conf.recovery.rollbackAfterExhaustion} | scopeGuard: ${conf.recovery.scopeGuard}`,
         `  policy: ${conf.policy.enabled} | maxChangedFiles: ${conf.policy.maxChangedFiles || "unlimited"} | maxAddedLines: ${conf.policy.maxAddedLines || "unlimited"} | allowWorkflow: ${conf.policy.allowWorkflowChanges} | blockBeforeWrite: ${conf.policy.blockBeforeWrite}`,
+        `  bash guard: ${conf.bash.enabled ? conf.bash.mode : "off"} | snapshotBeforeDestructive: ${conf.bash.snapshotBeforeDestructive} | maxProtectedFiles: ${conf.bash.maxProtectedFiles} | allow: ${conf.bash.allow.join(", ") || "(none)"}`,
         `  autoFix (legacy alias): ${conf.autoFix} (max ${conf.maxAutoRetries} attempts)`,
         `  trackVerifiedState: ${conf.trackVerifiedState} | revertOnRegression: ${conf.revertOnRegression}`,
         `  pruneStaleTraces: ${conf.pruneStaleTraces} | detectOutOfBand: ${conf.detectOutOfBand}`,

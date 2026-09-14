@@ -157,7 +157,7 @@ describe("formatError", () => {
         { file: "src/config.ts", symbols: ["parseConfig", "deepMerge"], dependents: ["src/index.ts"] },
       ],
     });
-    assert.ok(text.includes("Impact (code graph):"));
+    assert.ok(text.includes("Impact (code graph"));
     assert.ok(text.includes("src/config.ts"));
     assert.ok(text.includes("parseConfig, deepMerge"));
     assert.ok(text.includes("src/index.ts"));
@@ -201,7 +201,7 @@ describe("formatError", () => {
 
     const traceAt = text.indexOf("error TS2304");
     const regressionAt = text.indexOf("Regressed from a verified state");
-    const impactAt = text.indexOf("Impact (code graph):");
+    const impactAt = text.indexOf("Impact (code graph");
     const adviceAt = text.indexOf("still in place");
 
     assert.ok(traceAt < regressionAt && regressionAt < impactAt && impactAt < adviceAt, text);

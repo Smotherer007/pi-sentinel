@@ -54,7 +54,8 @@ export function metricsLines(metrics: SentinelMetrics): string[] {
     `  avg check:   ${formatDuration(avg)} | timeouts: ${metrics.timeouts}`,
     `  steps:       ${metrics.skippedSteps} skipped | ${metrics.retries} retried | ${metrics.escalations} escalated`,
     `  rollbacks:   ${metrics.rollbacks} (${metrics.partialRollbacks} partial)`,
-    `  refused:     ${metrics.blockedWrites ?? 0} write(s) blocked | ${metrics.policyViolations} policy stop(s)`,
+    `  refused:     ${metrics.blockedWrites ?? 0} write(s) | ${metrics.blockedCommands ?? 0} command(s) | ${metrics.policyViolations} policy stop(s)`,
+    `  protected:   ${metrics.protectedFiles ?? 0} file(s) captured before a shell command`,
   ];
   return lines;
 }
