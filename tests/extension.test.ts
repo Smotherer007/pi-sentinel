@@ -953,6 +953,49 @@ describe("P2 — evidence and stale traces", () => {
   });
 });
 
+describe("verification never runs twice at once", () => {
+  test("three mutations in one debounce window are one run, not three overlapping ones", async () => {
+    await configure({
+      autoRollback: false,
+      backgroundTurnEnd: false,
+      verification: { debounceMs: 400 },
+      pipelines: {
+        onFileMutation: [
+          {
+            name: "slow",
+            // The step logs its own start and end, so "was anything running while
+            // this ran?" is answered by the file rather than by trust.
+            cmd: "echo start >> runs.log; sleep 0.3; echo end >> runs.log",
+            timeoutMs: 10000,
+          },
+        ],
+        onTurnEnd: [],
+      },
+    });
+    const log = path.join(project, "runs.log");
+    fs.rmSync(log, { force: true });
+
+    // Three edits in one assistant message — parallel tool calls, the case the
+    // debounce exists for. Awaiting them one after another would not batch: each
+    // handler waits for its own run to finish, so every window would start fresh
+    // and this test would prove nothing about coalescing.
+    await Promise.all([
+      mutate("src/a.ts", "export const a = 1;\n", "c-a"),
+      mutate("src/b.ts", "export const b = 1;\n", "c-b"),
+      mutate("src/c.ts", "export const c = 1;\n", "c-c"),
+    ]);
+
+    await waitFor(
+      () => fs.existsSync(log) && fs.readFileSync(log, "utf-8").trim().split("\n").length >= 2,
+    );
+    // Time for a wrongly-scheduled second run to show up before asserting.
+    await new Promise((resolve) => setTimeout(resolve, 900));
+
+    const lines = fs.readFileSync(log, "utf-8").trim().split("\n");
+    assert.deepEqual(lines, ["start", "end"], "one run, and nothing overlapping it");
+  });
+});
+
 describe("P3 — out-of-band changes", () => {
   test("verifies files that no edit/write hook ever saw", async () => {
     await configure({
@@ -1004,6 +1047,40 @@ describe("P3 — out-of-band changes", () => {
       ctx._notifications.some((n) => n.text.includes("changed outside edit/write")),
       false,
       "the working tree is not the turn's diff",
+    );
+  });
+
+  test("a nested repository is named as seen-but-not-verifiable", async () => {
+    await configure({
+      autoRollback: false,
+      detectOutOfBand: true,
+      include: ["**/*.ts"],
+      pipelines: { onFileMutation: [], onTurnEnd: [] },
+    });
+    execSync("git init -q", { cwd: project });
+    execSync("git add -A", { cwd: project });
+
+    // A nested repository arrives *during* the turn. Git reports it as one
+    // directory (`?? nested`), and a directory can never match a file pattern —
+    // so nothing about the change inside it is verified. Silently dropping it
+    // would leave the user believing a watchful guard saw everything, which is
+    // the half of this boundary that is sentinel's to fix.
+    await runTurn(1, null, "", () => {
+      const nested = path.join(project, "nested");
+      fs.mkdirSync(nested, { recursive: true });
+      fs.writeFileSync(path.join(nested, "inner.ts"), "export const inner = 1;\n");
+      execSync("git init -q", { cwd: nested });
+    });
+
+    const notice = ctx._notifications.find((n) => n.text.includes("no pipeline filter covers them"));
+    assert.ok(notice, "the path is named rather than dropped in silence");
+    assert.match(notice.text, /nested/);
+    assert.match(notice.text, /not verified/);
+    // And it is not claimed as verified either: the other notice must not fire.
+    assert.equal(
+      ctx._notifications.some((n) => n.text.includes("verifying them too")),
+      false,
+      "nothing is claimed to be under verification that is not",
     );
   });
 

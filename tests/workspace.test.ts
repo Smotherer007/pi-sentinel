@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { execSync } from "node:child_process";
 
 import { parsePorcelain, changedPaths, outOfBandChanges } from "../src/clients/workspace.ts";
+import { defineConfig, shouldVerify } from "../src/config.ts";
 
 let dir: string;
 
@@ -42,6 +43,76 @@ describe("parsePorcelain", () => {
   test("ignores blank lines and empty output", () => {
     assert.deepEqual(parsePorcelain("", "/p"), []);
     assert.deepEqual(parsePorcelain("\n\n", "/p"), []);
+  });
+});
+
+describe("a rename is reported at the path that exists", () => {
+  test("the new path wins, and the old one is not invented", () => {
+    // `R  old -> new` is what git prints for a rename; verifying or snapshotting
+    // the old path would act on a file that is gone.
+    const changes = parsePorcelain("R  src/old.ts -> src/new.ts\n", "/w");
+    assert.deepEqual(changes, [{ status: "R ", path: path.resolve("/w", "src/new.ts") }]);
+  });
+
+  test("quoted paths survive", () => {
+    const changes = parsePorcelain('R  "a b.ts" -> "c d.ts"\n', "/w");
+    assert.equal(changes[0].path, path.resolve("/w", "c d.ts"));
+  });
+
+  test("a copy is reported like a rename, at the copy", () => {
+    const changes = parsePorcelain("C  src/a.ts -> src/b.ts\n", "/w");
+    assert.equal(changes[0].path, path.resolve("/w", "src/b.ts"));
+  });
+});
+
+describe("a nested repository is seen, as one path", () => {
+  let nestedRoot: string;
+  before(() => {
+    nestedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sentinel-nested-"));
+    const git = (cmd: string, cwd: string) => execSync(`git ${cmd}`, { cwd, stdio: "pipe" });
+    fs.writeFileSync(path.join(nestedRoot, "README.md"), "outer\n");
+    git("init -q", nestedRoot);
+    git("config user.email t@t", nestedRoot);
+    git("config user.name t", nestedRoot);
+    git("add -A", nestedRoot);
+    git("commit -qm init", nestedRoot);
+
+    const inner = path.join(nestedRoot, "nested");
+    fs.mkdirSync(inner, { recursive: true });
+    fs.writeFileSync(path.join(inner, "inner.ts"), "export const inner = 1;\n");
+    git("init -q", inner);
+    git("config user.email t@t", inner);
+    git("config user.name t", inner);
+    git("add -A", inner);
+    git("commit -qm nested", inner);
+
+    // The change sentinel is supposed to notice, made inside the nested repo.
+    fs.writeFileSync(path.join(inner, "inner.ts"), "export const inner = 2;\n");
+  });
+
+  after(() => {
+    fs.rmSync(nestedRoot, { recursive: true, force: true });
+  });
+
+  test("git reports the directory, so sentinel sees a path no file glob matches", () => {
+    const changes = changedPaths(nestedRoot);
+    const nested = changes.find((change) => change.path.endsWith("nested"));
+    assert.ok(nested, "the nested repo is visible to out-of-band detection at all");
+    // The consequence, pinned so it cannot drift silently: a directory cannot
+    // match `**/*.ts`, so `shouldVerify` drops this path and the change inside it
+    // is not verified. The turn-end hook now *names* that fact to the user
+    // instead of staying quiet, which is the honest half of the boundary;
+    // deciding to walk into a nested repository is a separate decision.
+    //
+    // Note the dependence on configuration: with no `include` patterns at all,
+    // sentinel verifies everything not excluded, so this path *is* passed on and
+    // the step's own file filter gets to decide. The boundary above is the one a
+    // project with a file list — like this repository — actually has.
+    assert.equal(
+      shouldVerify(nested!.path, defineConfig({ include: ["**/*.ts"] }), nestedRoot),
+      false,
+    );
+    assert.equal(shouldVerify(nested!.path, defineConfig({}), nestedRoot), true);
   });
 });
 

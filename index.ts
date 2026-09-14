@@ -1778,20 +1778,47 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
 
     // P3 — changes that never went through edit/write (bash, formatters, git).
     let outOfBand: string[] = [];
+    /**
+     * Changes sentinel saw and deliberately does not verify.
+     *
+     * A change that no pipeline filter covers is dropped from the run — that is
+     * correct, a step that cannot judge a path must not be pointed at it — but
+     * dropping it *silently* is not: the user is then told nothing about a change
+     * sentinel clearly noticed. The case that made this visible is a nested
+     * repository, which git reports as one directory (`?? nested`), so no file
+     * glob can match it and the change inside it was neither verified nor
+     * mentioned.
+     */
+    let unverified: string[] = [];
     if (conf.enabled && conf.detectOutOfBand) {
       try {
-        outOfBand = outOfBandChanges(
+        const changes = outOfBandChanges(
           ctx.cwd,
           turnPaths,
           (p) => {
             const abs = resolve(p);
             if (isSentinelArtifact(ctx.cwd, abs)) return true;
-            return !shouldVerify(abs, conf, ctx.cwd);
+            const skip = !shouldVerify(abs, conf, ctx.cwd);
+            // Only a *directory* is reported, and only because a directory can
+            // never match a file pattern — that is a category error, not a scope
+            // decision. A file that simply does not match `include` (a config, a
+            // doc, a lockfile) is deliberately out of scope, and naming those
+            // every turn is noise that teaches the reader to ignore the notice.
+            let isDirectory = false;
+            try {
+              isDirectory = fs.statSync(abs).isDirectory();
+            } catch {
+              isDirectory = false;
+            }
+            if (skip && isDirectory) unverified.push(abs);
+            return skip;
           },
           turnBaseline ?? undefined,
-        ).map((change) => change.path);
+        );
+        outOfBand = changes.map((change) => change.path);
       } catch {
         outOfBand = [];
+        unverified = [];
       }
     }
 
@@ -1853,6 +1880,20 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
         "info",
       );
     }
+
+    if (unverified.length > 0) {
+      // Named, not acted on: no rule covers these paths, so nothing is verified
+      // or restored for them, and saying nothing would leave the user believing a
+      // watchful guard saw everything. Whether to *cover* them is a separate,
+      // deliberate decision — verifying inside a nested repository means walking
+      // into it, which is not sentinel's call to make quietly.
+      ctx.ui.notify(
+        `Sentinel: ${unverified.length} path(s) changed outside edit/write but no pipeline filter covers them — not verified: ${unverified
+          .slice(0, 3)
+          .map((p) => relative(ctx.cwd, p))
+          .join(", ")}${unverified.length > 3 ? ` (+${unverified.length - 3} more)` : ""}`,
+        "warning",
+      );    }
 
     // The graph feeds `focusFor`, so an out-of-date one degrades verification
     // itself, not just the impact section. Say so instead of letting it rot.
