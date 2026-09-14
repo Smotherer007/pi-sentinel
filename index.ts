@@ -417,6 +417,28 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
       const first = requests[0];
       const focusPaths = [...new Set(requests.flatMap((request) => request.focusPaths))];
       const changedPaths = [...new Set(requests.flatMap((request) => request.changedPaths))];
+
+      // A retired session gets no work out of sentinel, on any path.
+      //
+      // The background drain learned this the expensive way (a whole `npm test`
+      // per turn, for a result nobody could receive); the mutation queue reaches
+      // the same conclusion through a different door, and a spawn is a spawn. The
+      // verdict is reported as passed because sentinel is not entitled to an
+      // opinion about a session it can no longer speak to — the live session
+      // verifies its own turns.
+      if (ctxRetired) {
+        return {
+          passed: true,
+          stateHash: "",
+          changedPaths,
+          warnings: [],
+          rolledBack: false,
+          regressions: [],
+          conflicts: [],
+          restoreSkipped: [],
+        };
+      }
+
       // Bind the run to the inputs it can read, so a concurrent writer — a
       // formatter, another agent, the user — invalidates the verdict instead of
       // being reported as a failure the agent has to chase.
