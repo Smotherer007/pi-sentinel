@@ -175,15 +175,26 @@ describe("PipelineRunner hardening", () => {
 
     // The shell must stay alive as the parent (two commands), so killing only
     // the shell would leave `node` running long enough to write the file.
+    //
+    // The write is scheduled *past* the kill grace on purpose. Terminating a
+    // tree is SIGTERM, then SIGKILL after `killGraceMs` — a deliberate window in
+    // which a step may clean up, which also means a child forked *after* the
+    // SIGTERM is not signalled by it and can still run until the SIGKILL lands.
+    // Asserting on a write inside that window asserts a race: exactly how this
+    // test failed a real run under load, and sent the repair loop after a flake.
+    // What it can assert deterministically is the promise sentinel actually
+    // makes: once the kill path has run, nothing of the step is working.
     const step = {
       name: "tree",
-      cmd: "sleep 0.1; node -e \"setTimeout(() => require('fs').writeFileSync('late.txt', 'x'), 300)\"",
+      cmd: "sleep 0.1; node -e \"setTimeout(() => require('fs').writeFileSync('late.txt', 'x'), 1200)\"",
       timeoutMs: 150,
     };
 
     const outcome = await runner.execute(step, dir);
     assert.equal(outcome.exitCode, 124);
-    await new Promise((done) => setTimeout(done, 700));
+    // SIGKILL lands at ~650 ms; the child would write at ~1300 ms. A child
+    // forked after the grace cannot happen: by then its parent is gone.
+    await new Promise((done) => setTimeout(done, 1400));
     assert.equal(fs.existsSync(late), false, "a killed step must not keep working in the background");
   });
 

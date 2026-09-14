@@ -528,6 +528,13 @@ Real isolation has to come from the operating system. Run pi in a container, or 
 [Gondolin](https://github.com/earendil-works/gondolin). P9 is what you want *in addition* to that,
 not instead of it.
 
+**A killed step has a bounded window.** When a step exceeds `timeoutMs`, sentinel signals its whole
+process group with `SIGTERM` and `SIGKILL`s it after `killGraceMs`. The grace exists so a step can
+clean up, and it is also the window a child forked *after* the `SIGTERM` can still run in — it is
+not in the signal's target set, and the `SIGKILL` is `killGraceMs` away. So "killed" means "not
+running once the kill path has completed", not "incapable of acting the instant the timeout fires".
+Lower `killGraceMs` to narrow it; the window cannot be closed from inside the process tree.
+
 ## Rollback model
 
 Sentinel snapshots the pre-state of every file the agent touches *before* the mutation runs, and
