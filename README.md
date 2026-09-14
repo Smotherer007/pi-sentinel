@@ -824,9 +824,35 @@ step, so an older runtime cannot even load them. `.node-version` pins 26; CI tes
 ```bash
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # node --test — 518 tests, 134 suites
+npm test              # node --test — 649 tests, 172 suites
 npm run audit:runtime # runtime dependencies only
 ```
+
+### A test must not depend on scheduling
+
+Four real sessions in one day were sent red by tests that decided something by waiting, not by
+knowing. Each one cost a repair attempt, a turn of the agent's attention and a round of "is sentinel
+broken?" — and every time the code was fine. The rule that came out of it:
+
+> **An assertion may only depend on what the test itself did** — never on a sleep, never on shared
+> state, never on the order tests happen to run in.
+
+In practice, in this repository:
+
+- **Synchronise on a signal the work produces.** A step that must be interrupted mid-run writes a
+  marker file; the test waits for the marker, not for 400 ms. A step whose output matters appends to a
+  log the test waits for.
+- **Stagger what the test controls.** If a write must land *inside* a running check, schedule it past
+  the phase it would otherwise race (the kill-grace test writes after the `SIGKILL`, so it asserts the
+  guarantee rather than the race).
+- **Scope assertions to the test's own turn.** Notification logs and state are shared across a file;
+  count only what appeared after the test's own start, and clean up anything you added to a shared
+  directory — a `nested/` directory left behind changes what every later test sees as dirty.
+- **Run the flake candidates under load in CI**, in parallel, because that is the only condition they
+  ever failed in.
+
+When a red verdict is reported that does not reproduce, that is the shape to look for — not a reason
+to re-run it until it passes.
 
 Test coverage by module:
 
