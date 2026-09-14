@@ -106,6 +106,22 @@ function makeCtx(cwd: string): FakeCtx {
   };
 }
 
+/**
+ * Make a ctx behave like pi's once the session behind it is gone: every member
+ * throws on use instead of returning. `ctx.ui` is the one that used to take the
+ * whole process down, from the cleanup of a background run that outlived it.
+ */
+function retireCtx(target: FakeCtx): void {
+  for (const key of ["ui", "cwd", "hasUI", "sessionManager"]) {
+    Object.defineProperty(target, key, {
+      configurable: true,
+      get() {
+        throw new Error("This extension ctx is stale after session replacement or reload.");
+      },
+    });
+  }
+}
+
 async function emit(fake: FakePi, name: string, event: any, ctx: FakeCtx): Promise<any> {
   let result: any;
   for (const handler of fake.handlers.get(name) ?? []) {
@@ -1790,6 +1806,58 @@ describe("P5 — output budget and background checks", () => {
     );
     assert.equal(fake.sent.length, 0, "a stale result must not re-prompt the agent");
     await waitFor(() => ctx._statuses.get("sentinel") === undefined, 20000);
+  });
+
+  test("a check that outlives its session does not crash on the retired ctx", async () => {
+    await configure({
+      autoRollback: false,
+      backgroundTurnEnd: true,
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [
+          {
+            name: "slow",
+            cmd: "sleep 0.4; echo done >> ran.log; exit 1",
+            timeoutMs: 20000,
+            cacheable: false,
+          },
+        ],
+      },
+    });
+
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+    assert.equal(ctx._statuses.get("sentinel"), "Checks running in background…");
+
+    // pi's order, and the only part of it that matters here: the shutdown event
+    // is emitted first, and only then does every member of the ctx start
+    // throwing. A run still in flight used to find that out in its `finally`.
+    await emit(fake, "session_shutdown", { type: "session_shutdown", reason: "resume" }, ctx);
+    // Anything sent before the retirement is legitimate — a turn-end notice for
+    // a live session. What must not happen is a report landing *after* it.
+    const before = ctx._notifications.length;
+
+    const rejections: unknown[] = [];
+    const collect = (reason: unknown) => {
+      rejections.push(reason);
+    };
+    process.on("unhandledRejection", collect);
+    try {
+      retireCtx(ctx);
+      // The check itself still finishes; it just stops reporting.
+      await waitFor(() => fs.existsSync(path.join(project, "ran.log")), 20000);
+      // Let the run's tail — `finally`, drain — settle before judging it.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      process.off("unhandledRejection", collect);
+    }
+
+    assert.deepEqual(rejections, [], "the retired run must not reject");
+    assert.equal(fake.sent.length, 0, "a retired session is not re-prompted");
+    assert.equal(
+      ctx._notifications.length,
+      before,
+      "a report addressed to a session that is gone is dropped, not thrown",
+    );
   });
 
   test("backgroundTurnEnd: false makes the turn wait for the result", async () => {

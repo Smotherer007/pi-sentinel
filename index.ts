@@ -309,6 +309,40 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
    * next run instead (see src/clients/background.ts).
    */
   let background: BackgroundSlot = EMPTY_BACKGROUND_SLOT;
+  /**
+   * Whether pi has retired this instance's ctx.
+   *
+   * A session replacement or reload does not merely stop delivering events: it
+   * makes every member of a captured `ctx` — `cwd` and `hasUI` included —
+   * *throw* on use. Sentinel is the rare extension that keeps working after a
+   * turn has ended, so its background verification can still be in flight when
+   * the user switches sessions or reloads; without this flag its tail reports
+   * into a conversation nobody is in, and an uncaught throw there takes the
+   * process down with it. pi emits `session_shutdown` before it invalidates, so
+   * that is where this is set. It is one-way on purpose: an instance whose
+   * session is gone is never handed a new one.
+   */
+  let ctxRetired = false;
+
+  /**
+   * This instance's UI, or undefined once pi has retired the ctx.
+   *
+   * Reading `ctx.ui` is itself the throwing operation, so the one place that
+   * cannot simply check the flag first — a `finally` that also runs on the
+   * early return above it — asks for it through here. A throw can only mean the
+   * ctx is stale (the getter does nothing but assert that it is active), so it
+   * retires the instance as well.
+   */
+  function liveUi(ctx: { ui: ExtensionUIContext }): ExtensionUIContext | undefined {
+    if (ctxRetired) return undefined;
+    try {
+      return ctx.ui;
+    } catch {
+      ctxRetired = true;
+      return undefined;
+    }
+  }
+
   /** Working-tree fingerprint when the current turn started (P3 baseline). */
   let turnBaseline: WorkspaceBaseline | null = null;
   /**
@@ -1230,6 +1264,18 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     }
   });
 
+  // ── Hook: session_shutdown ─────────────────────────────────────────────
+  //
+  // pi emits this before it tears the runtime down — on quit, reload, and
+  // every session replacement — and only then invalidates the ctx. Recording it
+  // is what lets the background verification tell "the session I belong to is
+  // gone" from "the session is live", rather than discovering it from a throw
+  // inside its own cleanup.
+
+  pi.on("session_shutdown", async () => {
+    ctxRetired = true;
+  });
+
   // ── Hook: before_agent_start (P4) ──────────────────────────────────────
   // The contract is (re)stated per user turn, so the rules are scoped to the
   // work that was actually asked for.
@@ -1619,8 +1665,11 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     try {
       return await runVerification(args);
     } catch (err) {
-      args.ctx.ui.setStatus("sentinel", undefined);
-      args.ctx.ui.notify(
+      // The catch must not throw in turn: when the failure *is* the retired
+      // ctx, reading `ctx.ui` here would turn a handled error into a crash.
+      const ui = liveUi(args.ctx);
+      ui?.setStatus("sentinel", undefined);
+      ui?.notify(
         `Sentinel: verification could not complete (${(err as Error)?.message ?? "unknown error"}). The code was left untouched.`,
         "error",
       );
@@ -1658,7 +1707,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
       // user with no trace at all — the silent version of exactly the failure
       // this guard exists to prevent.
       background = foldBackgroundRequest(background, args);
-      args.ctx.ui.notify(
+      liveUi(args.ctx)?.notify(
         "Sentinel: a background verification is still running — this turn was folded into the next run.",
         "info",
       );
@@ -1666,7 +1715,9 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     }
 
     const conf = runtime.config.config();
-    args.ctx.ui.setStatus("sentinel", "Checks running in background…");
+    // Also reached from the drain at the end of a retired run, holding the dead
+    // session's ctx — so the announcement goes through the same guard.
+    liveUi(args.ctx)?.setStatus("sentinel", "Checks running in background…");
 
     backgroundRun = (async () => {
       try {
@@ -1691,6 +1742,14 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
           postHashes: args.postHashes,
           allowRollback: false,
         });
+
+        // The conversation this run belongs to may have ended while it ran: the
+        // user can switch sessions, fork, or reload with `npm test` still going.
+        // Every member of `ctx` throws from here on, and a report would be
+        // addressed to nobody — so the run stops at the result, exactly as the
+        // stale-state branch below does. The `finally` still clears the status
+        // line and drains a folded turn, through the guard.
+        if (ctxRetired) return;
 
         if (runtime.config.revisionCount() !== startRevision) {
           args.ctx.ui.notify(
@@ -1765,7 +1824,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
         /* background verification must never crash the session */
       } finally {
         backgroundRun = null;
-        args.ctx.ui.setStatus("sentinel", undefined);
+        liveUi(args.ctx)?.setStatus("sentinel", undefined);
         // A turn that arrived while this one ran is now owed a verification.
         const next = takeBackgroundRequest(background);
         background = next.slot;
