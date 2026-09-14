@@ -54,6 +54,7 @@ export function metricsLines(metrics: SentinelMetrics): string[] {
     `  avg check:   ${formatDuration(avg)} | timeouts: ${metrics.timeouts}`,
     `  steps:       ${metrics.skippedSteps} skipped | ${metrics.retries} retried | ${metrics.escalations} escalated`,
     `  rollbacks:   ${metrics.rollbacks} (${metrics.partialRollbacks} partial)`,
+    `  refused:     ${metrics.blockedWrites ?? 0} write(s) blocked | ${metrics.policyViolations} policy stop(s)`,
   ];
   return lines;
 }

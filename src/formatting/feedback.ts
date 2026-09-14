@@ -67,6 +67,8 @@ export interface FailureFeedbackInput {
   includeRegressions?: boolean;
   /** Mindplace: include the code-graph blast radius (default true). */
   includeImpact?: boolean;
+  /** Files this repair attempt touched outside the cycle's original scope. */
+  scopeEscape?: string[];
   /** P5 token budget; 0 disables the cap. */
   maxOutputTokens: number;
 }
@@ -108,6 +110,7 @@ export function buildFailureFeedback(input: FailureFeedbackInput): SpillResult {
     escalation: input.escalation,
     conflicts: input.conflicts,
     restoreSkipped: input.restoreSkipped,
+    scopeEscape: input.scopeEscape,
   });
 
   return applyOutputCap(text, input.maxOutputTokens, spillDir(input.cwd), input.step);

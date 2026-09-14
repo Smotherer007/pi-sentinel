@@ -190,6 +190,29 @@ export function allVerified(cwd: string): VerifiedStateEntry[] {
   return Object.values(readLedger(cwd).files).sort((a, b) => b.at.localeCompare(a.at));
 }
 
+/** Ledger entries scanned when answering "what is green right now". */
+export const MAX_VERIFIED_SCAN = 200;
+
+/**
+ * The files that passed verification and are *still* in that exact state.
+ *
+ * `allVerified` answers "what did we ever record"; this answers the question
+ * the agent actually needs before it edits: which files are green as of this
+ * moment. An entry whose file has since changed is not evidence about the
+ * current tree and is deliberately left out rather than reported stale.
+ */
+export function currentlyVerified(cwd: string, limit = 12): VerifiedStateEntry[] {
+  const out: VerifiedStateEntry[] = [];
+  let scanned = 0;
+  for (const entry of allVerified(cwd)) {
+    if (scanned >= MAX_VERIFIED_SCAN || out.length >= limit) break;
+    scanned += 1;
+    if (hashFile(entry.path) !== entry.hash) continue;
+    out.push(entry);
+  }
+  return out;
+}
+
 /**
  * Restore a file to the state that last passed verification.
  * Returns false when there is no usable blob for it.

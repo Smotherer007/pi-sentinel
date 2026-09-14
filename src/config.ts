@@ -18,6 +18,7 @@ import type {
   PipelineStep,
   PolicyConfig,
   RecoveryConfig,
+  ScopeGuard,
   SentinelConfig,
   SentinelMetrics,
   StepPriority,
@@ -51,6 +52,10 @@ export const DEFAULT_CONFIG: SentinelConfig = {
     enabled: true,
     maxAttempts: 3,
     rollbackAfterExhaustion: false,
+    // Report by default: naming a widening change set costs nothing and is
+    // the signal the agent cannot derive on its own. `block` refuses the edit
+    // outright and is a deliberate per-project choice.
+    scopeGuard: "report",
   },
 
   // Diff/change policy — opt-in. Existing projects are never blocked until
@@ -63,6 +68,10 @@ export const DEFAULT_CONFIG: SentinelConfig = {
     allowLockfileChanges: true,
     allowWorkflowChanges: true,
     sensitivePaths: [],
+    // The whole policy block is opt-in, so enabling it is already the
+    // deliberate act. Once it is on, refusing the write is strictly better
+    // than undoing it afterwards.
+    blockBeforeWrite: true,
     rollbackOnViolation: false,
   },
 
@@ -114,10 +123,14 @@ export const DEFAULT_CONFIG: SentinelConfig = {
   },
   pipelines: {
     onFileMutation: [
-      // type-check is generous: npx can fetch/compile on first cold run.
-      { name: "type-check", cmd: "npx tsc --noEmit", timeoutMs: 15000 },
+      // `--no-install` on purpose: these run after *every* edit, and a default
+      // that can reach out to the npm registry turns a keystroke into a
+      // network round trip (and fails closed when there is no network at all).
+      // A missing tool is then reported as `command-not-found`, which sentinel
+      // classifies as an environment problem — it never rolls code back for it.
+      { name: "type-check", cmd: "npx --no-install tsc --noEmit", timeoutMs: 15000 },
       // linter is warnOnly by default so projects without eslint don't break.
-      { name: "linter", cmd: "npx eslint --quiet", timeoutMs: 8000, warnOnly: true },
+      { name: "linter", cmd: "npx --no-install eslint --quiet", timeoutMs: 8000, warnOnly: true },
     ],
     onTurnEnd: [
       // node:test has no `--bail` flag (Vitest/Jest only), so plain `npm test`.
@@ -213,6 +226,7 @@ export function emptyMetrics(): SentinelMetrics {
     rollbacks: 0,
     partialRollbacks: 0,
     policyViolations: 0,
+    blockedWrites: 0,
   };
 }
 
@@ -305,10 +319,18 @@ function normaliseConfig(
     maxAttempts: Number.isFinite(maxAttempts) ? Math.max(1, Math.floor(maxAttempts)) : 1,
     rollbackAfterExhaustion:
       rawRecovery.rollbackAfterExhaustion ?? merged.recovery.rollbackAfterExhaustion,
+    scopeGuard: normaliseScopeGuard(
+      rawRecovery.scopeGuard ?? merged.recovery.scopeGuard,
+    ),
   };
   merged.autoFix = merged.recovery.enabled;
   merged.maxAutoRetries = merged.recovery.maxAttempts;
   return merged;
+}
+
+/** An unknown scope-guard spelling falls back to the documented default. */
+function normaliseScopeGuard(value: unknown): ScopeGuard {
+  return value === "off" || value === "block" || value === "report" ? value : "report";
 }
 
 /** Settings a change policy needs, with safe defaults for out-of-date callers. */
@@ -322,6 +344,7 @@ export function recoveryOf(config: SentinelConfig): RecoveryConfig {
     enabled: config.autoFix,
     maxAttempts: config.maxAutoRetries,
     rollbackAfterExhaustion: false,
+    scopeGuard: "report",
   };
 }
 

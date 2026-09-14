@@ -75,10 +75,24 @@ import {
 } from "./src/clients/rollback.ts";
 import { snapshots, describeRestore } from "./src/clients/snapshot.ts";
 import { checkpoints } from "./src/clients/checkpoints.ts";
-import { stateHashOf, recordVerified, detectRegressions, revertToVerified, hashFile } from "./src/clients/evidence.ts";
-import { evaluatePolicy, formatPolicyReport, relativePath } from "./src/clients/policy.ts";
+import {
+  stateHashOf,
+  recordVerified,
+  detectRegressions,
+  revertToVerified,
+  hashFile,
+  currentlyVerified,
+} from "./src/clients/evidence.ts";
+import {
+  evaluatePolicy,
+  formatPolicyReport,
+  relativePath,
+  forbiddenKind,
+  violationFor,
+} from "./src/clients/policy.ts";
 import type { PolicyChange } from "./src/clients/policy.ts";
-import { outOfBandChanges } from "./src/clients/workspace.ts";
+import { outOfBandChanges, captureBaseline } from "./src/clients/workspace.ts";
+import type { WorkspaceBaseline } from "./src/clients/workspace.ts";
 import { describeChange, expandWithDependents } from "./src/clients/mindplace.ts";
 import { VerificationQueue } from "./src/clients/queue.ts";
 import { escalations, shouldEscalate } from "./src/clients/escalation.ts";
@@ -104,6 +118,7 @@ import {
   recoveryOf,
 } from "./src/config.ts";
 import type {
+  FailureKind,
   PipelineRunResult,
   PolicyReport,
   Regression,
@@ -128,11 +143,51 @@ export type { SentinelConfig, PipelineStep } from "./src/types.ts";
  */
 export const SENTINEL_MESSAGE_TYPE = "sentinel-verify";
 
+/**
+ * `customType` of sentinel's standing notices (the post-compaction restate).
+ *
+ * Deliberately *not* `SENTINEL_MESSAGE_TYPE`: a notice is not a verification
+ * result, so the trace hygiene in the `context` hook must never supersede it
+ * as if a newer run had answered it.
+ */
+export const SENTINEL_NOTICE_TYPE = "sentinel-notice";
+
 const SUPERSEDED_TRACE =
   "[sentinel] This verification result is superseded by a later run — ignore it and act on the most recent sentinel message.";
 
+/**
+ * Prefixed onto the newest trace once the code it describes has moved on.
+ *
+ * Superseding older traces only helps while a newer one exists. The live trace
+ * goes stale the moment the agent acts on it, and a repair loop that keeps
+ * reading it is exactly the documented failure: revising code against evidence
+ * bound to a state that no longer exists. The diagnostics are kept — some of
+ * them may still be unfixed — but they stop being treated as current.
+ */
+const STALE_TRACE_NOTICE =
+  "[sentinel] STALE: the files this result describes have changed since it was produced, so it no longer proves anything about the current code. Re-run the check before concluding that something still fails — and never report these diagnostics as the present state.";
+
 /** How many diagnostics from dependents we promote into the pruner focus. */
 const MAX_IMPACT_FOCUS = 10;
+
+/**
+ * Failure kinds that say nothing about the code.
+ *
+ * Sentinel already tells the agent "this is a timeout / a missing binary / an
+ * environment problem, do not rewrite working code" — and then used to roll
+ * that code back anyway and spend a repair attempt on it. A broken `npx`, a
+ * busy CI box or an unreachable registry must never cost the user their work.
+ */
+const INFRASTRUCTURE_KINDS: ReadonlySet<FailureKind> = new Set<FailureKind>([
+  "timeout",
+  "command-not-found",
+  "environment-error",
+]);
+
+/** True when a failure is about the environment rather than the code. */
+export function isInfrastructureFailure(kind: FailureKind | undefined): boolean {
+  return kind !== undefined && INFRASTRUCTURE_KINDS.has(kind);
+}
 
 /**
  * Whether at least one configured step actually executed. A step skipped by a
@@ -192,6 +247,45 @@ interface VerificationOutcome {
   escalation?: { count: number; max: number };
 }
 
+/**
+ * One turn's background verification request (P5). Named so a turn that could
+ * not start immediately can be kept and folded into the next run.
+ */
+interface BackgroundRequest {
+  cwd: string;
+  ctx: { ui: ExtensionUIContext };
+  focusPaths: string[];
+  checkpointId?: string;
+  /** Files the agent wrote this turn; the regression revert is scoped to them. */
+  mutablePaths?: string[];
+  /** Post-mutation hashes for `mutablePaths`. */
+  postHashes?: Map<string, string | null>;
+}
+
+/**
+ * Fold a turn that had to wait into the run that will cover it.
+ *
+ * The union of both scopes is verified. The *newer* checkpoint wins, because
+ * it is the only one a restore may still target: the older turn's tree has
+ * already been written over by the newer one.
+ */
+function mergeBackgroundRequests(
+  waiting: BackgroundRequest | null,
+  next: BackgroundRequest,
+): BackgroundRequest {
+  if (!waiting) return next;
+  const postHashes = new Map(waiting.postHashes ?? []);
+  for (const [path, hash] of next.postHashes ?? []) postHashes.set(path, hash);
+  return {
+    cwd: next.cwd,
+    ctx: next.ctx,
+    focusPaths: [...new Set([...waiting.focusPaths, ...next.focusPaths])],
+    checkpointId: next.checkpointId,
+    mutablePaths: [...new Set([...(waiting.mutablePaths ?? []), ...(next.mutablePaths ?? [])])],
+    postHashes,
+  };
+}
+
 /** One mutation's verification request, batched by the queue. */
 interface MutationRequest {
   cwd: string;
@@ -218,8 +312,24 @@ export default function (pi: ExtensionAPI) {
    * last one.
    */
   let recoveryStartCheckpointId: string | null = null;
+  /**
+   * The files the current red cycle is about. A repair attempt is expected to
+   * fix the cause *here*; reaching past it is the earliest observable sign
+   * that the agent has started varying an approach instead of fixing a cause,
+   * and `recovery.scopeGuard` decides whether that is reported or refused.
+   */
+  let recoveryScope: Set<string> | null = null;
   /** In-flight background verification (P5); one at a time. */
   let backgroundRun: Promise<void> | null = null;
+  /**
+   * A turn whose background checks could not start because an earlier run was
+   * still going. Dropping it would let a turn reach the user unverified, which
+   * is the one outcome the guard exists to prevent, so it is folded into the
+   * next run instead.
+   */
+  let pendingBackground: BackgroundRequest | null = null;
+  /** Working-tree fingerprint when the current turn started (P3 baseline). */
+  let turnBaseline: WorkspaceBaseline | null = null;
   /**
    * Signature of the last policy violation we already re-prompted for. An
    * identical violation is reported to the human but never re-sent to the
@@ -273,11 +383,28 @@ export default function (pi: ExtensionAPI) {
     mutationQueue.setDebounce(getConfig().verification.debounceMs);
   }
 
+  /**
+   * What the ledger can currently prove, as project-relative paths.
+   *
+   * Reading it is best-effort: an unreadable ledger costs the contract one
+   * sentence, never the turn.
+   */
+  function contractEvidence(cwd: string, conf: ReturnType<typeof getConfig>) {
+    if (!conf.trackVerifiedState) return {};
+    try {
+      const entries = currentlyVerified(cwd);
+      return { verified: entries.map((entry) => relativePath(cwd, entry.path)) };
+    } catch {
+      return {};
+    }
+  }
+
   function resetRepairBudget(): void {
     autoFixAttempts = 0;
     lastInjectedStateHash = null;
     lastInjectedPaths = [];
     recoveryStartCheckpointId = null;
+    recoveryScope = null;
     lastPolicySignature = null;
     // A new user turn (or a repaired loop) is a fresh start for escalation.
     escalations.reset();
@@ -324,6 +451,64 @@ export default function (pi: ExtensionAPI) {
       }
     }
     return changes;
+  }
+
+  /**
+   * Whether this mutation must not happen at all.
+   *
+   * Two independent reasons, both of which the agent can act on:
+   *   - the path is protected by the change policy, or
+   *   - the repair cycle is confined to a file set this path is not in.
+   *
+   * Returns null when the write may proceed.
+   */
+  function refuseMutation(
+    target: string,
+    cwd: string,
+    conf: ReturnType<typeof getConfig>,
+  ): { reason: string; summary: string } | null {
+    const abs = absPath(target, cwd);
+    if (isSentinelArtifact(cwd, abs)) return null;
+    const rel = relativePath(cwd, abs);
+
+    const policy = policyOf(conf);
+    if (policy.enabled && policy.blockBeforeWrite) {
+      const kind = forbiddenKind(rel, policy);
+      if (kind) {
+        const violation = violationFor(kind, rel);
+        recordPolicyViolation({
+          at: new Date().toISOString(),
+          rules: [violation.rule],
+          files: [rel],
+        });
+        recordMetrics({ policyViolations: 1 });
+        return {
+          summary: `${rel} is protected (${violation.rule})`,
+          reason:
+            `${violation.message.replace(/\n/g, " ")}\n` +
+            "The write was refused, so nothing changed on disk. Do not retry it: " +
+            "either solve the task without touching this path, or ask the user to relax " +
+            "`policy` in sentinel.config.ts.",
+        };
+      }
+    }
+
+    const recovery = recoveryOf(conf);
+    if (recovery.scopeGuard === "block" && recoveryScope && !recoveryScope.has(abs)) {
+      const allowed = [...recoveryScope].slice(0, 5).map((p) => relativePath(cwd, p));
+      return {
+        summary: `${rel} is outside the current repair scope`,
+        reason:
+          `[sentinel] This repair cycle is about ${allowed.join(", ")}. ` +
+          `${rel} was not part of the failure it started from, so the write was refused ` +
+          "and nothing changed on disk.\n" +
+          "Fix the cause inside the original scope. If the fix genuinely belongs " +
+          "elsewhere, stop and report that instead of editing further — widening the " +
+          "change set is how a repair loop turns one failure into several.",
+      };
+    }
+
+    return null;
   }
 
   /**
@@ -510,11 +695,17 @@ export default function (pi: ExtensionAPI) {
           )
         : [];
 
-    // 1) Whole-scope rollback (opt-in, never for warnOnly steps).
+    // A failure the environment caused is not evidence about the code. It
+    // must not restore files, must not revert a regression and must not spend
+    // a repair attempt — sentinel already tells the agent exactly that, and
+    // doing the opposite is how a slow `npx` costs somebody their work.
+    const infrastructure = isInfrastructureFailure(failure.failureKind);
+
+    // 1) Whole-scope rollback (opt-in, never for warnOnly or environment steps).
     let rolledBack = false;
     let conflicts: RollbackConflict[] = [];
     let restoreSkipped: string[] = [];
-    if (conf.autoRollback && !failure.warnOnly && args.allowRollback !== false) {
+    if (conf.autoRollback && !failure.warnOnly && !infrastructure && args.allowRollback !== false) {
       const ids = args.toolCallIds ?? [];
       const rb =
         ids.length > 1
@@ -568,7 +759,7 @@ export default function (pi: ExtensionAPI) {
     //    the file must be one the agent itself wrote this turn, and it must
     //    still be exactly what the agent left (a later edit by the user, a
     //    formatter or another process is never overwritten).
-    if (!rolledBack && conf.trackVerifiedState && conf.revertOnRegression) {
+    if (!rolledBack && !infrastructure && conf.trackVerifiedState && conf.revertOnRegression) {
       const postHashes = args.postHashes ?? snapshots.turnPostHashes();
       regressions = regressions.map((regression) => {
         if (!ownedPaths.has(regression.path)) return regression;
@@ -642,6 +833,7 @@ export default function (pi: ExtensionAPI) {
     cwd: string,
     attempt?: { attempt: number; max: number; stopped?: boolean },
     stateHashOverride?: string,
+    scopeEscape?: string[],
   ): string {
     const conf = getConfig();
     const failure = outcome.failure!;
@@ -665,6 +857,7 @@ export default function (pi: ExtensionAPI) {
       escalation: outcome.escalation,
       conflicts: outcome.conflicts,
       restoreSkipped: outcome.restoreSkipped,
+      scopeEscape,
       maxOutputTokens: conf.maxOutputTokens,
     }).text;
   }
@@ -685,10 +878,20 @@ export default function (pi: ExtensionAPI) {
     ctx: { ui: ExtensionUIContext };
     /** Pre-state checkpoint of this turn, used by rollbackAfterExhaustion. */
     checkpointId?: string;
+    /** Files the agent itself wrote this turn, for the cycle scope check. */
+    touchedPaths?: string[];
   }): void {
     const conf = getConfig();
     const recovery = recoveryOf(conf);
     const failure = args.outcome.failure!;
+
+    // Measured against the scope as it stands *before* this attempt can set
+    // it: the first failing turn defines the scope, later attempts are judged
+    // against it.
+    const scopeEscape =
+      recovery.scopeGuard !== "off" && recoveryScope
+        ? (args.touchedPaths ?? []).filter((path) => !recoveryScope!.has(path))
+        : [];
 
     // "The remaining delta stops changing" (Codex's stop condition) needs a
     // stable subject: a turn that changed nothing still refers to the files of
@@ -704,7 +907,7 @@ export default function (pi: ExtensionAPI) {
     let action: AutoFixAction = "none";
     let attemptInfo: { attempt: number; max: number; stopped?: boolean } | undefined;
 
-    if (recovery.enabled && !failure.warnOnly) {
+    if (recovery.enabled && !failure.warnOnly && !isInfrastructureFailure(failure.failureKind)) {
       if (lastInjectedStateHash === stateHash) {
         action = "stop-unchanged";
         recordAutoFix({
@@ -757,6 +960,10 @@ export default function (pi: ExtensionAPI) {
         if (recoveryStartCheckpointId === null && args.checkpointId) {
           recoveryStartCheckpointId = args.checkpointId;
         }
+        // The first attempt of a cycle fixes what the cycle may touch.
+        if (recoveryScope === null && recovery.scopeGuard !== "off") {
+          recoveryScope = new Set(deltaPaths);
+        }
         lastInjectedStateHash = stateHash;
         lastInjectedPaths = deltaPaths;
         attemptInfo = { attempt: autoFixAttempts, max: recovery.maxAttempts };
@@ -779,7 +986,15 @@ export default function (pi: ExtensionAPI) {
         ? { attempt: autoFixAttempts, max: recovery.maxAttempts, stopped: true }
         : attemptInfo,
       stateHash,
+      scopeEscape,
     );
+
+    if (scopeEscape.length > 0) {
+      args.ctx.ui.notify(
+        `Sentinel: this repair attempt changed ${scopeEscape.length} file(s) outside the failure it started from.`,
+        "warning",
+      );
+    }
 
     if (action === "inject") {
       pi.sendMessage(
@@ -814,6 +1029,11 @@ export default function (pi: ExtensionAPI) {
     } else if (action === "exhausted") {
       args.ctx.ui.notify(
         `Sentinel: ${recovery.maxAttempts} recovery attempts exhausted — reporting instead of editing further.`,
+        "warning",
+      );
+    } else if (isInfrastructureFailure(failure.failureKind)) {
+      args.ctx.ui.notify(
+        `Sentinel: "${failure.step}" failed for an environment reason (${failure.failureKind}) — the code was left untouched and no repair attempt was spent.`,
         "warning",
       );
     }
@@ -855,7 +1075,7 @@ export default function (pi: ExtensionAPI) {
     const conf = getConfig();
     if (!conf.enabled) return;
 
-    const contract = revisionContractText(conf);
+    const contract = revisionContractText(conf, contractEvidence(ctx.cwd, conf));
     if (!contract) return;
 
     return { systemPrompt: `${event.systemPrompt}\n\n${contract}` };
@@ -879,6 +1099,19 @@ export default function (pi: ExtensionAPI) {
     await ensureConfig(ctx.cwd);
     const conf = getConfig();
     if (!conf.enabled) return;
+
+    // P3 — what was already dirty before the agent did anything. Without this
+    // the turn-end scan attributes the user's in-flight work to the agent, and
+    // the state hash that bounds the repair loop starts drifting with files
+    // nobody in this turn touched.
+    turnBaseline = null;
+    if (conf.detectOutOfBand) {
+      try {
+        turnBaseline = captureBaseline(ctx.cwd);
+      } catch {
+        turnBaseline = null;
+      }
+    }
 
     let entryId: string | undefined;
     try {
@@ -908,6 +1141,20 @@ export default function (pi: ExtensionAPI) {
     const input = event.input as Record<string, unknown>;
     const target = (input.path ?? input.filePath ?? input.file) as string | undefined;
     if (target && !targetInScope(target, ctx.cwd)) return;
+
+    // ── Pre-write gate ───────────────────────────────────────────────────
+    // Checked before the verification filters on purpose: a protected path is
+    // protected whether or not sentinel would have type-checked it, and the
+    // cheapest rollback is the write that never happened.
+    if (target) {
+      const refusal = refuseMutation(target, ctx.cwd, conf);
+      if (refusal) {
+        ctx.ui.notify(`Sentinel refused a write: ${refusal.summary}`, "error");
+        recordMetrics({ blockedWrites: 1 });
+        return { block: true, reason: refusal.reason };
+      }
+    }
+
     if (target && !shouldVerify(target, conf, ctx.cwd)) return;
 
     if (target) {
@@ -1002,11 +1249,16 @@ export default function (pi: ExtensionAPI) {
     let outOfBand: string[] = [];
     if (conf.enabled && conf.detectOutOfBand) {
       try {
-        outOfBand = outOfBandChanges(ctx.cwd, turnPaths, (p) => {
-          const abs = resolve(p);
-          if (isSentinelArtifact(ctx.cwd, abs)) return true;
-          return !shouldVerify(abs, conf, ctx.cwd);
-        }).map((change) => change.path);
+        outOfBand = outOfBandChanges(
+          ctx.cwd,
+          turnPaths,
+          (p) => {
+            const abs = resolve(p);
+            if (isSentinelArtifact(ctx.cwd, abs)) return true;
+            return !shouldVerify(abs, conf, ctx.cwd);
+          },
+          turnBaseline ?? undefined,
+        ).map((change) => change.path);
       } catch {
         outOfBand = [];
       }
@@ -1117,7 +1369,14 @@ export default function (pi: ExtensionAPI) {
     if (outcome.passed) {
       resetRepairBudget();
     } else {
-      handleRedTurnSafely({ outcome, focusPaths, cwd: ctx.cwd, ctx, checkpointId });
+      handleRedTurnSafely({
+        outcome,
+        focusPaths,
+        cwd: ctx.cwd,
+        ctx,
+        checkpointId,
+        touchedPaths: turnPaths,
+      });
     }
 
     // The turn is over — drop its snapshot scope either way.
@@ -1158,6 +1417,7 @@ export default function (pi: ExtensionAPI) {
     cwd: string;
     ctx: { ui: ExtensionUIContext };
     checkpointId?: string;
+    touchedPaths?: string[];
   }): void {
     try {
       handleRedTurn(args);
@@ -1175,19 +1435,14 @@ export default function (pi: ExtensionAPI) {
    * state would silently discard work the user has not seen yet, so sentinel
    * reports instead.
    */
-  function startBackgroundChecks(args: {
-    cwd: string;
-    ctx: { ui: ExtensionUIContext };
-    focusPaths: string[];
-    checkpointId?: string;
-    /** Files the agent wrote this turn; the regression revert is scoped to them. */
-    mutablePaths?: string[];
-    /** Post-mutation hashes for `mutablePaths`. */
-    postHashes?: Map<string, string | null>;
-  }): void {
+  function startBackgroundChecks(args: BackgroundRequest): void {
     if (backgroundRun) {
+      // Never drop the turn. Skipping it would let unverified code reach the
+      // user with no trace at all — the silent version of exactly the failure
+      // this guard exists to prevent.
+      pendingBackground = mergeBackgroundRequests(pendingBackground, args);
       args.ctx.ui.notify(
-        "Sentinel: a background verification is still running — skipping this turn's checks.",
+        "Sentinel: a background verification is still running — this turn was folded into the next run.",
         "info",
       );
       return;
@@ -1265,15 +1520,70 @@ export default function (pi: ExtensionAPI) {
           cwd: args.cwd,
           ctx: args.ctx,
           checkpointId: args.checkpointId,
+          touchedPaths: args.mutablePaths,
         });
       } catch {
         /* background verification must never crash the session */
       } finally {
         backgroundRun = null;
         args.ctx.ui.setStatus("sentinel", undefined);
+        // A turn that arrived while this one ran is now owed a verification.
+        const queued = pendingBackground;
+        pendingBackground = null;
+        if (queued) startBackgroundChecks(queued);
       }
     })();
   }
+
+  // ── Hook: session_compact (P8 — survive a shortened context) ───────────
+  //
+  // Compaction replaces the conversation with a summary. Everything sentinel
+  // relies on being *in* the context goes with it: the revision contract, the
+  // live failure trace, and the evidence about what is green. What survives is
+  // a prose summary — and a summarized "the tests passed" is exactly the kind
+  // of unbound evidence that makes a repair loop act on a state that no longer
+  // exists. So the invariants are restated, as facts, right after the cut.
+  //
+  // The repair budget is deliberately *not* reset here: a loop that could buy
+  // itself fresh attempts by triggering a compaction would not be bounded at
+  // all.
+
+  pi.on("session_compact", async (_event, ctx) => {
+    await ensureConfig(ctx.cwd);
+    const conf = getConfig();
+    if (!conf.enabled) return;
+
+    const recovery = recoveryOf(conf);
+    const lines = [
+      "[sentinel] The conversation was compacted.",
+      "",
+      "Every verification result from before the compaction is gone from this context. A check result recalled from a summary is not evidence: it is not bound to any code state you can still see. Do not report anything as passing or failing on that basis — run the check again.",
+    ];
+
+    const contract = revisionContractText(conf, contractEvidence(ctx.cwd, conf));
+    if (contract) lines.push("", contract);
+
+    if (autoFixAttempts > 0) {
+      lines.push(
+        "",
+        `Repair budget carried over: attempt ${autoFixAttempts} of ${recovery.maxAttempts} in the cycle that is still open. Compaction does not reset it.`,
+      );
+    }
+
+    try {
+      pi.sendMessage(
+        {
+          customType: SENTINEL_NOTICE_TYPE,
+          content: lines.join("\n"),
+          display: false,
+          details: { compaction: true, attempt: autoFixAttempts },
+        },
+        { deliverAs: "nextTurn", triggerTurn: false },
+      );
+    } catch {
+      /* a notice is never worth breaking a compaction over */
+    }
+  });
 
   // ── Hook: context (P2 — stale-trace hygiene) ───────────────────────────
   // The strongest documented harm in repair loops is acting on a verification
@@ -1287,32 +1597,60 @@ export default function (pi: ExtensionAPI) {
     const messages = event.messages as unknown as Array<Record<string, unknown>>;
     if (!Array.isArray(messages) || messages.length === 0) return;
 
-    const indices: number[] = [];
+    const sentinelIndices = new Set<number>();
     for (let i = 0; i < messages.length; i += 1) {
       const message = messages[i];
       if (message?.role === "custom" && message.customType === SENTINEL_MESSAGE_TYPE) {
-        indices.push(i);
+        sentinelIndices.add(i);
       }
     }
-    if (indices.length <= 1) return;
+    if (sentinelIndices.size === 0) return;
 
-    const newest = indices[indices.length - 1];
+    const ordered = [...sentinelIndices];
+    const newest = ordered[ordered.length - 1];
+    const newestIsStale = injectedTraceIsStale();
+
     let changed = false;
     const next = messages.map((message, i) => {
-      if (i === newest || !indices.includes(i)) return message;
-      if (message.content === SUPERSEDED_TRACE) return message;
+      if (!sentinelIndices.has(i)) return message;
+
+      if (i !== newest) {
+        // An older trace is not merely stale, it is answered: a newer run
+        // exists. Nothing of it is worth the context it occupies.
+        if (message.content === SUPERSEDED_TRACE) return message;
+        changed = true;
+        return {
+          ...message,
+          content: Array.isArray(message.content)
+            ? [{ type: "text", text: SUPERSEDED_TRACE }]
+            : SUPERSEDED_TRACE,
+        };
+      }
+
+      if (!newestIsStale || containsText(message.content, STALE_TRACE_NOTICE)) return message;
       changed = true;
-      return {
-        ...message,
-        content: Array.isArray(message.content)
-          ? [{ type: "text", text: SUPERSEDED_TRACE }]
-          : SUPERSEDED_TRACE,
-      };
+      return { ...message, content: prefixContent(message.content, STALE_TRACE_NOTICE) };
     });
 
     if (!changed) return;
     return { messages: next as unknown as typeof event.messages };
   });
+
+  /**
+   * Whether the trace sentinel most recently injected still describes the tree.
+   *
+   * The repair loop already records the state hash it re-prompted for and the
+   * paths that hash covered; comparing them against the files as they are now
+   * is the whole test.
+   */
+  function injectedTraceIsStale(): boolean {
+    if (lastInjectedStateHash === null || lastInjectedPaths.length === 0) return false;
+    try {
+      return stateHashOf(lastInjectedPaths) !== lastInjectedStateHash;
+    } catch {
+      return false;
+    }
+  }
 
   // ── Command: /sentinel ─────────────────────────────────────────────────
 
@@ -1499,8 +1837,8 @@ export default function (pi: ExtensionAPI) {
     const lines = [
       "[sentinel] Status",
       `  enabled: ${conf.enabled} | autoRollback: ${conf.autoRollback}`,
-      `  recovery: ${conf.recovery.enabled} (max ${conf.recovery.maxAttempts} attempts, rollback-after-exhaustion ${conf.recovery.rollbackAfterExhaustion})`,
-      `  policy: ${conf.policy.enabled} (max ${conf.policy.maxChangedFiles || "unlimited"} file(s), ${conf.policy.maxAddedLines || "unlimited"} added line(s))`,
+      `  recovery: ${conf.recovery.enabled} (max ${conf.recovery.maxAttempts} attempts, rollback-after-exhaustion ${conf.recovery.rollbackAfterExhaustion}, scope guard ${conf.recovery.scopeGuard})`,
+      `  policy: ${conf.policy.enabled} (max ${conf.policy.maxChangedFiles || "unlimited"} file(s), ${conf.policy.maxAddedLines || "unlimited"} added line(s), block-before-write ${conf.policy.blockBeforeWrite})`,
       `  evidence: ${conf.trackVerifiedState} (revert ${conf.revertOnRegression}) | out-of-band: ${conf.detectOutOfBand}`,
       `  background checks: ${conf.backgroundTurnEnd} | output budget: ${conf.maxOutputTokens} tokens`,
       `  debounce: ${conf.verification.debounceMs}ms | cache: ${conf.verification.cache.enabled} | escalation: ${conf.verification.failureEscalation.enabled}`,
@@ -1519,6 +1857,23 @@ export default function (pi: ExtensionAPI) {
     ];
     return lines;
   }
+}
+
+/** True when a message body already carries `needle`. */
+function containsText(content: unknown, needle: string): boolean {
+  if (typeof content === "string") return content.includes(needle);
+  if (!Array.isArray(content)) return false;
+  return content.some(
+    (block) =>
+      typeof (block as { text?: unknown })?.text === "string" &&
+      ((block as { text: string }).text).includes(needle),
+  );
+}
+
+/** Put `prefix` in front of a message body, whatever shape it has. */
+function prefixContent(content: unknown, prefix: string): unknown {
+  if (Array.isArray(content)) return [{ type: "text", text: prefix }, ...content];
+  return `${prefix}\n\n${typeof content === "string" ? content : ""}`;
 }
 
 /** Session file of the active session, when available. */

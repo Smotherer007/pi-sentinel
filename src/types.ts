@@ -99,6 +99,18 @@ export interface PipelineStep {
  * Legacy `autoFix` / `maxAutoRetries` are mapped onto this block by
  * `config.ts`, so old configurations keep working unchanged.
  */
+/**
+ * How strictly a repair cycle is confined to the files it started from.
+ *
+ *   - `off`:    no scope is tracked.
+ *   - `report`: a widening change set is named in the failure payload.
+ *   - `block`:  an edit outside the scope is refused before it is written.
+ *
+ * A repair loop that keeps reaching further from the original failure is the
+ * documented way these loops cause damage, so the default reports it.
+ */
+export type ScopeGuard = "off" | "report" | "block";
+
 export interface RecoveryConfig {
   /** Whether the agent is re-prompted on a red turn at all. */
   enabled: boolean;
@@ -106,6 +118,8 @@ export interface RecoveryConfig {
   maxAttempts: number;
   /** Restore the pre-cycle state once `maxAttempts` is reached. */
   rollbackAfterExhaustion: boolean;
+  /** How a repair cycle that widens its file set is handled. */
+  scopeGuard: ScopeGuard;
 }
 
 /** Kind of sensitive file a change policy reacts to. */
@@ -133,6 +147,13 @@ export interface PolicyConfig {
   allowWorkflowChanges: boolean;
   /** Extra globs that must never be modified. */
   sensitivePaths: string[];
+  /**
+   * Refuse a write to a protected path *before* it happens, instead of only
+   * reporting it once the turn is over. A refusal the agent reads as a tool
+   * error is cheaper than a rollback and leaves nothing to undo; the turn-end
+   * evaluation still covers changes that never went through edit/write.
+   */
+  blockBeforeWrite: boolean;
   /** Restore the turn's files when the policy is violated. */
   rollbackOnViolation: boolean;
 }
@@ -395,6 +416,8 @@ export interface SentinelMetrics {
   partialRollbacks: number;
   /** Turns stopped by the change policy. */
   policyViolations: number;
+  /** Writes refused before they happened (policy or repair scope). */
+  blockedWrites: number;
 }
 
 // ── P1: durable checkpoints ───────────────────────────────────────────────

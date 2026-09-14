@@ -163,7 +163,20 @@ function isAllowed(kind: SensitiveKind, config: PolicyConfig): boolean {
   }
 }
 
-function violationFor(kind: SensitiveKind, rel: string): PolicyViolation {
+/**
+ * The sensitive kind of a path the policy refuses to have changed, or null.
+ *
+ * Same classification as the turn-end report, asked one step earlier: before
+ * the write happens rather than after. `projectPath` must be project-relative,
+ * like every other glob in sentinel.
+ */
+export function forbiddenKind(projectPath: string, config: PolicyConfig): SensitiveKind | null {
+  const kind = sensitiveKind(projectPath, config);
+  if (!kind) return null;
+  return isAllowed(kind, config) ? null : kind;
+}
+
+export function violationFor(kind: SensitiveKind, rel: string): PolicyViolation {
   switch (kind) {
     case "workflow":
       return {

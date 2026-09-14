@@ -140,6 +140,11 @@ export function formatError(failure: {
   restoreSkipped?: string[];
   /** P6: how many attempts the step needed (only when > 1). */
   attempts?: number;
+  /**
+   * Files this repair attempt changed that the cycle did not start from.
+   * A loop that keeps widening its change set is the documented failure mode.
+   */
+  scopeEscape?: string[];
 }): string {
   const header = `[sentinel] Verification failed at step "${failure.step}"`;
   const exitParts = [`exit code: ${failure.exitCode}`, `duration: ${failure.durationMs}ms`];
@@ -211,6 +216,20 @@ export function formatError(failure: {
         );
       }
     }
+  }
+
+  // The repair cycle is reaching past the files it was called about. Said
+  // plainly, because it is the earliest visible sign that the agent is varying
+  // an approach instead of fixing a cause.
+  const scopeEscape = failure.scopeEscape ?? [];
+  if (scopeEscape.length > 0) {
+    lines.push(`REPAIR SCOPE EXCEEDED (${scopeEscape.length} file(s)):`);
+    for (const file of scopeEscape.slice(0, 5)) {
+      lines.push(`  ${shortPath(file)} was not part of the failure this cycle started from.`);
+    }
+    lines.push(
+      "Widening the change set is how a repair loop turns one failure into several. Revert the files above, fix the cause inside the original scope, or stop and report what you cannot fix there.",
+    );
   }
 
   // Mindplace synergy: what else this change can break.

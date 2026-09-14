@@ -26,6 +26,9 @@
   ],
   "author": "Patrick Weppelmann",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.18.0"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Smotherer007/pi-sentinel.git"
@@ -35,7 +38,7 @@
   },
   "homepage": "https://github.com/Smotherer007/pi-sentinel#readme",
   "files": [
-    "*.ts",
+    "index.ts",
     "src/**/*.ts",
     "CHANGELOG.md",
     "README.md",

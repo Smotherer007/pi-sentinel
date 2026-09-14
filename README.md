@@ -17,12 +17,21 @@ mechanisms Codex CLI and Claude Code rely on:
 | Loop guard | `continue: false` | `stop_hook_active` | **budget + "code state unchanged" stop condition** |
 | Code checkpoints | git checkpoints (manual) | checkpointing + `/rewind`, last 100, ~30 days | **durable turn checkpoints + `/sentinel rewind`**, retention 50 |
 | Rollback precision | git stash | skips bash edits, subagents, symlinks | **snapshots incl. newly created files**, unrelated work untouched |
-| Detects bash/formatter/git edits | sandbox-wide | documented blind spot | **`git status --porcelain` scan (P3)** |
+| Detects bash/formatter/git edits | sandbox-wide | documented blind spot | **`git status --porcelain` scan against a per-turn baseline (P3)** |
+| Refuses a bad write before it happens | approval modes | `PreToolUse` → `deny` | **`tool_call` → `block` for protected paths and repair scope (P8)** |
+| Survives context compaction | — | `PreCompact` hook | **`session_compact` restates the invariants, budget carries over (P8)** |
+| Environment failure ≠ code failure | sandbox reports it | — | **timeout / missing tool / env error never rolls back (P6)** |
 | Stale verification traces | bounded retries, delta check | — | **superseded traces before every LLM call (P2)** |
 | Verified-state memory | hook recipe | — | **content-hash ledger + regression revert (P2)** |
 | Impact / blast radius | — | — | **code knowledge graph via pi-mindplace** |
 | Bounded output | ~2,500 tokens + spill file | 10,000 chars + spill file | **`maxOutputTokens` + spill file (P5)** |
 | Long checks off the critical path | background hooks | `asyncRewake` | **background turn-end + re-wake (P5)** |
+
+## Requirements
+
+Node **22.18 or newer**. The package ships TypeScript sources and relies on Node's native type
+stripping, so an older runtime fails at import with an unexplained syntax error. This is declared as
+`engines.node` — `npm install` will warn you rather than let you find out at run time.
 
 ## Installation
 
@@ -138,7 +147,7 @@ What that buys you: unrelated uncommitted work is never touched, a repair loop c
 a spent budget cannot leave a half-finished edit behind, and a change that would rewrite CI or a
 lockfile is stopped before it is ever verified.
 
-## The eight mechanisms
+## The nine mechanisms
 
 ### P0 — close the loop: the agent is re-prompted, not just reported to
 
@@ -265,15 +274,30 @@ Sentinel only observes `edit` and `write`. A large share of real edits does not 
 the same blind spot and documents the workaround — ask the working tree itself, via
 `git status --porcelain`, which also lists untracked files that `git diff` misses.
 
-At every `turn_end` sentinel scans the working tree, subtracts the paths the hooks already captured,
-and verifies the remainder too:
+At `turn_start` sentinel fingerprints everything the working tree already reports as dirty. At
+`turn_end` it scans again, subtracts the paths the hooks captured *and* everything that was already
+dirty before the turn began, and verifies the remainder:
 
 ```ts
 detectOutOfBand: true,
 ```
 
-Caveat, stated honestly: those files are **verified but not snapshotted** — their pre-state was never
-observed, so they cannot be restored from a checkpoint. Sentinel reports how many files that affects.
+Both halves of that matter more than they look:
+
+- **The working tree is not a diff.** `git status` lists every uncommitted change, not the ones this
+  turn made. Without the baseline, a user's work in flight is attributed to the agent — and since the
+  focus set feeds `stateHashOf`, the hash that bounds the repair loop starts drifting with files
+  nobody in this turn touched. The loop's stop condition depends on that hash being stable, so this
+  is a correctness property, not a tidiness one.
+- **Porcelain paths are repository-root-relative**, never relative to the current directory. Running
+  the agent in a package inside a monorepo is completely ordinary, and resolving those paths against
+  the cwd yields paths that do not exist. Every git-derived path now goes through
+  `git rev-parse --show-toplevel`, mapped back through the caller's own (possibly symlinked) prefix
+  so it still matches the absolute paths the mutation hooks captured.
+
+Caveat, stated honestly: out-of-band files are **verified but not snapshotted** — their pre-state was
+never observed, so they cannot be restored from a checkpoint. Sentinel reports how many files that
+affects.
 
 ### P4 — a revision contract in the system prompt
 
@@ -424,6 +448,42 @@ large changes must never miss one. Two rules keep the stop honest:
   re-sent to the agent, which is what keeps a policy stop from becoming a loop of its own. A clean
   turn reopens the stop, so a later occurrence is reported again.
 
+### P8 — the context is the product, so it is defended
+
+The three mechanisms above (P0, P2, P4) all rest on one assumption: that what the agent reads about
+the code is bound to the code as it is. Three things break that assumption, and each gets an answer.
+
+**A write that should never happen is refused, not undone.** `tool_call` can return
+`{ block: true, reason }` — pi's equivalent of Claude Code's `PreToolUse` deny. Sentinel uses it for
+two cases: a path the change policy protects, and an edit that reaches outside the file set the
+current repair cycle is about. The agent reads the reason as a tool error and can act on it; nothing
+was written, so there is nothing to restore and no conflict to resolve:
+
+```ts
+policy: { enabled: true, allowWorkflowChanges: false, blockBeforeWrite: true },
+recovery: { scopeGuard: "block" },
+```
+
+The turn-end policy evaluation still runs. It is the only thing that can see a change made through
+bash rather than `edit`/`write`, so the two are complementary rather than redundant.
+
+**A repair cycle may not widen.** The first failing turn of a cycle fixes the file set that cycle is
+about. A later attempt that edits something else is not repairing the cause, it is varying an
+approach — the documented way these loops turn one failure into several. `scopeGuard: "report"`
+(the default) names the offending files in the failure payload; `"block"` refuses the edit outright.
+A new user message opens a fresh cycle, because the user asking for something else is not a widening
+repair.
+
+**A compaction does not launder stale evidence.** Compaction replaces the conversation with a
+summary, and everything sentinel relies on being *in* the context goes with it: the contract, the
+live trace, the list of what is green. What survives is prose — and a summarized "the tests passed"
+is exactly the unbound evidence that sends a repair loop after code that has already moved. On
+`session_compact` sentinel restates the invariants as facts, re-lists the files that are verified
+green *at their current content*, and explicitly disowns any check result recalled from the summary.
+
+The repair budget deliberately carries across the compaction. A loop that could buy itself fresh
+attempts by triggering one would not be bounded at all.
+
 ## Tools
 
 | Tool | Description |
@@ -533,6 +593,15 @@ trustworthy:
    step, `maxOutputTokens` for the model-visible payload.
 6. **A `cwd` cannot leave the project root.** A step whose `cwd` resolves outside
    it fails with an environment error rather than running elsewhere.
+7. **An environment failure never costs you code.** A timeout, a missing binary
+   or an `EACCES`/network error says nothing about what you wrote. Those kinds
+   never trigger a rollback, never revert a regression and never spend a repair
+   attempt — sentinel already tells the agent "do not rewrite working code for
+   this", and doing the opposite would make that advice a lie.
+8. **A turn is never silently left unverified.** When background checks are
+   still running at the end of the next turn, that turn is folded into the next
+   run instead of being skipped. Unverified code reaching the user with no trace
+   at all is the silent form of the failure this guard exists to prevent.
 
 ## Failure recovery
 
@@ -548,6 +617,10 @@ trustworthy:
 | The recovery budget is spent | With `rollbackAfterExhaustion` the state before the failing cycle is restored; otherwise the work stays and is reported. | Read what still fails; do not start another identical cycle. |
 | A turn violates the change policy | The turn stops before verification, the violation is recorded, and with `rollbackOnViolation` its files are restored. | Revert the offending change, or relax `policy` in `sentinel.config.ts` if it was intended. |
 | A file regressed from a verified state | Reported as a regression; with `revertOnRegression` that single file is restored. | Restore the file or justify the change — never silently keep both. |
+| A check fails because the *environment* is broken | Classifies it (`timeout`, `command-not-found`, `environment-error`), leaves every file alone and spends no repair attempt. | Fix the tool, the network or the timeout. Do not touch the source. |
+| A repair attempt edits files the cycle was not about | Names them under `REPAIR SCOPE EXCEEDED`, or refuses the write with `scopeGuard: "block"`. | Fix the cause inside the original scope, or stop and report. |
+| The conversation is compacted | Restates the contract and the currently-green files, disowns summarized check results, carries the repair budget over. | Re-run any check whose result you only remember from the summary. |
+| A write targets a protected path | Refuses the tool call before anything is written (`policy.blockBeforeWrite`). | Solve the task without that path, or relax the policy deliberately. |
 
 ## Configuration
 
@@ -668,6 +741,7 @@ export default defineConfig({
 | `recovery.enabled` | boolean | `true` | Re-prompt the agent with the pruned failure at turn end (P0). |
 | `recovery.maxAttempts` | number | `3` | Upper bound on consecutive repair attempts (`>= 1`). |
 | `recovery.rollbackAfterExhaustion` | boolean | `false` | Restore the pre-cycle state once the attempt budget is spent (P0). |
+| `recovery.scopeGuard` | `"off" \| "report" \| "block"` | `"report"` | How a repair cycle that widens its file set is handled (P8). |
 | `policy.enabled` | boolean | `false` | Gate the *shape* of a turn, not just its result (P7). |
 | `policy.maxChangedFiles` | number | `0` | Max changed files per turn; `0` = no limit. |
 | `policy.maxAddedLines` | number | `0` | Max added lines per turn; `0` = no limit. |
@@ -675,6 +749,7 @@ export default defineConfig({
 | `policy.allowLockfileChanges` | boolean | `true` | Allow a lockfile to be modified. |
 | `policy.allowWorkflowChanges` | boolean | `true` | Allow `.github/workflows/**` to be modified. |
 | `policy.sensitivePaths` | string[] | `[]` | Project-relative globs that may never be modified. |
+| `policy.blockBeforeWrite` | boolean | `true` | Refuse a write to a protected path instead of undoing it afterwards (P8). |
 | `policy.rollbackOnViolation` | boolean | `false` | Restore the turn's files when the policy is violated. |
 | `autoFix` | boolean | `true` | Legacy alias of `recovery.enabled`, kept in sync. |
 | `maxAutoRetries` | number | `3` | Legacy alias of `recovery.maxAttempts`, kept in sync. |
@@ -730,13 +805,14 @@ export default defineConfig({
 | Hook | Trigger | What it does |
 |------|---------|--------------|
 | `session_start` | session starts | Announce the armed state; reset the repair budget. |
-| `before_agent_start` | user prompt submitted | Append the revision contract (P4). |
+| `before_agent_start` | user prompt submitted | Append the revision contract, including the files that are verified green right now (P4). |
 | `message_start` | every message | Reset the repair budget **only for `role: "user"`** — sentinel's own continuations keep counting (P0). |
-| `turn_start` | turn starts | Begin a fresh snapshot scope and checkpoint scope. |
-| `tool_call` | before `edit` / `write` | Snapshot the target file; set the status indicator. |
+| `turn_start` | turn starts | Begin a fresh snapshot and checkpoint scope; fingerprint the already-dirty working tree as the out-of-band baseline (P3). |
+| `tool_call` | before `edit` / `write` | Refuse the write when it targets a protected path or leaves the repair scope (P8); otherwise snapshot the target file and set the status indicator. |
 | `tool_result` | after `edit` / `write` | Run `onFileMutation`, record evidence, optionally restore, inject `isError`. |
 | `turn_end` | after a turn | Flush the checkpoint (P1), scan for out-of-band changes (P3), run `onTurnEnd` (sync or background, P5), re-prompt on failure (P0). |
-| `context` | before each LLM call | Keep only the newest sentinel trace live (P2). |
+| `session_compact` | after a compaction | Restate the contract and the currently-green files; disown summarized check results; carry the repair budget over (P8). |
+| `context` | before each LLM call | Supersede older sentinel traces, and mark the newest one stale once the files it describes have changed (P2). |
 
 ## Synergy with pi-mindplace
 

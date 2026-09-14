@@ -15,7 +15,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { execSync } from "node:child_process";
 
-import extensionFactory, { SENTINEL_MESSAGE_TYPE } from "../index.ts";
+import extensionFactory, { SENTINEL_MESSAGE_TYPE, SENTINEL_NOTICE_TYPE } from "../index.ts";
 import { projectDir, _resetForTesting, getConfig, getState } from "../src/config.ts";
 import { checkpoints } from "../src/clients/checkpoints.ts";
 import { verifiedEntry } from "../src/clients/evidence.ts";
@@ -23,6 +23,7 @@ import { SentinelRewindTool } from "../src/tools/sentinel-rewind.ts";
 import { SentinelStatusTool } from "../src/tools/sentinel-status.ts";
 import { _clearCache } from "../src/clients/mindplace.ts";
 import { changedPaths } from "../src/clients/workspace.ts";
+import { _clearRepoRootCache } from "../src/clients/git-client.ts";
 
 type Handler = (event: any, ctx: any) => any;
 
@@ -166,10 +167,24 @@ async function mutate(rel: string, content: string, callId = "call-1"): Promise<
   );
 }
 
-/** One full turn: start, mutate, end. */
-async function runTurn(turnIndex: number, rel: string | null, content: string): Promise<any> {
+/**
+ * One full turn: start, mutate, end.
+ *
+ * `duringTurn` runs after `turn_start` (and after the optional mutation), so a
+ * test can simulate a change that bypasses the hooks entirely — a formatter,
+ * `sed -i`, a code generator the agent invoked through bash. Out-of-band
+ * detection is about changes made *while the turn runs*; a file that was
+ * already dirty beforehand belongs to whoever made it dirty.
+ */
+async function runTurn(
+  turnIndex: number,
+  rel: string | null,
+  content: string,
+  duringTurn?: () => void | Promise<void>,
+): Promise<any> {
   await emit(fake, "turn_start", { type: "turn_start", turnIndex }, ctx);
   if (rel) await mutate(rel, content, `call-${turnIndex}`);
+  if (duringTurn) await duringTurn();
   const result = await emit(
     fake,
     "turn_end",
@@ -196,6 +211,9 @@ after(() => {
 beforeEach(async () => {
   _clearCache();
   _resetForTesting();
+  // The project directory is re-created (and re-`git init`ed) per test, so a
+  // memoised repository root from a previous test would be a stale answer.
+  _clearRepoRootCache();
 
   // Wipe the whole project except the module-type marker, so no test can leak
   // files (and therefore out-of-band detections) into the next one.
@@ -228,6 +246,7 @@ describe("extension registration", () => {
       "tool_call",
       "tool_result",
       "turn_end",
+      "session_compact",
       "context",
     ]) {
       assert.ok(fake.handlers.has(hook), `missing hook: ${hook}`);
@@ -480,7 +499,7 @@ describe("P7 — change policy", () => {
   test("a disallowed workflow stops the turn and tells the agent what to revert", async () => {
     await configure({
       autoRollback: false,
-      policy: { enabled: true, allowWorkflowChanges: false },
+      policy: { enabled: true, allowWorkflowChanges: false, blockBeforeWrite: false },
       pipelines: { onFileMutation: [], onTurnEnd: [] },
     });
 
@@ -503,7 +522,7 @@ describe("P7 — change policy", () => {
   test("stops the turn before verification runs", async () => {
     await configure({
       autoRollback: false,
-      policy: { enabled: true, allowWorkflowChanges: false },
+      policy: { enabled: true, allowWorkflowChanges: false, blockBeforeWrite: false },
       pipelines: {
         onFileMutation: [],
         onTurnEnd: [
@@ -524,7 +543,7 @@ describe("P7 — change policy", () => {
   test("rollbackOnViolation restores the offending file", async () => {
     await configure({
       autoRollback: false,
-      policy: { enabled: true, allowWorkflowChanges: false, rollbackOnViolation: true },
+      policy: { enabled: true, allowWorkflowChanges: false, rollbackOnViolation: true, blockBeforeWrite: false },
       pipelines: { onFileMutation: [], onTurnEnd: [] },
     });
 
@@ -552,7 +571,7 @@ describe("P7 — change policy", () => {
   test("a violation in one turn does not leak into the next", async () => {
     await configure({
       autoRollback: false,
-      policy: { enabled: true, allowWorkflowChanges: false },
+      policy: { enabled: true, allowWorkflowChanges: false, blockBeforeWrite: false },
       pipelines: { onFileMutation: [], onTurnEnd: [] },
     });
 
@@ -567,10 +586,65 @@ describe("P7 — change policy", () => {
     assert.equal(fake.sent.length, 1, "only the violating turn produced a follow-up");
   });
 
+  test("a protected path is refused before the write happens", async () => {
+    await configure({
+      autoRollback: false,
+      policy: { enabled: true, allowWorkflowChanges: false, blockBeforeWrite: true },
+      pipelines: { onFileMutation: [], onTurnEnd: [] },
+    });
+
+    const before = getState().metrics.blockedWrites;
+
+    await emit(fake, "turn_start", { type: "turn_start", turnIndex: 1 }, ctx);
+    const decision = await emit(
+      fake,
+      "tool_call",
+      {
+        type: "tool_call",
+        toolName: "write",
+        toolCallId: "call-1",
+        input: { path: ".github/workflows/ci.yml" },
+      },
+      ctx,
+    );
+
+    assert.equal(decision?.block, true, "the tool call is refused");
+    assert.ok(String(decision.reason).includes(".github/workflows/ci.yml"));
+    assert.ok(
+      String(decision.reason).includes("nothing changed on disk"),
+      "the agent is told there is nothing to undo",
+    );
+    assert.equal(
+      fs.existsSync(path.join(project, ".github/workflows/ci.yml")),
+      false,
+      "the cheapest rollback is the write that never happened",
+    );
+    assert.equal(getState().metrics.blockedWrites, before + 1);
+    assert.ok(ctx._notifications.some((n) => n.text.includes("refused a write")));
+  });
+
+  test("an ordinary path is not refused", async () => {
+    await configure({
+      autoRollback: false,
+      policy: { enabled: true, allowWorkflowChanges: false, blockBeforeWrite: true },
+      pipelines: { onFileMutation: [], onTurnEnd: [] },
+    });
+
+    await emit(fake, "turn_start", { type: "turn_start", turnIndex: 1 }, ctx);
+    const decision = await emit(
+      fake,
+      "tool_call",
+      { type: "tool_call", toolName: "edit", toolCallId: "call-1", input: { path: "src/a.ts" } },
+      ctx,
+    );
+
+    assert.equal(decision?.block, undefined);
+  });
+
   test("an out-of-band violation is reported once, not re-sent in a loop", async () => {
     await configure({
       autoRollback: false,
-      policy: { enabled: true, allowWorkflowChanges: false },
+      policy: { enabled: true, allowWorkflowChanges: false, blockBeforeWrite: false },
       include: ["**/*.yml"],
       pipelines: { onFileMutation: [], onTurnEnd: [] },
     });
@@ -579,15 +653,35 @@ describe("P7 — change policy", () => {
     execSync("git add -A", { cwd: project });
 
     const target = path.join(project, ".github/workflows/ci.yml");
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, "name: ci\n");
 
-    await runTurn(1, null, "");
+    await runTurn(1, null, "", async () => {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, "name: ci\n");
+      await waitFor(() => changedPaths(project).some((c) => c.path.endsWith("ci.yml")));
+    });
     assert.equal(fake.sent.length, 1, "a bash-only change is still caught");
 
-    // The very same state is observed again: nothing changed and nothing was
-    // committed, so the change is reported to the human but not re-prompted.
+    // Turn 2 changes nothing: the file is still dirty, but it was dirty when
+    // the turn began, so it is not this turn's doing and is not re-reported.
     await runTurn(2, null, "");
+    assert.equal(fake.sent.length, 1, "an untouched violation is not re-sent");
+  });
+
+  test("re-creating a rolled-back violation is reported once, not in a loop", async () => {
+    await configure({
+      autoRollback: false,
+      policy: { enabled: true, allowWorkflowChanges: false, rollbackOnViolation: true, blockBeforeWrite: false },
+      pipelines: { onFileMutation: [], onTurnEnd: [] },
+    });
+
+    // Turn 1 writes the forbidden file; the policy restores it away again.
+    await runTurn(1, ".github/workflows/ci.yml", "name: ci\n");
+    assert.equal(fake.sent.length, 1);
+    assert.equal(fs.existsSync(path.join(project, ".github/workflows/ci.yml")), false);
+
+    // Turn 2 re-creates exactly the same file: the same violation about the
+    // same content. That is the loop the signature guard exists for.
+    await runTurn(2, ".github/workflows/ci.yml", "name: ci\n");
     assert.equal(fake.sent.length, 1, "an identical violation is not re-sent");
     assert.ok(ctx._notifications.some((n) => n.text.includes("same policy violation repeated")));
   });
@@ -831,22 +925,46 @@ describe("P3 — out-of-band changes", () => {
     execSync("git init -q", { cwd: project });
     execSync("git add -A", { cwd: project });
 
-    // A "bash" style change: written directly, no tool_call involved.
-    fs.mkdirSync(path.join(project, "src"), { recursive: true });
-    fs.writeFileSync(path.join(project, "src/generated.ts"), "export const g = 1;\n");
+    await runTurn(1, null, "", async () => {
+      // A "bash" style change: written directly, no tool_call involved.
+      fs.mkdirSync(path.join(project, "src"), { recursive: true });
+      fs.writeFileSync(path.join(project, "src/generated.ts"), "export const g = 1;\n");
 
-    // Precondition: `git status` is the only source for out-of-band changes and
-    // can lag briefly under load. Wait until the scan sees the file, so a slow
-    // git fails here with a clear message instead of at the notification below.
-    await waitFor(() =>
-      changedPaths(project).some((c) => c.path.endsWith("generated.ts")),
-    );
-
-    await runTurn(1, null, "");
+      // Precondition: `git status` is the only source for out-of-band changes
+      // and can lag briefly under load. Wait until the scan sees the file, so a
+      // slow git fails here with a clear message instead of at the assertion.
+      await waitFor(() =>
+        changedPaths(project).some((c) => c.path.endsWith("generated.ts")),
+      );
+    });
 
     assert.ok(
       ctx._notifications.some((n) => n.text.includes("changed outside edit/write")),
       "the user is told what the hooks could not see",
+    );
+  });
+
+  test("work that was already dirty before the turn is not attributed to it", async () => {
+    await configure({
+      autoRollback: false,
+      include: ["**/*.ts"],
+      pipelines: { onFileMutation: [], onTurnEnd: [{ name: "check", cmd: "exit 0", timeoutMs: 5000 }] },
+    });
+
+    execSync("git init -q", { cwd: project });
+    execSync("git add -A", { cwd: project });
+
+    // The user's own work in flight, made before the agent did anything.
+    fs.mkdirSync(path.join(project, "src"), { recursive: true });
+    fs.writeFileSync(path.join(project, "src/wip.ts"), "export const wip = 1;\n");
+    await waitFor(() => changedPaths(project).some((c) => c.path.endsWith("wip.ts")));
+
+    await runTurn(1, null, "");
+
+    assert.equal(
+      ctx._notifications.some((n) => n.text.includes("changed outside edit/write")),
+      false,
+      "the working tree is not the turn's diff",
     );
   });
 
@@ -864,6 +982,414 @@ describe("P3 — out-of-band changes", () => {
       ctx._notifications.some((n) => n.text.includes("changed outside edit/write")),
       false,
     );
+  });
+});
+
+describe("environment failures are not code failures", () => {
+  test("a missing command never rolls back and never spends a repair attempt", async () => {
+    await configure({
+      autoRollback: true,
+      recovery: { enabled: true, maxAttempts: 3 },
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [
+          { name: "missing-tool", cmd: "sentinel-no-such-binary-xyz", timeoutMs: 5000 },
+        ],
+      },
+    });
+
+    // State is persisted per project and outlives a single test, so every
+    // counter is compared as a delta.
+    const before = getState().autoFixHistory.length;
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+
+    assert.equal(
+      fs.readFileSync(path.join(project, "src/a.ts"), "utf-8"),
+      "export const a = 1;\n",
+      "the agent's work survives a broken pipeline",
+    );
+    assert.equal(fake.sent.length, 0, "the agent is not sent back to edit code");
+    assert.equal(
+      getState().autoFixHistory.length,
+      before,
+      "no repair attempt is charged for an environment failure",
+    );
+    assert.ok(
+      ctx._notifications.some((n) => n.text.includes("environment reason")),
+      "the human is told why nothing happened",
+    );
+  });
+
+  test("a timeout leaves the working tree alone", async () => {
+    await configure({
+      autoRollback: true,
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [{ name: "slow", cmd: "node -e 'setTimeout(()=>{}, 5000)'", timeoutMs: 150 }],
+      },
+    });
+
+    const before = getState().metrics.rollbacks;
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+
+    assert.equal(fs.existsSync(path.join(project, "src/a.ts")), true);
+    assert.equal(
+      getState().metrics.rollbacks,
+      before,
+      "a slow check is not a reason to undo work",
+    );
+  });
+
+  test("a real type error still rolls back", async () => {
+    await configure({
+      autoRollback: true,
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [
+          {
+            name: "type-check",
+            cmd: "node -e 'console.error(\"src/a.ts(1,1): error TS2322: nope\"); process.exit(2)'",
+            timeoutMs: 5000,
+          },
+        ],
+      },
+    });
+
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+
+    assert.equal(
+      fs.existsSync(path.join(project, "src/a.ts")),
+      false,
+      "a genuine code failure is still undone",
+    );
+  });
+});
+
+describe("green evidence reaches the agent", () => {
+  test("the contract names the files that are verified right now", async () => {
+    await configure({
+      autoRollback: false,
+      trackVerifiedState: true,
+      pipelines: { onFileMutation: [], onTurnEnd: [{ name: "ok", cmd: "exit 0", timeoutMs: 5000 }] },
+    });
+
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+
+    const result = await emit(
+      fake,
+      "before_agent_start",
+      { type: "before_agent_start", prompt: "next", systemPrompt: "BASE" },
+      ctx,
+    );
+
+    assert.ok(
+      result.systemPrompt.includes("Verified green right now"),
+      "the rule about green code is backed by the list it refers to",
+    );
+    assert.ok(result.systemPrompt.includes("src/a.ts"));
+  });
+
+  test("a file that changed since it passed is no longer claimed as green", async () => {
+    await configure({
+      autoRollback: false,
+      trackVerifiedState: true,
+      pipelines: { onFileMutation: [], onTurnEnd: [{ name: "ok", cmd: "exit 0", timeoutMs: 5000 }] },
+    });
+
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+    fs.writeFileSync(path.join(project, "src/a.ts"), "export const a = 999;\n");
+
+    const result = await emit(
+      fake,
+      "before_agent_start",
+      { type: "before_agent_start", prompt: "next", systemPrompt: "BASE" },
+      ctx,
+    );
+
+    assert.equal(
+      result.systemPrompt.includes("src/a.ts"),
+      false,
+      "evidence is bound to content, not to a file name",
+    );
+  });
+
+  test("nothing is claimed when the ledger is off", async () => {
+    await configure({
+      autoRollback: false,
+      trackVerifiedState: false,
+      pipelines: { onFileMutation: [], onTurnEnd: [{ name: "ok", cmd: "exit 0", timeoutMs: 5000 }] },
+    });
+
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+    const result = await emit(
+      fake,
+      "before_agent_start",
+      { type: "before_agent_start", prompt: "next", systemPrompt: "BASE" },
+      ctx,
+    );
+
+    assert.equal(result.systemPrompt.includes("Verified green right now"), false);
+  });
+});
+
+describe("a trace stops being current when the code moves", () => {
+  async function redTurnThenContext(mutate: () => void) {
+    await configure({
+      autoRollback: false,
+      recovery: { enabled: true, maxAttempts: 3 },
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [
+          {
+            name: "type-check",
+            cmd: "node -e 'console.error(\"error TS2322: nope\"); process.exit(2)'",
+            timeoutMs: 5000,
+          },
+        ],
+      },
+    });
+
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+    assert.equal(fake.sent.length, 1, "the red turn produced a trace");
+
+    mutate();
+
+    return emit(
+      fake,
+      "context",
+      {
+        type: "context",
+        messages: [
+          { role: "user", content: "go on" },
+          {
+            role: "custom",
+            customType: SENTINEL_MESSAGE_TYPE,
+            content: fake.sent[0].message.content,
+            display: true,
+          },
+        ],
+      },
+      ctx,
+    );
+  }
+
+  test("the live trace is marked stale once its files change", async () => {
+    const result = await redTurnThenContext(() => {
+      fs.writeFileSync(path.join(project, "src/a.ts"), "export const a = 2;\n");
+    });
+
+    assert.ok(result?.messages, "the context is rewritten");
+    const body = String(result.messages[1].content);
+    assert.ok(body.includes("STALE"), "the agent is told the result is out of date");
+    assert.ok(body.includes("error TS2322"), "the diagnostics themselves are kept");
+  });
+
+  test("an unchanged tree leaves the live trace alone", async () => {
+    const result = await redTurnThenContext(() => {});
+    assert.equal(result, undefined, "nothing to rewrite");
+  });
+});
+
+describe("repair cycles do not widen", () => {
+  test("an attempt that reaches past the original failure is named", async () => {
+    await configure({
+      autoRollback: false,
+      recovery: { enabled: true, maxAttempts: 5, scopeGuard: "report" },
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [
+          {
+            name: "type-check",
+            cmd: "node -e 'console.error(\"error TS2322: nope\"); process.exit(2)'",
+            timeoutMs: 5000,
+          },
+        ],
+      },
+    });
+
+    // Turn 1 fails on a.ts: that is what the cycle is about.
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+    assert.equal(fake.sent.length, 1);
+    assert.equal(
+      (fake.sent[0].message.content as string).includes("REPAIR SCOPE EXCEEDED"),
+      false,
+      "the turn that opens a cycle cannot exceed it",
+    );
+
+    // Turn 2 edits a different file instead of fixing the cause.
+    await runTurn(2, "src/unrelated.ts", "export const u = 1;\n");
+
+    const body = fake.sent[1].message.content as string;
+    assert.ok(body.includes("REPAIR SCOPE EXCEEDED"), "the widening is reported");
+    assert.ok(body.includes("unrelated.ts"));
+    assert.ok(
+      ctx._notifications.some((n) => n.text.includes("outside the failure it started from")),
+      "the human sees it too",
+    );
+  });
+
+  test("scopeGuard: block refuses the widening edit outright", async () => {
+    await configure({
+      autoRollback: false,
+      recovery: { enabled: true, maxAttempts: 5, scopeGuard: "block" },
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [{ name: "type-check", cmd: "exit 2", timeoutMs: 5000 }],
+      },
+    });
+
+    // Turn 1 opens the cycle on a.ts.
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+
+    // Turn 2 tries to edit something else instead of fixing the cause.
+    await emit(fake, "turn_start", { type: "turn_start", turnIndex: 2 }, ctx);
+    const decision = await emit(
+      fake,
+      "tool_call",
+      {
+        type: "tool_call",
+        toolName: "edit",
+        toolCallId: "call-2",
+        input: { path: "src/unrelated.ts" },
+      },
+      ctx,
+    );
+
+    assert.equal(decision?.block, true, "the edit never happens");
+    assert.ok(String(decision.reason).includes("src/a.ts"), "the reason names the real scope");
+    assert.equal(fs.existsSync(path.join(project, "src/unrelated.ts")), false);
+
+    // The file the cycle is about stays editable.
+    const allowed = await emit(
+      fake,
+      "tool_call",
+      { type: "tool_call", toolName: "edit", toolCallId: "call-3", input: { path: "src/a.ts" } },
+      ctx,
+    );
+    assert.equal(allowed?.block, undefined, "fixing the cause is exactly what is wanted");
+  });
+
+  test("scopeGuard: off keeps quiet", async () => {
+    await configure({
+      autoRollback: false,
+      recovery: { enabled: true, maxAttempts: 5, scopeGuard: "off" },
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [{ name: "type-check", cmd: "exit 2", timeoutMs: 5000 }],
+      },
+    });
+
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+    await runTurn(2, "src/unrelated.ts", "export const u = 1;\n");
+
+    const body = fake.sent[1].message.content as string;
+    assert.equal(body.includes("REPAIR SCOPE EXCEEDED"), false);
+  });
+
+  test("a new user message opens a fresh cycle", async () => {
+    await configure({
+      autoRollback: false,
+      recovery: { enabled: true, maxAttempts: 5, scopeGuard: "report" },
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [{ name: "type-check", cmd: "exit 2", timeoutMs: 5000 }],
+      },
+    });
+
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+    await emit(fake, "message_start", { type: "message_start", message: { role: "user" } }, ctx);
+    await runTurn(2, "src/unrelated.ts", "export const u = 1;\n");
+
+    const body = fake.sent[1].message.content as string;
+    assert.equal(
+      body.includes("REPAIR SCOPE EXCEEDED"),
+      false,
+      "the user asked for something else; that is not a widening repair",
+    );
+  });
+});
+
+describe("compaction does not launder stale evidence", () => {
+  async function compact() {
+    return emit(
+      fake,
+      "session_compact",
+      { type: "session_compact", compactionEntry: {}, fromExtension: false, reason: "threshold", willRetry: false },
+      ctx,
+    );
+  }
+
+  test("the invariants are restated after the context is cut", async () => {
+    await configure({
+      autoRollback: false,
+      trackVerifiedState: true,
+      pipelines: { onFileMutation: [], onTurnEnd: [{ name: "ok", cmd: "exit 0", timeoutMs: 5000 }] },
+    });
+
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+    const sentBefore = fake.sent.length;
+
+    await compact();
+
+    assert.equal(fake.sent.length, sentBefore + 1, "a notice is sent");
+    const notice = fake.sent[fake.sent.length - 1];
+    assert.equal(notice.message.customType, SENTINEL_NOTICE_TYPE, "a notice is not a trace");
+    assert.equal(notice.options.triggerTurn, false, "restating facts must not start a turn");
+
+    const body = notice.message.content as string;
+    assert.ok(body.includes("not evidence"), "a summarized check result is disowned");
+    assert.ok(body.includes("[sentinel:revision-contract]"), "the contract is restated");
+    assert.ok(body.includes("src/a.ts"), "the green files are restated as fact");
+  });
+
+  test("the repair budget survives a compaction", async () => {
+    await configure({
+      autoRollback: false,
+      recovery: { enabled: true, maxAttempts: 2 },
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [{ name: "type-check", cmd: "exit 2", timeoutMs: 5000 }],
+      },
+    });
+
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+    await compact();
+
+    const notice = fake.sent[fake.sent.length - 1].message.content as string;
+    assert.ok(
+      notice.includes("attempt 1 of 2"),
+      "a loop cannot buy fresh attempts by compacting",
+    );
+
+    // The budget is spent, not restarted: the second red turn exhausts it.
+    await runTurn(2, "src/a.ts", "export const a = 2;\n");
+    await runTurn(3, "src/a.ts", "export const a = 3;\n");
+    assert.ok(
+      getState().autoFixHistory.some((entry) => entry.outcome === "exhausted"),
+      "the bound still applies across the compaction",
+    );
+  });
+
+  test("a compaction notice is never superseded as if it were a trace", async () => {
+    await configure({ autoRollback: false, pipelines: { onFileMutation: [], onTurnEnd: [] } });
+
+    const result = await emit(
+      fake,
+      "context",
+      {
+        type: "context",
+        messages: [
+          { role: "custom", customType: SENTINEL_NOTICE_TYPE, content: "standing notice" },
+          { role: "custom", customType: SENTINEL_MESSAGE_TYPE, content: "old trace" },
+          { role: "custom", customType: SENTINEL_MESSAGE_TYPE, content: "new trace" },
+        ],
+      },
+      ctx,
+    );
+
+    assert.equal(result.messages[0].content, "standing notice", "the notice is left alone");
+    assert.ok(String(result.messages[1].content).includes("superseded"));
+    assert.equal(result.messages[2].content, "new trace");
   });
 });
 
@@ -913,6 +1439,46 @@ describe("P5 — output budget and background checks", () => {
     await waitFor(() => fake.sent.length > 0);
     assert.ok(fake.sent[0].message.content.includes('step "slow"'));
     await waitFor(() => ctx._statuses.get("sentinel") === undefined);
+  });
+
+  test("a turn that arrives during a running check is verified, not dropped", async () => {
+    await configure({
+      autoRollback: false,
+      backgroundTurnEnd: true,
+      pipelines: {
+        onFileMutation: [],
+        onTurnEnd: [
+          {
+            // Each execution leaves a mark, so "did this turn get verified?"
+            // is answered by counting runs rather than by reading a payload.
+            name: "slow",
+            cmd: "sleep 0.4; echo run >> ran.log; exit 1",
+            timeoutMs: 20000,
+          },
+        ],
+      },
+    });
+
+    // Turn 1 starts the slow check. Turn 2 lands while it is still running:
+    // dropping it would let its changes reach the user with no verification
+    // and no trace at all.
+    await runTurn(1, "src/a.ts", "export const a = 1;\n");
+    await runTurn(2, "src/b.ts", "export const b = 2;\n");
+
+    assert.ok(
+      ctx._notifications.some((n) => n.text.includes("folded into the next run")),
+      "the waiting turn is announced rather than silently skipped",
+    );
+
+    // The folded-in turn is owed a verification, so the pipeline runs a second
+    // time once the first run is done.
+    const log = path.join(project, "ran.log");
+    await waitFor(
+      () => fs.existsSync(log) && fs.readFileSync(log, "utf-8").trim().split("\n").length >= 2,
+      20000,
+    );
+    await waitFor(() => ctx._statuses.get("sentinel") === undefined, 20000);
+    assert.ok(fake.sent.length >= 2, "both turns produced feedback");
   });
 
   test("backgroundTurnEnd: false makes the turn wait for the result", async () => {

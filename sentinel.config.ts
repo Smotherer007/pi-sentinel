@@ -35,6 +35,10 @@ export default defineConfig({
     // Off for this repo: the budget is still bounded, but a spent budget must
     // not silently undo a work-in-progress refactor.
     rollbackAfterExhaustion: false,
+    // A repair cycle that starts reaching past the file it was called about is
+    // the earliest sign the agent is varying an approach instead of fixing a
+    // cause. "report" names it in the payload; "block" refuses the edit.
+    scopeGuard: "report",
   },
 
   // ── P1: durable checkpoints ────────────────────────────────────────────
@@ -100,6 +104,10 @@ export default defineConfig({
     allowLockfileChanges: true,
     allowWorkflowChanges: true,
     sensitivePaths: [],
+    // With the policy on, a write to a protected path is refused before it
+    // happens. The turn-end evaluation still runs — it is the only thing that
+    // can see a change made through bash rather than edit/write.
+    blockBeforeWrite: true,
     rollbackOnViolation: false,
   },
 
@@ -122,15 +130,10 @@ export default defineConfig({
         priority: "critical",
         files: ["**/*.ts", "**/*.tsx"],
       },
-      // The linter is a warning: it must never fail a turn or trigger a
-      // rollback, and projects without eslint stay usable.
-      {
-        name: "linter",
-        cmd: "npx eslint --quiet",
-        timeoutMs: 8000,
-        priority: "warning",
-        files: ["**/*.ts", "**/*.tsx"],
-      },
+      // No linter step here on purpose: this repository has no ESLint config
+      // and no eslint devDependency, so the step could only ever spawn a
+      // process per edit in order to report that the tool is missing. Add the
+      // tool first, then the step.
     ],
     onTurnEnd: [
       // Slow, whole-project checks belong at turn end. Runs in the background

@@ -22,10 +22,31 @@ import type { SentinelConfig } from "../types.ts";
 export const CONTRACT_MARKER = "[sentinel:revision-contract]";
 
 /**
+ * What sentinel knows about the tree right now, so the contract can state it
+ * instead of merely asserting the rule.
+ */
+export interface ContractEvidence {
+  /** Project-relative paths that are verified green as of this turn. */
+  verified?: string[];
+  /** How many verified files exist beyond the ones listed. */
+  more?: number;
+}
+
+/** Most files named in the contract; beyond this it is a count, not a list. */
+export const MAX_CONTRACT_FILES = 12;
+
+/**
  * Build the contract text for the active configuration.
  * Returns an empty string when the contract is disabled.
+ *
+ * `evidence` turns the first rule from an assertion into a fact. "Do not
+ * rewrite code whose checks passed" is unactionable if the agent cannot tell
+ * which code that is — the ledger knows, so the contract says it.
  */
-export function revisionContractText(config: SentinelConfig): string {
+export function revisionContractText(
+  config: SentinelConfig,
+  evidence: ContractEvidence = {},
+): string {
   if (!config.revisionContract) return "";
 
   const rules = [
@@ -38,6 +59,15 @@ export function revisionContractText(config: SentinelConfig): string {
     rules.push(
       "- If sentinel reports that a file regressed from a verified state, either restore that file or justify the change explicitly. Do not silently keep both.",
     );
+    const verified = evidence.verified ?? [];
+    if (verified.length > 0) {
+      const listed = verified.slice(0, MAX_CONTRACT_FILES);
+      const hidden = (evidence.more ?? 0) + Math.max(0, verified.length - listed.length);
+      const suffix = hidden > 0 ? ` (+${hidden} more)` : "";
+      rules.push(
+        `- Verified green right now, at their current content: ${listed.join(", ")}${suffix}. Treat these as evidence: read them freely, but do not rewrite them unless the user asked for exactly that change or a failure names them.`,
+      );
+    }
   }
   if (config.autoRollback) {
     rules.push(
