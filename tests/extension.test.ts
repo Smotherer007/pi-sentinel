@@ -1304,28 +1304,22 @@ describe("a trace stops being current when the code moves", () => {
     );
   }
 
-  test("the live trace stops being current once its files change", async () => {
+  test("the live trace keeps its diagnostics while it is being worked on", async () => {
     const result = await redTurnThenContext(() => {
       fs.writeFileSync(path.join(project, "src/a.ts"), "export const a = 2;\n");
     });
 
     assert.ok(result?.messages, "the context is rewritten");
     const body = String(result.messages[1].content);
-    // Replaced, not prefixed. A stale verdict is not a hint with a caveat: its
-    // line numbers and error text describe a tree that no longer exists, which is
-    // the documented way a repair loop ends up revising code against evidence
-    // bound to an earlier state. So the model gets the notice and nothing else —
-    // the payload stays in the session for the person reading it (asserted in the
-    // delivery test), and a fresh verdict arrives from the next run anyway.
-    assert.equal(body, STALE_TRACE_NOTICE, "the model is given the notice, not the payload");
-    assert.equal(
-      body.includes("error TS2322"),
-      false,
-      "stale diagnostics are not handed to the model as current",
-    );
+    // Caveat first, diagnostics still there. A trace whose files moved because
+    // the *repair* moved them is not obsolete — it is the failure being worked
+    // on, and replacing it took the errors away from the agent that was fixing
+    // them. (A trace a later green run has answered is replaced; see the
+    // delivery test in the P5 suite.)
+    assert.ok(body.startsWith(STALE_TRACE_NOTICE), "the agent is told the result is out of date");
     assert.ok(
-      String(fake.sent[0].message.content).includes("error TS2322"),
-      "and the session still holds them for the human",
+      body.includes("error TS2322"),
+      "and keeps the diagnostics it is working from",
     );
   });
 
@@ -1924,32 +1918,36 @@ describe("P5 — output budget and background checks", () => {
 
     // An input the turn never touched changed after the payload was composed —
     // a formatter, another agent, the user. The verdict may now be wrong for
-    // reasons the payload cannot see, so delivery must not present it as an
-    // instruction. This is the case that reached a real session as a naked
-    // "Repair attempt 1/3" after the code it complained about was fixed.
+    // reasons the payload cannot see. It is still *the* failure being worked on
+    // (no later run has answered it), so it keeps its diagnostics and gains the
+    // caveat — replacing it here is what hid the errors mid-repair.
     fs.writeFileSync(path.join(project, "src/other.ts"), "export const other = 2;\n");
     const afterInput = await asContext(injected);
-    assert.equal(
-      String(afterInput?.messages?.[0]?.content),
-      STALE_TRACE_NOTICE,
-      "a change to any bound input demotes the verdict",
+    const caveated = String(afterInput?.messages?.[0]?.content);
+    assert.ok(caveated.startsWith(STALE_TRACE_NOTICE), "the caveat comes first");
+    assert.ok(
+      caveated.includes("Verification failed"),
+      "and the payload stays where the agent can still read it",
     );
 
-    // And the same when the file the turn wrote is the one that moved.
-    fs.writeFileSync(path.join(project, "src/a.ts"), "export const a = 2;\n");
-    const delivered = await asContext(injected);
-    const content = String(delivered?.messages?.[0]?.content);
-    assert.match(content, /\[sentinel\] STALE:/);
-    // Replaced, not prefixed: the *model* gets the one-liner, so however late the
-    // verdict arrives it cannot arrive as an instruction. The payload itself is
-    // untouched in the session — the hook shapes the request, not the transcript
-    // — which is why nothing is hidden from the person reading it.
-    assert.equal(content, STALE_TRACE_NOTICE, "the model sees the one-liner, not the body");
-    assert.equal(
-      String(injected.content).includes("Verification failed"),
-      true,
-      "the payload stays in the transcript for the human",
+    // A green run answers it. Now nothing of it is worth acting on or reading,
+    // and it is replaced.
+    await configure({
+      autoRollback: false,
+      backgroundTurnEnd: false,
+      include: ["**/*.ts"],
+      pipelines: { onFileMutation: [], onTurnEnd: [{ name: "tests", cmd: "exit 0", timeoutMs: 5000 }] },
+    });
+    await runTurn(2, "src/a.ts", "export const a = 1;\n");
+    const answered = await asContext(injected);
+    assert.match(
+      String(answered?.messages?.[0]?.content),
+      /superseded by a later run/,
+      "an answered verdict is replaced by the superseded notice",
     );
+    // The session keeps the payload either way — the hook shapes the request,
+    // not the transcript, so nothing is hidden from the person reading it.
+    assert.equal(String(injected.content).includes("Verification failed"), true);
   });
 
   test("a green run clears a stall, so a later failure is reported again", async () => {

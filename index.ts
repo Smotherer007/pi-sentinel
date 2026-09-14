@@ -1333,6 +1333,10 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
           details: {
             step: failure.step,
             stateHash: args.outcome.binding?.stateHash ?? stateHash,
+            // When this verdict was produced, so a later delivery can ask whether
+            // a green run has answered it since — the difference between "the
+            // verdict you are working on" and "a verdict nobody needs any more".
+            at: new Date().toISOString(),
             // The paths this verdict is bound to, carried with it so a later
             // delivery can tell whether it still describes the tree. These are
             // the run's *inputs*, not this turn's writes: a verdict is invalidated
@@ -2361,6 +2365,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
 
     const messages = event.messages as unknown as Array<Record<string, unknown>>;
     if (!Array.isArray(messages) || messages.length === 0) return;
+    const state = runtime.config.state();
 
     const sentinelIndices = new Set<number>();
     for (let i = 0; i < messages.length; i += 1) {
@@ -2377,10 +2382,32 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
     // matters at delivery — does the state *this payload names* still exist? —
     // whereas the current repair cycle can only answer for the last cycle it
     // knows about. A message without its own binding keeps the old behaviour.
-    const newestIsStale =
-      bindingIsStale(readTraceBinding(messages[newest]?.details), (paths) =>
-        stateHashOf([...paths]),
-      ) || injectedTraceIsStale();
+    // A trace stops being the *working* verdict in two ways, and they want
+    // different answers. Replacing in both — which is what this did — hid exactly
+    // the evidence a repair needed, because the repair is what makes a trace's
+    // files move.
+    //
+    //   - **answered**: a later green verdict exists, so nothing in the payload is
+    //     worth acting on or reading. Replace with "superseded".
+    //   - **discarded**: the freshness gate threw the verdict away because its
+    //     inputs moved while it ran. Replace with "stale — re-run to confirm".
+    //   - **working, but its files moved**: the repair itself changed them. Keep
+    //     the diagnostics and prefix the caveat, or the agent loses the errors it
+    //     is fixing halfway through fixing them.
+    const newestDetails = messages[newest]?.details as Record<string, unknown> | undefined;
+    const boundTrace = readTraceBinding(newestDetails);
+    const traceAt = typeof newestDetails?.at === "string" ? Date.parse(newestDetails.at) : undefined;
+    const answeredSinceInjection =
+      traceAt !== undefined &&
+      state.lastVerifications.some((verdict) => verdict.passed && Date.parse(verdict.at) > traceAt);
+    const discardedByFreshness = newestDetails?.stale === true;
+    const newestMoved =
+      bindingIsStale(boundTrace, (paths) => stateHashOf([...paths])) || injectedTraceIsStale();
+
+    const replace = (message: Record<string, unknown>, text: string, from: unknown) => ({
+      ...message,
+      content: Array.isArray(from) ? [{ type: "text", text }] : text,
+    });
 
     let changed = false;
     const next = messages.map((message, i) => {
@@ -2391,31 +2418,31 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
         // exists. Nothing of it is worth the context it occupies.
         if (message.content === SUPERSEDED_TRACE) return message;
         changed = true;
-        return {
-          ...message,
-          content: Array.isArray(message.content)
-            ? [{ type: "text", text: SUPERSEDED_TRACE }]
-            : SUPERSEDED_TRACE,
-        };
+        return replace(message, SUPERSEDED_TRACE, message.content);
       }
 
-      if (!newestIsStale || containsText(message.content, STALE_TRACE_NOTICE)) return message;
+      if (answeredSinceInjection) {
+        if (message.content === SUPERSEDED_TRACE) return message;
+        changed = true;
+        return replace(message, SUPERSEDED_TRACE, message.content);
+      }
+
+      if (discardedByFreshness) {
+        if (message.content === STALE_TRACE_NOTICE) return message;
+        changed = true;
+        return replace(message, STALE_TRACE_NOTICE, message.content);
+      }
+
+      if (!newestMoved || containsText(message.content, STALE_TRACE_NOTICE)) return message;
       changed = true;
-      // Replace, do not prefix.
-      //
-      // A background verdict is true when it is produced and possibly false when
-      // it is read: the check ran 19 s ago, the agent kept working, the payload is
-      // obsolete on arrival — and pi has no API to retract a message it has
-      // already queued. The one place sentinel still decides what the *model*
-      // sees is this hook, so the model gets the one-liner while the full payload
-      // stays in the session for the human, who may still want the diagnostics.
-      // That closes the late-delivery problem without hiding anything: nothing
-      // reaches the model as an instruction about a state that no longer exists.
+      // Still the failure being worked on: keep the payload, say that the tree
+      // moved since. Hiding it here lost the errors mid-repair.
+      if (Array.isArray(message.content)) {
+        return { ...message, content: [{ type: "text", text: STALE_TRACE_NOTICE }, ...message.content] };
+      }
       return {
         ...message,
-        content: Array.isArray(message.content)
-          ? [{ type: "text", text: STALE_TRACE_NOTICE }]
-          : STALE_TRACE_NOTICE,
+        content: `${STALE_TRACE_NOTICE}\n\n${typeof message.content === "string" ? message.content : ""}`,
       };
     });
 
