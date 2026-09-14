@@ -1,5 +1,7 @@
 # pi-sentinel
 
+![A knight with a checked shield blocking red error windows on a bridge, while verified files continue past a checkpoint tower towards a green check](https://raw.githubusercontent.com/Smotherer007/pi-sentinel/main/banner.png)
+
 In-loop verification, repair and rollback hardening for the
 [pi coding agent](https://github.com/earendil-works/pi).
 

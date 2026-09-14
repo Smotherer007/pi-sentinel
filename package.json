@@ -74,6 +74,7 @@
   "pi": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/Smotherer007/pi-sentinel/main/banner.png"
   }
 }
