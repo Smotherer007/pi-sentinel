@@ -11,6 +11,43 @@ import {
 
 const base = { stepName: "check", cmd: "check", exitCode: 1, output: "" };
 
+describe("a step the project cannot run is not a code failure", () => {
+  // The case behind this: a plain Node 26 project with no `test` script and no
+  // tsconfig. `npm test` exits 1 with "Missing script", which used to classify as
+  // a *code* failure — so sentinel reported a red turn after every edit and spent
+  // repair attempts on a diff nobody had broken. None of these outputs is
+  // evidence about the code, so none of them may roll anything back or re-prompt
+  // the agent.
+  const cases: Array<[string, string]> = [
+    ["npm", 'npm ERR! Missing script: "test"\nnpm ERR! To see a list of scripts, run:\n'],
+    ["pnpm", " ERR_PNPM_NO_SCRIPT  Missing script: test\n"],
+    ["yarn", 'error: Couldn\'t find a script named "test".\n'],
+    ["vitest, no files", "No test files found, exiting with code 1\n"],
+  ];
+
+  for (const [name, output] of cases) {
+    test(`${name} is an environment error`, () => {
+      assert.equal(
+        classifyFailure({ stepName: "unit-tests", cmd: "npm test", exitCode: 1, output }),
+        "environment-error",
+      );
+    });
+  }
+
+  test("a real test failure is still a test failure", () => {
+    // The probes must not swallow the thing they exist to report.
+    assert.equal(
+      classifyFailure({
+        stepName: "unit-tests",
+        cmd: "npm test",
+        exitCode: 1,
+        output: "FAIL src/a.test.ts\n  ● adds → expected 1 to be 2\n",
+      }),
+      "test-failure",
+    );
+  });
+});
+
 describe("classifyFailure", () => {
   test("a timeout wins over everything in the output", () => {
     const kind = classifyFailure({
@@ -25,8 +62,7 @@ describe("classifyFailure", () => {
     assert.equal(classifyFailure({ ...base, exitCode: 124 }), "timeout");
   });
 
-  test("detects a missing command", () => {
-    assert.equal(
+  test("detects a missing command", () => {    assert.equal(
       classifyFailure({ ...base, exitCode: 127, output: "sh: npx: command not found" }),
       "command-not-found",
     );

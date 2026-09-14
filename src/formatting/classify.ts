@@ -48,6 +48,20 @@ const PROBES: Probe[] = [
   { kind: "environment-error", pattern: /\bunable to resolve dependency tree\b/i },
   { kind: "environment-error", pattern: /\bpermission denied\b/i },
 
+  // A step the project cannot run *at all*: no such script, no test files, a
+  // harness that was never set up. It is named like a command problem because
+  // that is what it is — the pipeline points at something this project does not
+  // have — and classifying it as a code failure made a project without a `test`
+  // script (a plain Node 26 project, say) report a red turn after every edit and
+  // spend repair attempts on a file nobody broke. Nothing here is evidence about
+  // the diff, so it must never roll anything back or re-prompt the agent.
+  { kind: "environment-error", pattern: /npm ERR!\s+Missing script\b/i },
+  { kind: "environment-error", pattern: /\bMissing script:?\s+["'`]?[\w:-]+/i },
+  { kind: "environment-error", pattern: /ERR_PNPM_NO_SCRIPT\b/ },
+  { kind: "environment-error", pattern: /Couldn't find a script named/i },
+  { kind: "environment-error", pattern: /\bNo test files found,/i },
+  { kind: "environment-error", pattern: /\bnpm run\b[^\n]*\bmissing script\b/i },
+
   // Source-level diagnostics.
   { kind: "type-error", pattern: /\berror TS\d{4}\b/ },
   { kind: "type-error", pattern: /\bTS\d{4}:\s/ },
