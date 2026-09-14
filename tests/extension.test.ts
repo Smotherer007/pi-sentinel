@@ -1711,8 +1711,17 @@ describe("P5 — output budget and background checks", () => {
           {
             // Each execution leaves a mark, so "did this turn get verified?"
             // is answered by counting runs rather than by reading a payload.
+            //
+            // On its *first* run the step also moves an input, which makes the
+            // staleness path deterministic instead of dependent on a write of
+            // ours landing inside a sleep. Later runs change nothing, so the
+            // folded run is a genuinely fresh verdict — the thing this test is
+            // about.
             name: "slow",
-            cmd: "sleep 0.4; echo run >> ran.log; exit 1",
+            cmd:
+              "node -e \"const fs=require('fs'); if(!fs.existsSync('ran-once.marker')){" +
+              "fs.writeFileSync('ran-once.marker','1'); fs.writeFileSync('src/changed-during-run.ts','moved');}" +
+              "setTimeout(()=>process.exit(1),1200)\"; sleep 1.2; echo run >> ran.log; exit 1",
             timeoutMs: 20000,
           },
         ],
@@ -1722,6 +1731,11 @@ describe("P5 — output budget and background checks", () => {
     // Turn 1 starts the slow check. Turn 2 lands while it is still running:
     // dropping it would let its changes reach the user with no verification
     // and no trace at all.
+    // Self-contained: state from earlier tests in this suite must not decide
+    // whether run 1 is stale or whether run 2 has "already run".
+    for (const leftover of ["ran.log", "ran-once.marker", "src/changed-during-run.ts"]) {
+      fs.rmSync(path.join(project, leftover), { force: true });
+    }
     await runTurn(1, "src/a.ts", "export const a = 1;\n");
     await runTurn(2, "src/b.ts", "export const b = 2;\n");
 
@@ -1749,6 +1763,13 @@ describe("P5 — output budget and background checks", () => {
       "the superseded run is named rather than acted on",
     );
     assert.ok(fake.sent.length >= 1, "the folded run produced fresh feedback");
+    // And it is *fresh*: the first run's verdict was demoted, but the folded run
+    // still delivered a verdict that may wake the agent — otherwise "not
+    // dropped" would be satisfied by stale notices alone.
+    assert.ok(
+      fake.sent.some((sent) => sent.options?.triggerTurn === true),
+      "the folded run delivered a current verdict, not just a demoted one",
+    );
   });
 
   test("a delivered payload is demoted once the state it names moved", async () => {

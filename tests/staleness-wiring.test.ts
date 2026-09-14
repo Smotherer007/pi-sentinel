@@ -68,7 +68,18 @@ async function waitFor(predicate: () => boolean, timeoutMs = 8000): Promise<void
 }
 
 /** A failing onTurnEnd step that holds the run open long enough to move a file. */
-const SLOW_FAIL = 'node -e "setTimeout(()=>process.exit(1),400)"';
+/**
+ * A failing onTurnEnd step that *signals* it has started, then holds the run
+ * open.
+ *
+ * The marker is what makes these tests deterministic: a change must land inside
+ * the run, and a fixed sleep is only a guess at how long that is. Under load a
+ * 400 ms window lost — which is how this test failed a real run and sent the
+ * repair loop after a flake.
+ */
+const SLOW_FAIL =
+  "node -e \"require('fs').writeFileSync('run-started.marker','1'); " +
+  "setTimeout(()=>process.exit(1),1500)\"";
 
 let home: string;
 let project: string;
@@ -126,6 +137,7 @@ describe("staleness: a verdict whose inputs moved", () => {
       sessionManager: { getLeafId: () => "entry-1", getSessionFile: () => undefined },
     };
     fs.rmSync(path.join(project, "sentinel.config.js"), { force: true });
+    fs.rmSync(path.join(project, "run-started.marker"), { force: true });
     fs.rmSync(path.join(home, ".pi"), { recursive: true, force: true });
     fs.rmSync(path.join(project, "src"), { recursive: true, force: true });
     fs.mkdirSync(path.join(project, "src"), { recursive: true });
@@ -137,8 +149,13 @@ describe("staleness: a verdict whose inputs moved", () => {
   test("is demoted, spends no attempt, and cannot re-prompt the agent", async () => {
     await fire(fake, "turn_end", { type: "turn_end", turnIndex: 1 }, ctx);
 
-    // The check is now running. Move a file it reads but the turn never touched
-    // — exactly what an agent editing while `npm test` runs does.
+    // Wait for the check to have *started* rather than guessing with a sleep:
+    // the moved file has to land while the run is in flight, and "in flight" is
+    // not a fixed number of milliseconds on a loaded machine.
+    await waitFor(() => fs.existsSync(path.join(project, "run-started.marker")));
+
+    // Move a file it reads but the turn never touched — exactly what an agent
+    // editing while `npm test` runs does.
     fs.writeFileSync(path.join(project, "src", "moved.ts"), "export const moved = 1;\n");
 
     await waitFor(() => fake.notifications.some((n) => n.text.includes("discarded")));
