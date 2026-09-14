@@ -47,6 +47,7 @@ function facts(overrides: Partial<DoctorFacts> = {}): DoctorFacts {
       protectedPaths: 4,
       learnMutationTools: true,
       learnedTools: [],
+      configured: true,
       onFileMutation: [{ name: "type-check", timeoutMs: 60_000, files: 2, cacheable: true }],
       onTurnEnd: [{ name: "unit-tests", timeoutMs: 120_000, files: 0, cacheable: false }],
       missingCommands: [],

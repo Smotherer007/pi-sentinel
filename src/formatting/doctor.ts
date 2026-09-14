@@ -73,6 +73,8 @@ export interface DoctorFacts {
     readonly protectedPaths: number;
     /** Whether undeclared writers are learned from observation. */
     readonly learnMutationTools: boolean;
+    /** Whether this project (or the user) has written a config at all. */
+    readonly configured: boolean;
     /** Tool names learned so far — sentinel's own decision, shown not hidden. */
     readonly learnedTools: readonly string[];
     readonly onFileMutation: readonly DoctorStep[];
@@ -215,6 +217,17 @@ export function buildDoctorReport(facts: DoctorFacts, now = Date.now()): DoctorR
   );
 
   const steps = [...config.onFileMutation, ...config.onTurnEnd];
+  if (!config.configured) {
+    // The single most useful thing a doctor can say in an unconfigured project:
+    // every step below came from the library's defaults, which describe an
+    // npm + tsc + eslint project and nothing else.
+    warnings.push(
+      warn(
+        "running on library defaults",
+        "no sentinel.config.ts in this project (and none global) — the configured steps are sentinel's guesses, not this project's commands. `/sentinel init` writes one derived from what is here.",
+      ),
+    );
+  }
   sentinel.push(
     steps.length === 0
       ? warn("no pipeline steps configured", "nothing is verified after a change or at turn end")

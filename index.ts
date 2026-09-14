@@ -144,7 +144,16 @@ import {
   policyOf,
   bashGuardOf,
   recoveryOf,
+  homeDir,
 } from "./src/config.ts";
+import {
+  detectProject,
+  hasGlobalConfig,
+  hasProjectConfig,
+  proposeConfig,
+  renderConfig,
+  writeConfig,
+} from "./src/clients/init.ts";
 import type {
   FailureKind,
   SentinelConfig,
@@ -1452,6 +1461,11 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
         mutationQueue.debouncing ? `debounce ${conf.verification.debounceMs}ms` : null,
         conf.verification.cache.enabled ? "cache" : null,
         conf.verification.failureEscalation.enabled ? "escalation" : null,
+        // Running on the library's defaults is a *guess* about how this project
+        // is checked — a guess that fits npm+tsc+eslint projects and nothing
+        // else. Saying so once per session is what turns "sentinel is noisy here"
+        // into "sentinel is unconfigured here".
+        !hasProjectConfig(ctx.cwd) && !hasGlobalConfig(homeDir()) ? "NO CONFIG — /sentinel init" : null,
       ].filter(Boolean);
       ctx.ui.notify(`Sentinel armed (${extras.join(", ")})`, "info");
     }
@@ -2430,7 +2444,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
   pi.registerCommand("sentinel", {
     description: "Sentinel verification, repair & rollback control",
     getArgumentCompletions: (prefix) => {
-      const options = ["status", "doctor", "verify", "test", "rollback", "rewind", "config", "help"];
+      const options = ["status", "doctor", "init", "verify", "test", "rollback", "rewind", "config", "help"];
       return options.filter((o) => o.startsWith(prefix)).map((o) => ({ label: o, value: o }));
     },
     handler: async (args, ctx) => {
@@ -2441,6 +2455,27 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
       switch (sub) {
         case "status": {
           ctx.ui.setWidget("sentinel", statusLines(ctx.cwd, conf));
+          return;
+        }
+        case "init": {
+          // Deliberate, visible, never overwriting: the config a project runs on
+          // should be a decision someone made, and this is where they make it.
+          const profile = detectProject(ctx.cwd);
+          const proposal = proposeConfig(profile);
+          const result = writeConfig(ctx.cwd, renderConfig(proposal, profile));
+          const chosen = [...proposal.onFileMutation, ...proposal.onTurnEnd].map((step) => step.cmd);
+          ctx.ui.setWidget(
+            "sentinel",
+            result.written
+              ? [
+                  `[sentinel] wrote ${relative(ctx.cwd, result.path)}`,
+                  ...(chosen.length > 0
+                    ? [`  checks: ${chosen.join(" | ")}`]
+                    : ["  no check could be detected — the file says where to add yours"]),
+                  "Review it, adjust it, commit it: sentinel never overwrites a config.",
+                ]
+              : [`[sentinel] ${result.reason ?? "nothing written"}`],
+          );
           return;
         }
         case "doctor": {
@@ -2512,6 +2547,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
             "  /sentinel           Show this help",
             "  /sentinel status    Show current state",
             "  /sentinel doctor    Check that sentinel is actually working here",
+            "  /sentinel init      Write a config derived from this project",
             "  /sentinel verify    Run onFileMutation pipelines now",
             "  /sentinel test      Run onTurnEnd pipelines now",
             "  /sentinel rollback  Restore this turn's changes (or HEAD)",

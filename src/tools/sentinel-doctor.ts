@@ -23,6 +23,7 @@ import { allVerified } from "../clients/evidence.ts";
 import { graphStatus } from "../clients/mindplace.ts";
 import { peekVerificationCache } from "../clients/cache.ts";
 import { homeDir, projectDir, scopeKey } from "../config.ts";
+import { hasGlobalConfig, hasProjectConfig, onPath } from "../clients/init.ts";
 import { buildDoctorReport, formatDoctorReport } from "../formatting/doctor.ts";
 import type { DoctorFacts, DoctorStep } from "../formatting/doctor.ts";
 import type { PipelineStep } from "../types.ts";
@@ -84,23 +85,6 @@ function commandOf(cmd: string): string | undefined {
   if (SHELL_BUILTINS.has(first)) return undefined;
   if (first.startsWith("$") || first.startsWith("(")) return undefined;
   return first;
-}
-
-/** Is this program resolvable through PATH, without spawning anything? */
-function onPath(program: string): boolean {
-  const exts =
-    process.platform === "win32" ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT").split(";") : [""];
-  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
-    if (dir.length === 0) continue;
-    for (const ext of exts) {
-      try {
-        if (fs.existsSync(path.join(dir, program + ext))) return true;
-      } catch {
-        /* an unreadable PATH entry proves nothing about the next one */
-      }
-    }
-  }
-  return false;
 }
 
 function reduce(step: PipelineStep): DoctorStep {
@@ -193,6 +177,7 @@ export function createSentinelDoctorTool(
           protectedPaths: conf.policy.sensitivePaths.length,
           learnMutationTools: conf.learnMutationTools,
           learnedTools: [...state.learnedMutationTools],
+          configured: hasProjectConfig(cwd) || hasGlobalConfig(homeDir()),
           onFileMutation: conf.pipelines.onFileMutation.map(reduce),
           onTurnEnd: conf.pipelines.onTurnEnd.map(reduce),
           missingCommands: missing,

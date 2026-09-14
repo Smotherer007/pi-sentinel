@@ -592,6 +592,7 @@ The agent can call these directly.
 | `/sentinel` | Show the command list. |
 | `/sentinel status` | Armed state, pipelines, git, latest checkpoint, metrics, turn history. |
 | `/sentinel doctor` | Classified health report: what is broken now, what is imperfect, what a bad turn would cost. Renders the same report as the `sentinel_doctor` tool. |
+| `/sentinel init` | Writes a `sentinel.config.ts` derived from *this* project — the scripts it declares, the tools it has, the languages it uses — every step carrying the reason it was chosen. Refuses to overwrite a config that exists. |
 | `/sentinel verify` | Run the `onFileMutation` pipelines now. |
 | `/sentinel test` | Run the `onTurnEnd` pipelines now. |
 | `/sentinel rollback` | Restore this turn's changes, or reset to HEAD when no snapshot exists. |
@@ -601,6 +602,10 @@ The agent can call these directly.
 ## Configuration
 
 Create `sentinel.config.ts` in the project root, or `~/.sentinel.config.ts` for a global default.
+`/sentinel init` writes the project one for you, derived from what is actually in the repository:
+declared scripts, installed tools, detected languages — and **only commands that can run**, because a
+step that cannot run is worse than no step. An existing config is never overwritten, and
+`/sentinel doctor` says when a project is running on the library defaults instead of a decision.
 Resolution order: `<cwd>/sentinel.config.ts` → `<cwd>/sentinel.config.js` → `~/.sentinel.config.ts` →
 built-in defaults. The file is re-read when its content changes, so an edit takes effect without
 restarting pi.
