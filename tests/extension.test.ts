@@ -265,7 +265,7 @@ describe("extension registration", () => {
   test("registers the tools, the command and every hook", () => {
     assert.deepEqual(
       fake.tools.map((t) => t.name).sort(),
-      ["sentinel_rewind", "sentinel_rollback", "sentinel_status", "sentinel_verify"],
+      ["sentinel_doctor", "sentinel_rewind", "sentinel_rollback", "sentinel_status", "sentinel_verify"],
     );
     assert.equal(fake.commands.length, 1);
     assert.equal(fake.commands[0].name, "sentinel");

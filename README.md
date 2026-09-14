@@ -562,6 +562,7 @@ The agent can call these directly.
 | `sentinel_rollback` | `mode`: `"turn"` \| `"head"`, `force`: boolean | Restores the files changed this turn (safe, default), or hard-resets tracked files to HEAD (destructive, gated behind `force` while `autoRollback` is off). |
 | `sentinel_rewind` | `mode`: `"list"` \| `"code"`, `checkpointId` | Lists durable checkpoints, or restores the working tree to one. Never touches files that turn did not change. |
 | `sentinel_status` | — | Configuration, git state, checkpoints, verified-state count, graph freshness, metrics and recent history. |
+| `sentinel_doctor` | — | Is sentinel working *here*: hooks, session ctx, storage, git, node, pipeline commands on PATH, graph age, rollback readiness and the open repair cycle. Use it when a sentinel message looks wrong, or before trusting sentinel after a reload. |
 
 ## Commands
 
@@ -569,6 +570,7 @@ The agent can call these directly.
 |---|---|
 | `/sentinel` | Show the command list. |
 | `/sentinel status` | Armed state, pipelines, git, latest checkpoint, metrics, turn history. |
+| `/sentinel doctor` | Classified health report: what is broken now, what is imperfect, what a bad turn would cost. Renders the same report as the `sentinel_doctor` tool. |
 | `/sentinel verify` | Run the `onFileMutation` pipelines now. |
 | `/sentinel test` | Run the `onTurnEnd` pipelines now. |
 | `/sentinel rollback` | Restore this turn's changes, or reset to HEAD when no snapshot exists. |

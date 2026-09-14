@@ -160,6 +160,7 @@ import { createSentinelVerifyTool } from "./src/tools/sentinel-verify.ts";
 import { createSentinelRollbackTool } from "./src/tools/sentinel-rollback.ts";
 import { createSentinelRewindTool } from "./src/tools/sentinel-rewind.ts";
 import { createSentinelStatusTool } from "./src/tools/sentinel-status.ts";
+import { createSentinelDoctorTool } from "./src/tools/sentinel-doctor.ts";
 
 // Re-exported so `import { defineConfig } from "@patimweb/pi-sentinel"` works
 // for the documented config manifest.
@@ -1329,6 +1330,25 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
   pi.registerTool(createSentinelRewindTool(runtime));
   pi.registerTool(createSentinelStatusTool(runtime));
 
+  /**
+   * The session facts a doctor report needs, which only this instance knows.
+   *
+   * `ctxRetired` is the one that matters most: a retired ctx makes every branch
+   * that would report or resolve a result return early, so sentinel can look
+   * busy while nothing it produces can reach anybody.
+   */
+  const doctorTool = createSentinelDoctorTool(runtime, () => ({
+    ctxRetired,
+    backgroundRunning: backgroundRun !== null,
+    backgroundPending: background.pending !== null,
+    failureOutstanding,
+    repairAttempts: repair.attempts,
+    maxAttempts: recoveryOf(runtime.config.config()).maxAttempts,
+    turnSnapshotFiles: runtime.snapshots.turnPaths().length,
+    startedAtMs: sessionStartedAtMs,
+  }));
+  pi.registerTool(doctorTool);
+
   // ── Hook: session_start ────────────────────────────────────────────────
 
   /**
@@ -2208,7 +2228,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
   pi.registerCommand("sentinel", {
     description: "Sentinel verification, repair & rollback control",
     getArgumentCompletions: (prefix) => {
-      const options = ["status", "verify", "test", "rollback", "rewind", "config", "help"];
+      const options = ["status", "doctor", "verify", "test", "rollback", "rewind", "config", "help"];
       return options.filter((o) => o.startsWith(prefix)).map((o) => ({ label: o, value: o }));
     },
     handler: async (args, ctx) => {
@@ -2219,6 +2239,16 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
       switch (sub) {
         case "status": {
           ctx.ui.setWidget("sentinel", statusLines(ctx.cwd, conf));
+          return;
+        }
+        case "doctor": {
+          // Same report the tool returns, rendered into the widget: the user
+          // asking for it and the agent asking for it must see the same facts.
+          const result = (await doctorTool.execute("doctor", {}, undefined, undefined, ctx)) as {
+            content?: Array<{ text?: string }>;
+          };
+          const text = result?.content?.[0]?.text ?? "[sentinel] doctor produced no output.";
+          ctx.ui.setWidget("sentinel", text.split("\n"));
           return;
         }
         case "verify": {
@@ -2279,6 +2309,7 @@ export default function (pi: ExtensionAPI, deps: { runtime?: SentinelRuntime } =
             "[sentinel] Commands",
             "  /sentinel           Show this help",
             "  /sentinel status    Show current state",
+            "  /sentinel doctor    Check that sentinel is actually working here",
             "  /sentinel verify    Run onFileMutation pipelines now",
             "  /sentinel test      Run onTurnEnd pipelines now",
             "  /sentinel rollback  Restore this turn's changes (or HEAD)",
