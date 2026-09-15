@@ -1,7 +1,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 
-import { REDACTED, looksSecret, redactEnv, redactSecrets, secretValues } from "../src/formatting/redact.ts";
+import { REDACTED, looksSecret, redactEnv, redactSecrets, secretValues } from "../src/format/redact.ts";
 
 const env = {
   NPM_TOKEN: "npm_abcdefghijklmnop",

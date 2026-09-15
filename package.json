@@ -1,15 +1,12 @@
 {
   "name": "@patimweb/pi-sentinel",
   "version": "2.8.1",
-  "description": "Astra/Codex-style in-loop verification & rollback hardening for Pi coding agent. Prunes failed tool-execution traces, runs type/lint/test pipelines, and rolls back on invariant violations.",
+  "description": "Verification harness for the pi coding agent: runs your checks when the agent edits and before it is done, sends it back when they fail, and checkpoints every run so it can be rewound.",
   "type": "module",
   "main": "./index.ts",
   "types": "./index.ts",
   "exports": {
     ".": "./index.ts",
-    "./src/config.ts": "./src/config.ts",
-    "./src/runtime.ts": "./src/runtime.ts",
-    "./src/types.ts": "./src/types.ts",
     "./package.json": "./package.json"
   },
   "keywords": [
@@ -17,13 +14,12 @@
     "pi",
     "pi-coding-agent",
     "extension",
+    "harness",
     "verification",
-    "rollback",
-    "trace-pruning",
-    "linter",
-    "tsc",
-    "ast",
-    "git"
+    "checks",
+    "repair-loop",
+    "checkpoints",
+    "rewind"
   ],
   "author": "Patrick Weppelmann",
   "license": "MIT",
@@ -47,8 +43,7 @@
   ],
   "scripts": {
     "test": "node --test",
-    "typecheck": "tsc --noEmit",
-    "audit:runtime": "npm audit --omit=dev --omit=peer"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "typebox": "^1.1.38"

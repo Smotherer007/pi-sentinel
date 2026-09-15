@@ -1,8 +1,0 @@
-{
-  "name": "eval-off-by-one",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "test": "node --test check/sum.check.js"
-  }
-}

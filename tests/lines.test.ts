@@ -1,7 +1,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 
-import { RANK, dedupeLines, errorLines, isDiagnosticRank, rankLine, stripAnsi } from "../src/formatting/lines.ts";
+import { RANK, dedupeLines, errorLines, isDiagnosticRank, rankLine, stripAnsi } from "../src/format/lines.ts";
 
 describe("stripAnsi", () => {
   test("removes SGR sequences", () => {

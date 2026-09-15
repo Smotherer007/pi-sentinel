@@ -7,7 +7,7 @@ import {
   failureHeadline,
   failureSignature,
   summarizeFailure,
-} from "../src/formatting/classify.ts";
+} from "../src/format/classify.ts";
 
 const base = { stepName: "check", cmd: "check", exitCode: 1, output: "" };
 
