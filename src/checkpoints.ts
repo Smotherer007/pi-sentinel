@@ -118,11 +118,16 @@ export class RunRecorder {
     return head === undefined ? { path: file, existed: false, data: null } : { path: file, existed: true, data: head };
   }
 
-  /** Persist the checkpoint. Returns null when the run changed nothing. */
-  save(store: CheckpointStore, changed = this.changedFiles()): CheckpointSummary | null {
+  /**
+   * Persist the checkpoint. With `extend`, the run's files are merged into that
+   * existing checkpoint instead (a repair round belongs to the task it repairs):
+   * files already in it keep their older pre-state. Returns null when the run
+   * changed nothing.
+   */
+  save(store: CheckpointStore, changed = this.changedFiles(), extend?: string): CheckpointSummary | null {
     if (changed.length === 0) return null;
     const states = changed.map((file) => this.pre.get(file) ?? this.outOfBandPreState(file));
-    return store.write(this.label, states);
+    return (extend ? store.extend(extend, states) : null) ?? store.write(this.label, states);
   }
 }
 
@@ -178,6 +183,33 @@ export class CheckpointStore {
       return summarise(manifest);
     } catch {
       fs.rmSync(target, { recursive: true, force: true });
+      return null;
+    }
+  }
+
+  /** Merge pre-states into an existing checkpoint; refreshes every file's post-run fingerprint. */
+  extend(id: string, states: PreState[]): CheckpointSummary | null {
+    const manifest = this.find(id);
+    if (!manifest) return null;
+    const target = path.join(this.dir, manifest.id);
+    try {
+      const known = new Set(manifest.files.map((f) => f.path));
+      let index = manifest.files.length;
+      for (const state of states) {
+        if (known.has(state.path)) continue;
+        const entry: StoredFile = { path: state.path, existed: state.existed, after: "" };
+        if (state.data) {
+          entry.blob = `${index}.blob`;
+          entry.mode = state.mode;
+          fs.writeFileSync(path.join(target, "blobs", entry.blob), state.data, { mode: 0o600 });
+        }
+        index += 1;
+        manifest.files.push(entry);
+      }
+      for (const file of manifest.files) file.after = fingerprint(file.path);
+      fs.writeFileSync(path.join(target, "manifest.json"), JSON.stringify(manifest, null, 2), { mode: 0o600 });
+      return summarise(manifest);
+    } catch {
       return null;
     }
   }

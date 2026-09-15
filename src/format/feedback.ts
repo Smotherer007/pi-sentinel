@@ -69,7 +69,7 @@ export function repairPrompt(input: {
   const lines = [
     `[sentinel] Not done yet: ${headline(result)}. Repair attempt ${input.attempt}/${input.maxAttempts}.`,
   ];
-  if (input.changed.length > 0) lines.push(`Changed in this run: ${list(input.cwd, input.changed)}`);
+  if (input.changed.length > 0) lines.push(`Changed since the task started: ${list(input.cwd, input.changed)}`);
   lines.push(`Command: ${result.cmd}`);
   lines.push("─".repeat(40), pruneTrace(result.output, input.maxTraceLines, input.changed) || result.output.slice(0, 2000), "─".repeat(40));
   lines.push(...impactLines(input.dependents));

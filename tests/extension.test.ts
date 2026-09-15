@@ -150,7 +150,7 @@ describe("the gate at agent_end", () => {
     assert.equal(repairMsg.message.customType, SENTINEL_MESSAGE_TYPE);
     assert.deepEqual(repairMsg.options, { deliverAs: "followUp", triggerTurn: true });
     assert.match(repairMsg.message.content, /Not done yet: "test" failed .* Repair attempt 1\/2/);
-    assert.match(repairMsg.message.content, /Changed in this run: src\/sum\.js/);
+    assert.match(repairMsg.message.content, /Changed since the task started: src\/sum\.js/);
 
     // pi continues with the follow-up as a new agent run.
     await agentRun(s, async () => {
@@ -166,6 +166,13 @@ describe("the gate at agent_end", () => {
     );
     assert.equal(context.messages[1].content, SUPERSEDED_NOTICE);
     assert.equal(context.messages[0].content, "task");
+
+    // The repair round belongs to the task: one checkpoint, and one rewind undoes both rounds.
+    const rewind = s.pi.tools.get("sentinel_rewind");
+    const list = await rewind.execute("l", { action: "list" }, undefined, undefined, s.ctx);
+    assert.equal(list.content[0].text.split("\n").length, 2, list.content[0].text);
+    await rewind.execute("r", { action: "restore" }, undefined, undefined, s.ctx);
+    assert.equal(read(s.cwd, "src/sum.js"), "export const sum = (a, b) => a + b;\n");
   });
 
   test("the budget is bounded: after maxAttempts sentinel stops and tells the next turn", async () => {
@@ -246,7 +253,7 @@ describe("the gate at agent_end", () => {
       write(cwd, "src/sum.js", "BUG from sed"); // no edit/write tool call
     });
     assert.equal(s.pi.sent.length, 1);
-    assert.match(s.pi.sent[0].message.content, /Changed in this run: src\/sum\.js/);
+    assert.match(s.pi.sent[0].message.content, /Changed since the task started: src\/sum\.js/);
   });
 
   test("disabled means silent", async () => {

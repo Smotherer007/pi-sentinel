@@ -71,7 +71,8 @@ symptoms, stop and explain instead of widening the change.
 ## Checkpoints and rewind
 
 Every agent run that changed files becomes a checkpoint (kept outside the repo under
-`~/.pi/sentinel-state/`). Repair rounds get their own.
+`~/.pi/sentinel-state/`). Repair rounds are merged into the checkpoint of the task they repair, so
+one rewind undoes the whole prompt.
 
 - `/sentinel rewind` — pick a run and restore its files to how they were before it
 - `/sentinel rewind <id> [--force]`

@@ -114,3 +114,41 @@ describe("pruneTrace ranking", () => {
     assert.equal(result.includes("npm notice"), false);
   });
 });
+
+describe("pruneTrace — node:test TAP output", () => {
+  const output = [
+    "TAP version 13",
+    "# Subtest: report lists lines and the total",
+    "not ok 1 - report lists lines and the total",
+    "  ---",
+    "  duration_ms: 1.727351",
+    "  location: '/p/test/invoice.test.ts:5:1'",
+    "  error: |-",
+    "    Expected values to be strictly equal:",
+    "    + actual - expected",
+    "",
+    "    + 'Tea: 5.00'",
+    "    - 'Tea: €5.00'",
+    "  code: 'ERR_ASSERTION'",
+    "  expected: |-",
+    "    Tea: €5.00",
+    "  actual: |-",
+    "    Tea: 5.00",
+    "  stack: |-",
+    "    TestContext.<anonymous> (file:///p/test/invoice.test.ts:7:10)",
+    "    Test.runInAsyncScope (node:async_hooks:214:14)",
+    "    Test.run (node:internal/test_runner/test:1047:25)",
+    "    Test.start (node:internal/test_runner/test:944:17)",
+    "  ...",
+    "# fail 1",
+  ].join("\n");
+
+  test("keeps the values that explain the assertion, ahead of stack frames", () => {
+    const result = pruneTrace(output, 12);
+    for (const needle of ["not ok 1", "+ 'Tea: 5.00'", "- 'Tea: €5.00'", "Tea: €5.00", "Expected values to be strictly equal"]) {
+      assert.ok(result.includes(needle), `missing ${needle}:\n${result}`);
+    }
+    assert.equal(/^error: \|-$/m.test(result), false, "the YAML key is not mistaken for an error");
+    assert.ok(result.indexOf("- 'Tea: €5.00'") < result.indexOf("Test.run ("), "values before frames");
+  });
+});

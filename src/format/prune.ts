@@ -40,10 +40,16 @@ export function pruneTrace(rawOutput: string, maxLines: number, focusPaths: stri
     .filter(Boolean)
     .map((path) => path.replace(/\\/g, "/"));
 
+  const blocks = assertionBlocks(lines);
   const ranked: RankedLine[] = [];
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index].trim();
     if (!line) continue;
+    const block = blocks.get(index);
+    if (block !== undefined) {
+      if (block !== RANK.noise) ranked.push({ line, rank: block, index });
+      continue;
+    }
     // Focused lines are kept even if they don't look like errors — a compiler
     // pointing at the file we just touched is always the most useful signal.
     const normalised = line.replace(/\\/g, "/");
@@ -93,4 +99,35 @@ export function pruneTrace(rawOutput: string, maxLines: number, focusPaths: stri
   }
 
   return result.join("\n").trim();
+}
+
+/** YAML block keys test runners use for the failure itself (node:test TAP, tap). */
+const BLOCK_KEY = /^(\s*)(error|expected|actual|diff|message|found|wanted):\s*[|>][-+]?\s*$/;
+
+/**
+ * Lines inside `error: |-` / `expected: |-` / `actual: |-` blocks carry the
+ * values that explain a failing assertion, but on their own they look like
+ * indented context. Rank them as assertions; the key line itself is noise
+ * (`error: |-` would otherwise look like a compiler error).
+ */
+function assertionBlocks(lines: string[]): Map<number, number> {
+  const out = new Map<number, number>();
+  for (let i = 0; i < lines.length; i += 1) {
+    const key = BLOCK_KEY.exec(lines[i]);
+    if (!key) continue;
+    // `expected:` / `actual:` label the values that follow; `error: |-` would read as a compiler error.
+    out.set(i, key[2] === "error" || key[2] === "message" ? RANK.noise : RANK.assertion);
+    const indent = key[1].length;
+    let taken = 0;
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const raw = lines[j];
+      if (raw.trim() === "") continue;
+      if (raw.length - raw.trimStart().length <= indent) break;
+      if (taken < 12) out.set(j, Math.min(rankLine(raw.trim()), RANK.assertion));
+      else out.set(j, RANK.noise);
+      taken += 1;
+      i = j;
+    }
+  }
+  return out;
 }

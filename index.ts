@@ -77,6 +77,8 @@ export default function sentinel(pi: ExtensionAPI) {
   let repair: RepairState = initialRepairState();
   /** Files changed since the last user prompt, across repair rounds. */
   const cycleChanged = new Set<string>();
+  /** The checkpoint of the current task; repair rounds are merged into it. */
+  let cycleCheckpoint: string | null = null;
   /** When the gate last passed; failure messages older than this are superseded. */
   let lastGreenAt = 0;
   let lastRun: { at: string; run: CheckRun } | null = null;
@@ -152,6 +154,7 @@ export default function sentinel(pi: ExtensionAPI) {
     const conf = await refresh(ctx.cwd);
     repair = initialRepairState();
     cycleChanged.clear();
+    cycleCheckpoint = null;
     toldAboutInfra.clear();
     lastHint = null;
     label = (event.prompt ?? "").replace(/\s+/g, " ").trim().slice(0, 80) || "agent run";
@@ -222,7 +225,8 @@ export default function sentinel(pi: ExtensionAPI) {
     const changed = run.changedFiles().filter((file) => relevant(ctx.cwd, file));
     if (conf.checkpoints.enabled && changed.length > 0) {
       try {
-        run.save(store(ctx.cwd), changed);
+        const saved = run.save(store(ctx.cwd), changed, repair.attempts > 0 ? cycleCheckpoint ?? undefined : undefined);
+        if (saved) cycleCheckpoint = saved.id;
       } catch {
         /* a lost checkpoint must not break the turn */
       }
