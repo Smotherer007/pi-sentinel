@@ -1,6 +1,6 @@
 {
   "name": "@patimweb/pi-sentinel",
-  "version": "2.8.1",
+  "version": "3.0.0",
   "description": "Verification harness for the pi coding agent: runs your checks when the agent edits and before it is done, sends it back when they fail, and checkpoints every run so it can be rewound.",
   "type": "module",
   "main": "./index.ts",
