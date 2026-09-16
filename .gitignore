@@ -7,3 +7,7 @@ sentinel-state.json
 
 # Mind Place knowledge-graph build artifacts
 graph-out/
+
+# eval output
+evals/runs/
+evals/.cache/

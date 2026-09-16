@@ -1,0 +1,5 @@
+{
+  "id": "duration-feature",
+  "kind": "feature across modules",
+  "prompt": "Add a function parseDuration(text: string): number to src/duration.ts that returns seconds for inputs like \"45s\", \"15m\", \"2h\" and combinations in that order such as \"1h30m\" or \"1m30s\". A plain number like \"90\" means seconds. Empty or invalid input (e.g. \"abc\", \"1x\", \"m5\") must throw an Error. Then make the CLI accept durations: `--timeout 1h30m` must work, and `--timeout 90` must still mean 90 seconds. Add tests."
+}

@@ -1,0 +1,5 @@
+{
+  "id": "rename-money",
+  "kind": "multi-file refactor",
+  "prompt": "Rename the function formatCents to formatMoney everywhere in this project and give it a second parameter `currency` (an ISO code, default \"EUR\"). EUR is rendered as €12.50, USD as $12.50, and any other code as the amount followed by the code, e.g. \"12.50 CHF\". Existing output must stay the same. Keep the tests passing."
+}

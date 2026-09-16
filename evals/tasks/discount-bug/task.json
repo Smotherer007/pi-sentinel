@@ -1,0 +1,5 @@
+{
+  "id": "discount-bug",
+  "kind": "bug fix with weak test coverage",
+  "prompt": "Customers reported three pricing bugs:\n1. SAVE15 on an item costing 9.99 (999 cents) charges 8.50, but it must be 8.49 — percentage discounts round down in the customer's favour.\n2. FIVEOFF on an item costing 3.00 results in a negative price. A price must never go below 0.\n3. With FREESHIP the items become free. FREESHIP must only remove shipping, never change item prices.\nFix these bugs and add tests for them. Unknown codes must still throw."
+}
