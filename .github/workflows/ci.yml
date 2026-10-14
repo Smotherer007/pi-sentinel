@@ -47,21 +47,7 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Semantic Release
-        run: |
-          set +e
-          npx semantic-release --debug > /tmp/semantic-release.log 2>&1
-          status=$?
-          if [ $status -ne 0 ]; then
-            # Annotations are readable without a token, the log is not: surface
-            # the lines that name the failure, not the stack frames.
-            sed -r 's/\x1b\[[0-9;]*m//g' /tmp/semantic-release.log \
-              | grep -aE "Failed step|An error occurred|AggregateError|E[A-Z]+:|EAR|ENO|403|401" \
-              | head -n 8 \
-              | while IFS= read -r line; do
-                  echo "::error title=semantic-release::${line}"
-                done
-          fi
-          exit $status
+        run: npx semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # @semantic-release/npm reads NPM_TOKEN. NODE_AUTH_TOKEN only ever
