@@ -53,10 +53,13 @@ jobs:
           status=$?
           if [ $status -ne 0 ]; then
             # Annotations are readable without a token, the log is not: surface
-            # the lines that explain the failure.
-            grep -iE "error|e_|cannot|denied|not permitted" /tmp/semantic-release.log | tail -n 8 | while IFS= read -r line; do
-              echo "::error title=semantic-release::${line//\%/}"
-            done
+            # the lines that name the failure, not the stack frames.
+            sed -r 's/\x1b\[[0-9;]*m//g' /tmp/semantic-release.log \
+              | grep -aE "Failed step|An error occurred|AggregateError|E[A-Z]+:|EAR|ENO|403|401" \
+              | head -n 8 \
+              | while IFS= read -r line; do
+                  echo "::error title=semantic-release::${line}"
+                done
           fi
           exit $status
         env:
