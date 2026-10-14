@@ -47,7 +47,18 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Semantic Release
-        run: npx semantic-release
+        run: |
+          set +e
+          npx semantic-release --debug > /tmp/semantic-release.log 2>&1
+          status=$?
+          if [ $status -ne 0 ]; then
+            # Annotations are readable without a token, the log is not: surface
+            # the lines that explain the failure.
+            grep -iE "error|e_|cannot|denied|not permitted" /tmp/semantic-release.log | tail -n 8 | while IFS= read -r line; do
+              echo "::error title=semantic-release::${line//\%/}"
+            done
+          fi
+          exit $status
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # @semantic-release/npm reads NPM_TOKEN. NODE_AUTH_TOKEN only ever
